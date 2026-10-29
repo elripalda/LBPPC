@@ -1,0 +1,43 @@
+# Game files: never committed or distributed. Everyone brings their own copy of the game.
+eboot.bin
+*.elf
+*.self
+*.sprx
+*.prx
+*.pkg
+*.psarc
+*.farc
+sce_sys/
+sce_module/
+game/
+dumps/
+*.dmp
+
+# Saves and user data
+savedata/
+user/
+
+# Build output
+out/
+build/
+dist/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.spv
+__pycache__/
+*.pyc
+
+# Logs and local leftovers
+*.log
+*.orig
+*.mp4
+
+# IDE and session-local
+.idea/
+.vscode/
+.claude/
