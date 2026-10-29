@@ -20,6 +20,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -231,6 +232,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // The guest requires a depth sampled texture, but cache can offer only Rxf. Need to
         // recreate the image.
         recreate |= requested_info.props.is_depth && !cache_image.info.props.is_depth;
+        // lbppc: a colour texture over a depth image in a format no depth or stencil view can take
+        // (LBP3 samples its D32S8 buffer as R8G8B8A8): a view would be invalid (the GPU was lost
+        // writing through it), so the depth bits are copied into a colour image of that format.
+        recreate |= !requested_info.props.is_depth && cache_image.info.props.is_depth &&
+                    !Vulkan::LiverpoolToVK::IsFormatDepthCompatible(requested_info.pixel_format) &&
+                    !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(requested_info.pixel_format);
         break;
     case BindingType::Storage:
         // If the guest is going to use previously created depth as storage, the image needs to be
@@ -599,6 +606,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         cached.levels == info.resources.levels && cached.layers == info.resources.layers &&
         !BbToggle::Disabled(BbToggle::FindImageCache)) {
         Image& image = slot_images[cached.image_id];
+        if (image.info.props.is_depth && !info.props.is_depth && info.pixel_format == vk::Format::eR8G8B8A8Unorm) {
+            std::printf("lbppc: FindImage cache hit gives depth for RGBA8\n");
+        }
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
         if (cached.view_mip > 0) {
@@ -634,6 +644,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             continue;
         }
         if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+            continue;
+        }
+        // lbppc: a depth image is no match for a colour format that no depth or stencil view can
+        // take: the overlap path converts it (ResolveDepthOverlap) instead of an invalid view.
+        if (cache_image.info.props.is_depth && !info.props.is_depth &&
+            !Vulkan::LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format) &&
+            !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(info.pixel_format)) {
             continue;
         }
         image_id = cache_id;
@@ -677,6 +694,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
+    if (image.info.props.is_depth && !info.props.is_depth && info.pixel_format == vk::Format::eR8G8B8A8Unorm) {
+        std::printf("lbppc: FindImage resolved depth for RGBA8 (view mip %d slice %d, %zu candidates)\n",
+                    view_mip, view_slice, image_ids.size());
+    }
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
@@ -740,6 +761,14 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,
                                      bool refresh) {
     Image& image = slot_images[image_id];
+    if (image.info.props.is_depth && !desc.info.props.is_depth) {
+        static int logged;
+        if (logged++ < 6) {
+            std::printf("lbppc: %s of depth image at %#llx as format %d\n",
+                        desc.type == BindingType::Storage ? "storage" : "texture",
+                        (unsigned long long)image.info.guest_address, int(desc.info.pixel_format));
+        }
+    }
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
@@ -769,6 +798,13 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    if (image.info.props.is_depth) {
+        static int logged;
+        if (logged++ < 6) {
+            std::printf("lbppc: render target on depth image at %#llx as format %d\n",
+                        (unsigned long long)image.info.guest_address, int(desc.info.pixel_format));
+        }
+    }
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
@@ -808,11 +844,16 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     }
 
     // If there is a stencil attachment, link depth and stencil.
-    if (desc.info.stencil_addr != 0) {
+    if (desc.info.stencil_addr != 0 && desc.info.stencil_addr != desc.info.guest_address) {
         ImageId stencil_id{};
+        // lbppc: only an 8-bit image at a stencil address of its own is a stencil plane. LBP3's
+        // stencil address is its depth buffer's, where its R8G8B8A8 copy of the depth bits lives:
+        // linked as "stencil", reads of that copy went back to the depth image (and lost the GPU).
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
+                                 if (image.info.guest_address == desc.info.stencil_addr &&
+                                     desc.info.stencil_addr != desc.info.guest_address &&
+                                     image.info.num_bits == 8) {
                                      stencil_id = image_id;
                                  }
                              });

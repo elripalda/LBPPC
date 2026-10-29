@@ -89,6 +89,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::De
     type = range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
 }
 
+extern "C" char __ImageBase;
 ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info_,
                      const Image& image)
     : info{info_} {
@@ -115,6 +116,24 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
         format = image.info.pixel_format;
         aspect = vk::ImageAspectFlagBits::eStencil;
+    }
+    if ((aspect & (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil)) &&
+        format != image.info.pixel_format) {
+        // lbppc: a colour format over a depth image that reached here anyway (the texture cache
+        // converts these): a view in the depth format instead, which reads wrongly but is valid.
+        // An invalid one lost the GPU.
+        format = image.info.pixel_format;
+        aspect &= vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        if (aspect == (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil)) {
+            aspect = vk::ImageAspectFlagBits::eDepth;
+        }
+        static int logged;
+        if (logged++ < 4) {
+            std::printf("lbppc: colour view %d of depth image %d at %#llx (storage %d), from %p %p %p\n",
+                        int(format), int(image.info.pixel_format),
+                        (unsigned long long)image.info.guest_address, int(info.is_storage),
+                        (void*)((char*)__builtin_return_address(0) - (char*)&__ImageBase), nullptr, nullptr);
+        }
     }
 
     // bbport: storage writes never convert to sRGB and sRGB formats cannot be storage images

@@ -956,6 +956,17 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     if (!pipeline) {
         return;
     }
+    // lbppc diagnostics: LBPPC_SKIP_STAGES=tess,gs skips draws with tessellation or geometry stages.
+    static const char* skip_stages = std::getenv("LBPPC_SKIP_STAGES");
+    if (skip_stages) {
+        const auto stages = pipeline->GetStages();
+        const bool tess = stages[u32(Shader::SwStage::TessellationControl)] ||
+                          stages[u32(Shader::SwStage::TessellationEval)];
+        const bool gs = stages[u32(Shader::SwStage::Geometry)] != nullptr;
+        if ((tess && std::strstr(skip_stages, "tess")) || (gs && std::strstr(skip_stages, "gs"))) {
+            return;
+        }
+    }
     if (pipelined && FilterDrawPasses()) {
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
