@@ -16,11 +16,14 @@ This repository contains no game files and never will. To play, you dump LittleB
 
 | Folder | What goes there |
 |---|---|
-| `runtime/` | Loads and runs the game's code; stands in for the PS4 system libraries |
-| `gpu/` | The graphics layer: PS4 GPU commands and shaders to Vulkan |
-| `launcher/` | The Windows launcher: setup, settings, updates, online sign-in |
-| `tools/` | Development tools: dumping helpers, log and file inspectors |
+| `src/` | The runtime: loads and runs the game's code; stands in for the PS4 system libraries |
+| `gpu/` | The graphics layer: PS4 GPU commands and shaders to Vulkan (from shadPS4) |
+| `scripts/` | Reads the game's executable and links it with its bundled modules before a start |
+| `tools/` | Development tools: import list, GPU capability check |
+| `tests/` | Tests of the GPU layer |
 | `docs/` | Research notes and design documents |
+
+The runtime and graphics layer come from the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) 1.9.5, merged with its history (remote `bloodborne`) so its fixes can be merged in later. Build on Windows with MSYS2 CLANG64: `./build.sh` (packages in `packaging/windows/README.md`).
 
 ## Licence
 
