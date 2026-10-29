@@ -517,6 +517,178 @@ static ABI int32_t epoll_wait(int32_t epoll,EpollEvent *events,int32_t max,int32
     return count;
 }
 
+/* Fibers (libSceFiber): guest code switching between its own execution contexts on one thread. On Windows
+ * each guest fiber is a Win32 fiber: SwitchToFiber keeps the thread's stack bounds in its TEB right, which
+ * exception dispatch needs (the GPU layer's page tracking faults on every thread; a stack outside those
+ * bounds ends the process without a word). The fiber runs on a stack of its own with room for host code,
+ * not on the game's context memory, which is only recorded. The game's OrbisFiber (256 bytes) keeps
+ * upstream shadPS4's layout, with the host fiber where shadPS4 keeps its context pointer. */
+#define FIBER_NULL ((int32_t)0x80590001)
+#define FIBER_ALIGNMENT ((int32_t)0x80590002)
+#define FIBER_RANGE ((int32_t)0x80590003)
+#define FIBER_INVALID ((int32_t)0x80590004)
+#define FIBER_PERMISSION ((int32_t)0x80590005)
+#define FIBER_STATE ((int32_t)0x80590006)
+enum { FIBER_SIGNATURE0=0xdef1649c, FIBER_SIGNATURE1=0xb37592a0, FIBER_OPT_SIGNATURE=0xbb40e64d };
+enum { FIBER_RUN=1, FIBER_IDLE=2, FIBER_TERMINATED=3 };
+typedef void (ABI *FiberEntry)(uint64_t arg_on_initialize,uint64_t arg_on_run);
+typedef struct HostFiber HostFiber;
+typedef struct {
+    uint32_t magic_start, state;
+    FiberEntry entry;
+    uint64_t arg_on_initialize;
+    void *addr_context;
+    uint64_t size_context;
+    char name[32];
+    HostFiber *host;
+    uint32_t flags;
+    void *context_start, *context_end;
+    uint32_t magic_end;
+} GuestFiber;
+typedef struct {
+    uint64_t size;
+    FiberEntry entry;
+    uint64_t arg_on_initialize;
+    void *addr_context;
+    uint64_t size_context;
+    char name[32];
+    uint64_t size_context_margin;
+    uint8_t pad[48];
+} FiberInfo;
+struct HostFiber {
+    GuestFiber *guest;
+    void *native;      /* the Win32 fiber */
+    void *return_to;   /* the thread's own fiber that ran it, for sceFiberReturnToThread */
+    uint64_t arg_on_run, arg_on_return;
+};
+static __thread HostFiber *current_fiber;
+static int fiber_valid(const GuestFiber *f) {
+    return f->magic_start==FIBER_SIGNATURE0 && f->magic_end==FIBER_SIGNATURE1 && f->host;
+}
+static ABI int32_t fiber_opt_init(uint32_t *opt) {
+    if (!opt) return FIBER_NULL;
+    if ((uintptr_t)opt&7) return FIBER_ALIGNMENT;
+    *opt=FIBER_OPT_SIGNATURE;
+    return ORBIS_OK;
+}
+#ifdef _WIN32
+static void WINAPI fiber_start(void *param) {
+    HostFiber *f=param;
+    f->guest->entry(f->guest->arg_on_initialize,f->arg_on_run);
+    /* An entry must end with sceFiberReturnToThread or a switch; returning has nowhere to go. */
+    fprintf(stderr,"STOP: fiber '%s' returned from its entry function\n",f->guest->name);
+    fflush(stderr);
+    _Exit(23);
+}
+#endif
+static ABI int32_t fiber_init(GuestFiber *fiber,const char *name,FiberEntry entry,uint64_t arg_on_initialize,
+                              void *addr_context,uint64_t size_context,const uint32_t *opt,uint32_t build_version) {
+    (void)build_version;
+    if (!fiber || !name || !entry) return FIBER_NULL;
+    if ((uintptr_t)fiber&7 || (uintptr_t)addr_context&15) return FIBER_ALIGNMENT;
+    if (opt && *opt!=FIBER_OPT_SIGNATURE) return FIBER_INVALID;
+    if (addr_context && size_context<512) return FIBER_RANGE;
+#ifdef _WIN32
+    HostFiber *host=calloc(1,sizeof(*host));
+    if (!host) return FIBER_RANGE;
+    host->guest=fiber;
+    /* The game's context size plus room for host code (the runtime, the GPU layer, Windows). */
+    host->native=CreateFiberEx(0,(SIZE_T)size_context+2*1024*1024,FIBER_FLAG_FLOAT_SWITCH,fiber_start,host);
+    if (!host->native) { free(host); return FIBER_RANGE; }
+    memset(fiber,0,sizeof(*fiber));
+    fiber->magic_start=FIBER_SIGNATURE0;
+    fiber->magic_end=FIBER_SIGNATURE1;
+    fiber->state=FIBER_IDLE;
+    fiber->entry=entry;
+    fiber->arg_on_initialize=arg_on_initialize;
+    fiber->addr_context=addr_context;
+    fiber->size_context=size_context;
+    snprintf(fiber->name,sizeof(fiber->name),"%s",name);
+    fiber->host=host;
+    fiber->context_start=addr_context;
+    fiber->context_end=addr_context ? (uint8_t *)addr_context+size_context : NULL;
+    return ORBIS_OK;
+#else
+    (void)arg_on_initialize;
+    fputs("STOP: fibers are implemented on Windows only\n",stderr);
+    exit(21);
+#endif
+}
+static ABI int32_t fiber_finalize(GuestFiber *fiber) {
+    if (!fiber) return FIBER_NULL;
+    if ((uintptr_t)fiber&7) return FIBER_ALIGNMENT;
+    if (!fiber_valid(fiber)) return FIBER_INVALID;
+    if (fiber->state!=FIBER_IDLE) return FIBER_STATE;
+#ifdef _WIN32
+    DeleteFiber(fiber->host->native);
+#endif
+    free(fiber->host);
+    fiber->host=NULL;
+    fiber->state=FIBER_TERMINATED;
+    fiber->magic_start=0;
+    fiber->magic_end=0;
+    return ORBIS_OK;
+}
+/* From a thread (not a fiber): runs the fiber until it returns to the thread. */
+static ABI int32_t fiber_run(GuestFiber *fiber,uint64_t arg_on_run_to,uint64_t *arg_on_return) {
+    if (!fiber) return FIBER_NULL;
+    if ((uintptr_t)fiber&7) return FIBER_ALIGNMENT;
+    if (!fiber_valid(fiber)) return FIBER_INVALID;
+    if (current_fiber) return FIBER_PERMISSION;
+    if (fiber->state!=FIBER_IDLE) return FIBER_STATE;
+#ifdef _WIN32
+    if (!IsThreadAFiber() && !ConvertThreadToFiberEx(NULL,FIBER_FLAG_FLOAT_SWITCH)) return FIBER_PERMISSION;
+    HostFiber *f=fiber->host;
+    f->return_to=GetCurrentFiber();
+    f->arg_on_run=arg_on_run_to;
+    fiber->state=FIBER_RUN;
+    current_fiber=f;
+    SwitchToFiber(f->native);
+    /* Back from sceFiberReturnToThread. */
+    current_fiber=NULL;
+    fiber->state=FIBER_IDLE;
+    if (arg_on_return) *arg_on_return=f->arg_on_return;
+    return ORBIS_OK;
+#else
+    (void)arg_on_run_to; (void)arg_on_return;
+    return FIBER_PERMISSION;
+#endif
+}
+/* From a fiber: back to the thread that ran it; returns when a thread runs the fiber again. */
+static ABI int32_t fiber_return_to_thread(uint64_t arg_on_return,uint64_t *arg_on_run) {
+    HostFiber *f=current_fiber;
+    if (!f) return FIBER_PERMISSION;
+#ifdef _WIN32
+    f->arg_on_return=arg_on_return;
+    SwitchToFiber(f->return_to);
+    /* Run again (fiber_run set current_fiber and the argument on that thread). */
+    if (arg_on_run) *arg_on_run=f->arg_on_run;
+    return ORBIS_OK;
+#else
+    (void)arg_on_return; (void)arg_on_run;
+    return FIBER_PERMISSION;
+#endif
+}
+static ABI int32_t fiber_get_self(GuestFiber **fiber) {
+    if (!fiber) return FIBER_NULL;
+    if (!current_fiber) return FIBER_PERMISSION;
+    *fiber=current_fiber->guest;
+    return ORBIS_OK;
+}
+static ABI int32_t fiber_get_info(GuestFiber *fiber,FiberInfo *info) {
+    if (!fiber || !info) return FIBER_NULL;
+    if ((uintptr_t)fiber&7 || (uintptr_t)info&7) return FIBER_ALIGNMENT;
+    if (info->size!=sizeof(FiberInfo)) return FIBER_INVALID;
+    if (!fiber_valid(fiber)) return FIBER_INVALID;
+    info->entry=fiber->entry;
+    info->arg_on_initialize=fiber->arg_on_initialize;
+    info->addr_context=fiber->addr_context;
+    info->size_context=fiber->size_context;
+    memcpy(info->name,fiber->name,sizeof(info->name));
+    info->size_context_margin=(uint64_t)-1;
+    return ORBIS_OK;
+}
+
 /* Modules the game loads itself (LBP3's FMOD plugins): run.py links them into the image at start, and they
  * have no initializer or module_start, so loading one only hands out a handle. A module that is not there
  * is missing, as on the console. */
@@ -586,6 +758,9 @@ static const RuntimeExport exports[]={
     {"sendto",socket_send}, {"sceNetSetsockopt",socket_option}, {"sceNetSocketClose",socket_close},
     {"sceNetEpollControl",epoll_control}, {"sceNetEpollWait",epoll_wait},
     {"sceKernelLoadStartModule",load_start_module},
+    {"sceFiberOptParamInitialize",fiber_opt_init}, {"_sceFiberInitializeImpl",fiber_init},
+    {"sceFiberFinalize",fiber_finalize}, {"sceFiberRun",fiber_run}, {"sceFiberReturnToThread",fiber_return_to_thread},
+    {"sceFiberGetSelf",fiber_get_self}, {"sceFiberGetInfo",fiber_get_info},
     {"sceSystemServiceGetDisplaySafeAreaInfo",safe_area}, {"scePadSetLightBar",pad_light_bar},
     {"sceVoiceGetPortAttr",voice_port_attr},
     {"sceRtcCheckValid",rtc_check_valid}, {"sceRtcTickAddMinutes",rtc_add_minutes},

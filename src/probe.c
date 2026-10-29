@@ -103,6 +103,66 @@ static uintptr_t trace_wrap(uintptr_t target, const char *name) {
     used+=(size_t)((o-s+15)&~15);
     return (uintptr_t)s;
 }
+/* BB_HOOK=offset:length,... (diagnostics): at those guest offsets the first `length` bytes (whole
+ * instructions, at least 5, no rip-relative ones) become a jump to a stub that logs the first two arguments,
+ * the int each points to (when readable) and the return address, runs the moved bytes and jumps back. */
+static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t ret) {
+    static volatile long count;
+    long n=InterlockedIncrement(&count);
+    if (n>200) return;
+    char line[256];
+    int32_t va=0, vb=0;
+    SIZE_T got;
+    int ra=a && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)a,&va,4,&got) && got==4;
+    int rb=b && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)b,&vb,4,&got) && got==4;
+    int len=snprintf(line,sizeof(line),"HOOK 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x]) from guest 0x%llx (thread %lu)\n",
+                     (unsigned long long)offset,(unsigned long long)a,ra?"":"?",(unsigned)va,(unsigned long long)b,
+                     rb?"":"?",(unsigned)vb,(unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
+    DWORD written;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
+}
+static void hooks_install(const char *spec) {
+    if (!spec || !*spec) return;
+    /* Stubs within 2 GiB of the image, for 5-byte jumps. */
+    unsigned char *stubs=NULL;
+    for (uintptr_t at=((uintptr_t)image-0x10000000)&~(uintptr_t)0xffff; !stubs && at>(uintptr_t)image-0x70000000; at-=0x10000000)
+        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    if (!stubs) { fprintf(stderr,"BB_HOOK: no memory near the image\n"); return; }
+    unsigned char *o=stubs;
+    for (const char *p=spec; *p;) {
+        char *end;
+        uint64_t offset=strtoull(p,&end,0);
+        unsigned length=*end==':' ? (unsigned)strtoul(end+1,&end,0) : 0;
+        p=*end==',' ? end+1 : end+strlen(end);
+        if (length<5 || length>32) { fprintf(stderr,"BB_HOOK: %llx needs a length of 5-32\n",(unsigned long long)offset); continue; }
+        unsigned char *site=image+offset, *s=o;
+        /* push rdi,rsi,rdx,rcx,r8,r9,rax; rcx=[rsp+56] (return address); rdx=rsi; rsi=rdi; rcx moves to 4th;
+           rdi=offset; call hook_log; pop; moved bytes; jmp back. */
+        static const unsigned char push[]={0x57,0x56,0x52,0x51,0x41,0x50,0x41,0x51,0x50};
+        memcpy(o,push,sizeof(push)); o+=sizeof(push);
+        *o++=0x48; *o++=0x8b; *o++=0x4c; *o++=0x24; *o++=0x38; /* mov rcx,[rsp+56] */
+        *o++=0x48; *o++=0x89; *o++=0xf2;                       /* mov rdx,rsi */
+        *o++=0x48; *o++=0x89; *o++=0xfe;                       /* mov rsi,rdi */
+        *o++=0x48; *o++=0xbf; memcpy(o,&offset,8); o+=8;       /* mov rdi,offset */
+        uintptr_t fn=(uintptr_t)hook_log;
+        *o++=0x48; *o++=0xb8; memcpy(o,&fn,8); o+=8;           /* mov rax,hook_log */
+        *o++=0xff; *o++=0xd0;                                  /* call rax */
+        static const unsigned char pop[]={0x58,0x41,0x59,0x41,0x58,0x59,0x5a,0x5e,0x5f};
+        memcpy(o,pop,sizeof(pop)); o+=sizeof(pop);
+        memcpy(o,site,length); o+=length;
+        uintptr_t back=(uintptr_t)site+length;
+        *o++=0x49; *o++=0xbb; memcpy(o,&back,8); o+=8;         /* mov r11,back */
+        *o++=0x41; *o++=0xff; *o++=0xe3;                       /* jmp r11 */
+        int32_t rel=(int32_t)((intptr_t)s-((intptr_t)site+5));
+        DWORD old;
+        VirtualProtect(site,length,PAGE_EXECUTE_READWRITE,&old);
+        site[0]=0xe9; memcpy(site+1,&rel,4);
+        for (unsigned i=5;i<length;++i) site[i]=0x90;
+        VirtualProtect(site,length,old,&old);
+        o=(unsigned char *)(((uintptr_t)o+15)&~(uintptr_t)15);
+        fprintf(stderr,"BB_HOOK: guest 0x%llx hooked (%u bytes moved)\n",(unsigned long long)offset,length);
+    }
+}
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
@@ -838,6 +898,7 @@ int main(int argc, char **argv) {
     /* The Hunter's Dream backend reads the game's code before the patches change it. */
     if (bloodborne) bbnet_set_image(image, size);
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    hooks_install(getenv("BB_HOOK"));
     if (bloodborne) bbgpu_pc_menu_prepare(image);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
