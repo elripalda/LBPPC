@@ -13,6 +13,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -206,6 +207,50 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+/* --timeout seconds: where every thread is (name, instruction, return addresses on its stack), then exit 4.
+ * For a game that hangs instead of stopping. */
+static DWORD WINAPI watchdog_thread(LPVOID arg) {
+    Sleep((DWORD)(uintptr_t)arg*1000);
+    typedef HRESULT (WINAPI *GetDescription)(HANDLE,PWSTR *);
+    GetDescription describe=(GetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    fprintf(stderr,"Watchdog: %lu s passed; threads:\n",(unsigned long)(uintptr_t)arg);
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    THREADENTRY32 entry={.dwSize=sizeof(entry)};
+    for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
+        if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
+        HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ThreadID);
+        if (!thread) continue;
+        char name[96]="";
+        PWSTR wide=NULL;
+        if (describe && SUCCEEDED(describe(thread,&wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
+            LocalFree(wide);
+        }
+        CONTEXT c={.ContextFlags=CONTEXT_FULL};
+        if (SuspendThread(thread)!=(DWORD)-1 && GetThreadContext(thread,&c)) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),(uintptr_t)c.Rip);
+            fprintf(stderr,"  thread %lu '%s' at %s\n",entry.th32ThreadID,name,where);
+            for (int slot=0, shown=0; slot<512 && shown<8; ++slot) {
+                uintptr_t value=0;
+                SIZE_T got=0;
+                if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c.Rsp+slot*8),&value,sizeof(value),&got) || got!=sizeof(value)) break;
+                HMODULE owner=NULL;
+                int code_ref=(image && value-(uintptr_t)image<0x20000000) ||
+                             (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)value,&owner) && owner==GetModuleHandleA(NULL));
+                if (!code_ref) continue;
+                describe_address(where,sizeof(where),value);
+                fprintf(stderr,"    [rsp+0x%x] %s\n",slot*8,where);
+                ++shown;
+            }
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(),4);
+    return 0;
 }
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
@@ -532,7 +577,7 @@ int main(int argc, char **argv) {
         if (!SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy,&strict,sizeof(strict)))
             fprintf(stderr,"BB_STRICT_HANDLES: policy not set (%lu)\n",GetLastError());
     }
-    (void)timeout_seconds; /* no watchdog on Windows */
+    if (timeout_seconds) CloseHandle(CreateThread(NULL,0,watchdog_thread,(LPVOID)(uintptr_t)timeout_seconds,0,NULL));
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
@@ -591,7 +636,7 @@ int main(int argc, char **argv) {
             fail("invalid eboot TLS metadata");
         for (uint64_t m=0;m<module_count;++m) {
             LinkedModule *x=&modules[m];
-            if (x->base>=size || !x->size || x->size>size-x->base || x->init<x->base || x->init-x->base>=x->size ||
+            if (x->base>=size || !x->size || x->size>size-x->base || (x->init && (x->init<x->base || x->init-x->base>=x->size)) ||
                 (x->tls_module && (x->tls_address>=size || x->tls_memsz>size-x->tls_address || x->tls_memsz>1024*1024 ||
                                    x->tls_filesz>x->tls_memsz || x->tls_module<2 || x->tls_module>7)))
                 fail("invalid linked module metadata");
@@ -697,6 +742,21 @@ int main(int argc, char **argv) {
         }
         memcpy(image + relocs[i].target, &value, 8);
     }
+    /* BB_LIST_UNRESOLVED=1: every import still bound to a trap (it would stop the game when called), then exit. */
+    if (getenv("BB_LIST_UNRESOLVED")) {
+        unsigned char *listed=calloc(import_count ? import_count : 1,1);
+        unsigned count=0;
+        for (uint64_t i = 0; listed && i < nr; ++i) {
+            uint64_t index=relocs[i].value;
+            if (!relocs[i].kind || listed[index] || runtime_resolve(names[index], relocs[i].kind == 2)) continue;
+            if (native_libc && bindings[index]) continue;
+            listed[index]=1; ++count;
+            printf("UNRESOLVED %s %s\n", names[index], runtime_import_name(names[index]));
+        }
+        printf("UNRESOLVED total %u\n", count);
+        fflush(stdout);
+        _Exit(0);
+    }
     /* The Hunter's Dream backend reads the game's code before the patches change it. */
     if (bloodborne) bbnet_set_image(image, size);
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
@@ -730,7 +790,7 @@ int main(int argc, char **argv) {
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
-            int init_executable=0;
+            int init_executable=!modules[m].init; /* 0: no initializer */
             for (uint64_t i=0;i<ns;++i)
                 if ((segments[i].flags&1) && modules[m].init>=segments[i].address && modules[m].init-segments[i].address<segments[i].size) init_executable=1;
             if (!init_executable) fail("module init is not executable");
@@ -742,6 +802,7 @@ int main(int argc, char **argv) {
         runtime_set_procparam(image+procparam);
         /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
         for (uint64_t m=0;m<module_count;++m) {
+            if (!modules[m].init) continue;
             printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
             typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
             int result=((ModuleInit)(image+modules[m].init))(0,NULL,NULL);

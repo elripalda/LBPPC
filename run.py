@@ -33,11 +33,18 @@ def main(argv):
     user = HERE / 'user'
     user.mkdir(exist_ok=True)
     script('prepare.py', game, '--out', OUT)
-    script('link_modules.py', game, '--out', OUT)
+    # The game's own modules (LBP3's FMOD plugins) are linked too; sceKernelLoadStartModule hands them out.
+    plugins = sorted(p.relative_to(game).as_posix() for p in game.glob('gamedata_orbis/spu/*.prx'))
+    script('link_modules.py', game, '--out', OUT, '--modules', 'libc.prx', 'libSceFios2.prx', *plugins)
+    script('content_profile.py', game, '--out', OUT)
     env = dict(os.environ)
+    # Bloodborne's parallel draw preparation corrupts its submission list under LBP3 (random crashes in
+    # Rasterizer::RetireSubmission); off until that is fixed.
+    env.setdefault('BB_DRAW_PIPE', '0')
     if MSYS2_BIN.is_dir():
         env['PATH'] = f'{MSYS2_BIN}{os.pathsep}{env.get("PATH", "")}'
-    command = [str(probe), str(OUT / 'boot-linked.bin'), '--app0', str(game), '--user', str(user), *argv[1:]]
+    command = [str(probe), str(OUT / 'boot-linked.bin'), '--content-profile', str(OUT / 'content.bin'),
+               '--app0', str(game), '--user', str(user), '--timeout', '0', *argv[1:]]
     with (OUT / 'last_run.log').open('wb') as log:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, env=env, cwd=HERE)

@@ -254,7 +254,9 @@ def link(game, out, module_names=DEFAULT_MODULES):
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
     for filename in module_names:
-        m = module(game / 'sce_module' / filename)
+        # A bare name is a system module of sce_module/; a path is a module the game loads itself
+        # (sceKernelLoadStartModule), such as LBP3's gamedata_orbis/spu/*.prx.
+        m = module(game / filename if '/' in filename else game / 'sce_module' / filename)
         if filename == 'libc.prx':
             libc_changes = patch_libc(m)
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
@@ -272,6 +274,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
             segments.append((base + p['vaddr'], p['memsz'], p['flags']))
         tls = next((p for p in m['ph'] if p['type'] == 7), None)
         module_id = 0
+        if tls and not tls['memsz']:
+            tls = None  # an empty TLS header (LBP3's plugins) needs no TLS module id
         if tls:
             if tls['filesz'] > tls['memsz'] or not mapped(tls['vaddr'], tls['memsz']):
                 raise ValueError(f'{filename}: unsupported TLS layout')
@@ -318,7 +322,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
                 by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
                 count += 1
         fs_patched += patch_fs_loads(image, m['ph'], base)
-        table.append(dict(file=filename, base=base, size=modsize, init=base + m['tags'].get(12, 0),
+        # DT_INIT 0 is the module's first byte (libc's entry, too); no DT_INIT at all: 0, nothing runs at start.
+        table.append(dict(file=filename, base=base, size=modsize, init=base + m['tags'][12] if 12 in m['tags'] else 0,
                           tls_address=base + tls['vaddr'] if tls else 0, tls_memsz=tls['memsz'] if tls else 0,
                           tls_filesz=tls['filesz'] if tls else 0, tls_module=module_id,
                           tls_relocations=tls_relocations, exports=count, sha256=m['sha256']))

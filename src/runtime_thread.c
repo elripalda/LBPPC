@@ -354,6 +354,23 @@ static ABI int32_t thread_set_prio(GuestThread *t,int prio) {
 #endif
     return 0;
 }
+/* Policy and parameter (its first int is the priority), for games that set them on a running thread. */
+enum { SCHED_POLICY_OTHER=2 };
+static ABI int32_t thread_get_sched(GuestThread *t,int *policy,int *param) {
+    if (!policy || !param) return ERR(22);
+    *policy=SCHED_POLICY_OTHER;
+    return thread_get_prio(t,param);
+}
+static ABI int32_t thread_set_sched(GuestThread *t,int policy,const int *param) {
+    (void)policy;
+    if (!param) return ERR(22);
+    return thread_set_prio(t,*param);
+}
+/* A stack the game allocated itself: the thread gets one of that size from the runtime. */
+static ABI int32_t attr_set_stack_at(ThreadAttr **slot,void *address,uint64_t size) {
+    (void)address;
+    return attr_set_stack(slot,size);
+}
 static ABI int32_t thread_set_affinity(GuestThread *t,uint64_t mask) {
     if (!find_thread(t)) return ERR(3);
     t->attr.affinity=mask; return 0;
@@ -413,6 +430,8 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"T72hz6ffq08#p#J",thread_yield}, {"1tKyG7RlMJo#p#J",thread_get_prio},
         {"W0Hpm2X0uPE#p#J",thread_set_prio}, {"bt3CTBKmGyI#p#J",thread_set_affinity}, {"rcrVFJsQWRY#p#J",thread_get_affinity},
         {"GBUY7ywdULE#p#J",thread_rename}, {"3PtV6p3QNX4#p#J",thread_equal},
+        {"P41kTWUS3EI#p#J",thread_get_sched}, {"oIRFTjoILbg#p#J",thread_set_sched},
+        {"Bvn74vj6oLo#p#J",attr_set_stack_at},
         {"wtkt-teR1so#I#J",posix_attr_init}, {"zHchY8ft5pk#I#J",posix_attr_destroy},
         {"E+tyo3lp5Lw#I#J",posix_attr_set_detach}, {"2Q0z6rnBrTE#I#J",posix_attr_set_stack},
         {"euKRgm0Vn2M#I#J",posix_attr_set_param}, {"OxhIB8LB-PQ#I#J",posix_create},

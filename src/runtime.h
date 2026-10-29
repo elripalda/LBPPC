@@ -97,4 +97,6 @@ void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+/* Functions Bloodborne never imported, for other games (runtime_extra.c). */
+uintptr_t runtime_extra_resolve(const char *name);
 #endif
