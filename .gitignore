@@ -51,3 +51,7 @@ vkd3d-proton.cache
 /fsr4vk/
 fsr4_shaders/
 /benchmarks/
+
+# Created by the runtime at start
+input.ini
+bbport.ini
