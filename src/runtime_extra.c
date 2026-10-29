@@ -13,9 +13,25 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+typedef SOCKET HostSocket;
+#define socket_error(s) ((s)==INVALID_SOCKET)
+#define last_socket_error() WSAGetLastError()
+#define WOULD_BLOCK WSAEWOULDBLOCK
 #else
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+typedef int HostSocket;
+#define socket_error(s) ((s)<0)
+#define closesocket close
+#define last_socket_error() errno
+#define WOULD_BLOCK EWOULDBLOCK
 #endif
 
 #define ORBIS_OK 0
@@ -333,16 +349,173 @@ static int jpeg_seen;
 static ABI int32_t jpeg_decode_failed(void) { note_once(&jpeg_seen,"JPEG: decoding not implemented yet"); return JPEG_DEC_FAILED; }
 static ABI int32_t jpeg_encode_failed(void) { note_once(&jpeg_seen,"JPEG: encoding not implemented yet"); return JPEG_ENC_FAILED; }
 
-/* Sockets as on a console with the cable unplugged: they are created and bound, nothing arrives and sending
- * fails as unreachable (a failing socket() kept LBP3 retrying on "Connecting to LittleBigPlanet 3 online"). */
-static ABI int32_t socket_open(int32_t family,int32_t type,int32_t protocol) {
-    (void)family; (void)type; (void)protocol;
-    static int32_t next=0x4000;
-    return __atomic_add_fetch(&next,1,__ATOMIC_RELAXED);
+/* Sockets: real host sockets on this PC only. A game may send to itself on 127.0.0.1 to wake its own threads
+ * (LBP3 does, on port 3658: with sockets that dropped every packet it stayed on "Connecting to LittleBigPlanet
+ * 3 online" for ever). Binding is to 127.0.0.1 whatever the game asks, so nothing listens on the network,
+ * and sending anywhere else fails as unreachable: offline, as with the cable unplugged. Sockets never block
+ * (games set that anyway); sceNetEpollWait waits for them with select. */
+enum { SOCKET_BASE=0x4000, MAX_SOCKETS=256 };
+static struct { HostSocket host; int used, type; } sockets[MAX_SOCKETS];
+static pthread_mutex_t socket_lock=PTHREAD_MUTEX_INITIALIZER;
+static int socket_slot(int32_t fd) {
+    int i=fd-SOCKET_BASE;
+    return i>=0 && i<MAX_SOCKETS && sockets[i].used ? i : -1;
 }
-static ABI int32_t socket_bind(void) { return 0; }
-static ABI int64_t socket_send(void) { *runtime_errno()=runtime_guest_errno(ENETUNREACH); return -1; }
-static ABI int64_t socket_receive(void) { *runtime_errno()=runtime_guest_errno(EAGAIN); return -1; }
+static int32_t socket_fail(int host_errno) { *runtime_errno()=runtime_guest_errno(host_errno); return -1; }
+static int32_t socket_host_fail(void) {
+    int e=last_socket_error();
+    return socket_fail(e==WOULD_BLOCK || e==EAGAIN ? EAGAIN : ECONNREFUSED);
+}
+/* PS4 (BSD) sockaddr_in: length, family, port (network order), address, zero. */
+typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } GuestAddr;
+static int loopback(uint32_t addr) { return (ntohl(addr)>>24)==127; }
+static ABI int32_t socket_open(int32_t family,int32_t type,int32_t protocol) {
+    (void)protocol;
+#ifdef _WIN32
+    static int started;
+    if (!started) { WSADATA data; WSAStartup(MAKEWORD(2,2),&data); started=1; }
+#endif
+    if (family!=2) return socket_fail(EAFNOSUPPORT);
+    int stream=type==1 || type==10; /* SOCK_STREAM, PS4 SOCK_STREAM_P2P */
+    if (!stream && type!=2 && type!=6) return socket_fail(EPROTONOSUPPORT); /* SOCK_DGRAM, SOCK_DGRAM_P2P */
+    HostSocket s=socket(AF_INET,stream ? SOCK_STREAM : SOCK_DGRAM,0);
+    if (socket_error(s)) return socket_fail(EMFILE);
+#ifdef _WIN32
+    u_long on=1;
+    ioctlsocket(s,FIONBIO,&on);
+#else
+    fcntl(s,F_SETFL,fcntl(s,F_GETFL)|O_NONBLOCK);
+#endif
+    pthread_mutex_lock(&socket_lock);
+    int i=0;
+    while (i<MAX_SOCKETS && sockets[i].used) ++i;
+    if (i<MAX_SOCKETS) { sockets[i].host=s; sockets[i].used=1; sockets[i].type=type; }
+    pthread_mutex_unlock(&socket_lock);
+    if (i==MAX_SOCKETS) { closesocket(s); return socket_fail(EMFILE); }
+    return SOCKET_BASE+i;
+}
+static ABI int32_t socket_bind(int32_t fd,const GuestAddr *addr,uint32_t size) {
+    int i=socket_slot(fd);
+    if (i<0) return socket_fail(EBADF);
+    if (!addr || size<8) return socket_fail(EINVAL);
+    struct sockaddr_in host={0};
+    host.sin_family=AF_INET;
+    host.sin_port=addr->port;
+    host.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    if (bind(sockets[i].host,(struct sockaddr *)&host,sizeof(host))) return socket_fail(EADDRINUSE);
+    return 0;
+}
+static ABI int64_t socket_send(int32_t fd,const void *data,uint64_t size,int32_t flags,const GuestAddr *to,uint32_t to_size) {
+    (void)flags;
+    int i=socket_slot(fd);
+    if (i<0) return socket_fail(EBADF);
+    if (!to || to_size<8 || !loopback(to->addr)) return socket_fail(ENETUNREACH);
+    struct sockaddr_in host={0};
+    host.sin_family=AF_INET;
+    host.sin_port=to->port;
+    host.sin_addr.s_addr=to->addr;
+    int64_t n=sendto(sockets[i].host,data,(int)size,0,(struct sockaddr *)&host,sizeof(host));
+    return n<0 ? socket_host_fail() : n;
+}
+static ABI int64_t socket_receive_from(int32_t fd,void *data,uint64_t size,int32_t flags,GuestAddr *from,uint32_t *from_size) {
+    (void)flags;
+    int i=socket_slot(fd);
+    if (i<0) return socket_fail(EBADF);
+    struct sockaddr_in host={0};
+    socklen_t host_size=sizeof(host);
+    int64_t n=recvfrom(sockets[i].host,data,(int)size,0,(struct sockaddr *)&host,&host_size);
+    if (n<0) return socket_host_fail();
+    if (from && from_size && *from_size>=sizeof(GuestAddr)) {
+        memset(from,0,sizeof(*from));
+        from->len=sizeof(GuestAddr);
+        from->family=2;
+        from->port=host.sin_port;
+        from->addr=host.sin_addr.s_addr;
+        *from_size=sizeof(GuestAddr);
+    }
+    return n;
+}
+static ABI int64_t socket_receive(int32_t fd,void *data,uint64_t size,int32_t flags) {
+    return socket_receive_from(fd,data,size,flags,NULL,NULL);
+}
+static ABI int32_t socket_close(int32_t fd) {
+    int i=socket_slot(fd);
+    if (i<0) return socket_fail(EBADF);
+    pthread_mutex_lock(&socket_lock);
+    closesocket(sockets[i].host);
+    sockets[i].used=0;
+    pthread_mutex_unlock(&socket_lock);
+    return 0;
+}
+static ABI int32_t socket_option(int32_t fd,int32_t level,int32_t name,const void *value,uint32_t size) {
+    (void)level; (void)name; (void)value; (void)size;
+    return socket_slot(fd)<0 ? (int32_t)0x80410109 /* EBADF */ : 0; /* the sockets never block already */
+}
+/* Epoll: which sockets each epoll id watches, with the game's event mask and data. */
+typedef struct { uint32_t events, reserved; uint64_t ident, data; } EpollEvent;
+enum { EPOLL_IN=1, EPOLL_DEL=3, MAX_WATCHES=64 };
+static struct { int32_t epoll, fd; uint32_t events; uint64_t data; } watches[MAX_WATCHES];
+static ABI int32_t epoll_control(int32_t epoll,int32_t op,int32_t fd,const EpollEvent *event) {
+    pthread_mutex_lock(&socket_lock);
+    int found=-1, empty=-1;
+    for (int i=0;i<MAX_WATCHES;++i) {
+        if (watches[i].epoll && watches[i].epoll==epoll && watches[i].fd==fd) found=i;
+        if (!watches[i].epoll && empty<0) empty=i;
+    }
+    int32_t result=0;
+    if (op==EPOLL_DEL) {
+        if (found>=0) watches[found].epoll=0;
+    } else {
+        int i=found>=0 ? found : empty;
+        if (i<0) result=(int32_t)0x8041010c; /* ENOMEM */
+        else {
+            watches[i].epoll=epoll;
+            watches[i].fd=fd;
+            watches[i].events=event ? event->events : EPOLL_IN;
+            watches[i].data=event ? event->data : 0;
+        }
+    }
+    pthread_mutex_unlock(&socket_lock);
+    return result;
+}
+static ABI int32_t epoll_wait(int32_t epoll,EpollEvent *events,int32_t max,int32_t timeout_us) {
+    fd_set read;
+    FD_ZERO(&read);
+    int watched=0;
+    HostSocket highest=0;
+    pthread_mutex_lock(&socket_lock);
+    for (int i=0;i<MAX_WATCHES;++i) {
+        int s=watches[i].epoll==epoll ? socket_slot(watches[i].fd) : -1;
+        if (s<0 || !(watches[i].events&EPOLL_IN)) continue;
+        FD_SET(sockets[s].host,&read);
+        ++watched;
+        if (sockets[s].host>highest) highest=sockets[s].host;
+    }
+    pthread_mutex_unlock(&socket_lock);
+    struct timeval wait={timeout_us<0 ? 1 : timeout_us/1000000, timeout_us<0 ? 0 : timeout_us%1000000};
+    if (!watched) {
+#ifdef _WIN32
+        Sleep((DWORD)(wait.tv_sec*1000+wait.tv_usec/1000));
+#else
+        select(0,NULL,NULL,NULL,&wait);
+#endif
+        return 0;
+    }
+    if (select((int)highest+1,&read,NULL,NULL,&wait)<=0) return 0;
+    int32_t count=0;
+    pthread_mutex_lock(&socket_lock);
+    for (int i=0;i<MAX_WATCHES && count<max;++i) {
+        int s=watches[i].epoll==epoll ? socket_slot(watches[i].fd) : -1;
+        if (s<0 || !FD_ISSET(sockets[s].host,&read)) continue;
+        events[count].events=EPOLL_IN;
+        events[count].reserved=0;
+        events[count].ident=(uint64_t)watches[i].fd;
+        events[count].data=watches[i].data;
+        ++count;
+    }
+    pthread_mutex_unlock(&socket_lock);
+    return count;
+}
 
 /* Modules the game loads itself (LBP3's FMOD plugins): run.py links them into the image at start, and they
  * have no initializer or module_start, so loading one only hands out a handle. A module that is not there
@@ -409,8 +582,9 @@ static const RuntimeExport exports[]={
     {"sceJpegDecParseHeader",jpeg_decode_failed}, {"sceJpegDecDecode",jpeg_decode_failed},
     {"sceJpegEncQueryMemorySize",jpeg_memory_size}, {"sceJpegEncCreate",jpeg_create}, {"sceJpegEncDelete",jpeg_delete},
     {"sceJpegEncEncode",jpeg_encode_failed},
-    {"socket",socket_open}, {"bind",socket_bind}, {"recv",socket_receive}, {"recvfrom",socket_receive},
-    {"sendto",socket_send},
+    {"socket",socket_open}, {"bind",socket_bind}, {"recv",socket_receive}, {"recvfrom",socket_receive_from},
+    {"sendto",socket_send}, {"sceNetSetsockopt",socket_option}, {"sceNetSocketClose",socket_close},
+    {"sceNetEpollControl",epoll_control}, {"sceNetEpollWait",epoll_wait},
     {"sceKernelLoadStartModule",load_start_module},
     {"sceSystemServiceGetDisplaySafeAreaInfo",safe_area}, {"scePadSetLightBar",pad_light_bar},
     {"sceVoiceGetPortAttr",voice_port_attr},

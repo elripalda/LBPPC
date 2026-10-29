@@ -352,6 +352,18 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
                                 module==GetModuleHandleA("vcruntime140.dll")))
             ours=1;
         if (ours) return fatal_exception(info);
+        /* Not ours (a driver, SDL, Windows): its owner may handle it. The first few are noted with WriteFile
+         * alone (no locks), since a process that then ends with no report died of one of them. */
+        static volatile long noted;
+        if (InterlockedIncrement(&noted)<=8) {
+            char line[256], where[MAX_PATH+64];
+            describe_address(where,sizeof(where),rip);
+            int n=snprintf(line,sizeof(line),"Exception 0x%08lx in %s, address %p, rsp %p (thread %lu), passed on\n",
+                           code,where,record->NumberParameters>=2 ? (void *)record->ExceptionInformation[1] : NULL,
+                           (void *)(uintptr_t)info->ContextRecord->Rsp,GetCurrentThreadId());
+            DWORD written;
+            if (n>0) WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
+        }
     }
     /* BB_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
     if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);

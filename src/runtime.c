@@ -157,8 +157,10 @@ static ABI void guard_abort(uint64_t *guard) {
     atomic_fetch_and_explicit((_Atomic uint64_t *)guard, UINT64_C(0xffffffff), memory_order_release);
 }
 static ABI __attribute__((noreturn)) void stack_fail(void) {
-    fputs("STOP: guest stack protector detected corruption\n", stderr);
-    exit(22);
+    /* The guest function whose canary was overwritten called this: its return address says which. */
+    fprintf(stderr, "STOP: guest stack protector detected corruption (called from %p)\n", __builtin_return_address(0));
+    fflush(stderr);
+    _Exit(22);
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);

@@ -101,9 +101,15 @@ static ABI int32_t mutex_unlock(GuestMutex **mutex) {
 static ABI int32_t mutex_destroy(GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
     if ((uintptr_t)*mutex < 2) return 0;
-    int e = pthread_mutex_destroy(&(*mutex)->native);
-    if (!e) { free(*mutex); *mutex = (GuestMutex *)(uintptr_t)2; }
-    return orbis_error(e);
+    /* A locked mutex is busy, as on PS4. An unlocked one is only marked destroyed: its host mutex stays,
+     * since another thread may already hold the old pointer and be about to lock it (freeing it made
+     * LBP3's timed locks crash inside winpthreads now and then). Games destroy few mutexes. */
+    GuestMutex *native = *mutex;
+    int e = pthread_mutex_trylock(&native->native);
+    if (e) return orbis_error(EBUSY);
+    pthread_mutex_unlock(&native->native);
+    *mutex = (GuestMutex *)(uintptr_t)2;
+    return 0;
 }
 static int deadline_after(struct timespec *end, uint64_t usec) {
     if (clock_gettime(CLOCK_REALTIME, end)) return errno;
