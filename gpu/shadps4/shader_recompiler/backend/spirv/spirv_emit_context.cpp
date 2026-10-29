@@ -523,7 +523,18 @@ void EmitContext::DefineInputs() {
         interfaces.push_back(gl_in);
 
         const auto num_params = runtime_info.hw.gs.in_vertex_data_size / 4 - 1u;
+        // lbppc: only the parameters the shader reads. All of them (31 for an LBP3 shader) went
+        // past maxGeometryInputComponents (128 on NVIDIA) with gl_in's built-ins, and the GPU was
+        // lost. Unused outputs of the previous stage are fine. No recorded use: all, as before.
+        bool any_param_read = false;
+        for (u32 param_id = 0; param_id < num_params; ++param_id) {
+            any_param_read |= info.loads.GetAny(IR::Attribute(u32(IR::Attribute::Param0) + param_id));
+        }
         for (int param_id = 0; param_id < num_params; ++param_id) {
+            if (any_param_read &&
+                !info.loads.GetAny(IR::Attribute(u32(IR::Attribute::Param0) + u32(param_id)))) {
+                continue;
+            }
             const Id type{TypeArray(F32[4], ConstU32(num_verts_in))};
             const Id id{DefineInput(type, param_id)};
             Name(id, fmt::format("gs_in_attr{}", param_id));

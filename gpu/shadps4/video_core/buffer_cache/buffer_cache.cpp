@@ -260,6 +260,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
+    // lbppc diagnostics: LBPPC_NO_DOWNLOAD=1 keeps GPU-written data out of guest memory.
+    static const bool no_download = std::getenv("LBPPC_NO_DOWNLOAD") != nullptr;
+    if (no_download) {
+        static int logged;
+        if (logged++ < 5) {
+            std::printf("lbppc: download of %zu ranges at %#llx skipped\n", copies.size(),
+                        (unsigned long long)device_addr);
+        }
+        copies.clear();
+    }
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),

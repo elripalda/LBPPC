@@ -15,6 +15,7 @@ for y in range(height):
     row = bytearray(data[y * width * 4:(y + 1) * width * 4])
     if bgra:
         row[0::4], row[2::4] = row[2::4], row[0::4]
+    row[3::4] = bytes([255]) * width  # the alpha of a display buffer is not what is shown
     rows.append(b'\0' + bytes(row))
 
 

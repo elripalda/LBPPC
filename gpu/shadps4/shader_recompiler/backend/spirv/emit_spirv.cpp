@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -435,8 +436,23 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         execution_model = spv::ExecutionModel::Geometry;
         ctx.AddExecutionMode(main, GetInputPrimitiveType(ctx.runtime_info.hw.gs.in_primitive));
         ctx.AddExecutionMode(main, GetOutputPrimitiveType(ctx.runtime_info.hw.gs.out_primitive[0]));
-        ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices,
-                             ctx.runtime_info.hw.gs.output_vertices);
+        {
+            // lbppc: within maxGeometryTotalOutputComponents, 1024 on NVIDIA and the least Vulkan
+            // guarantees. AMD's GS writes its ring in memory, so a PS4 shader may declare 64
+            // vertices of 9 attributes (2688 components, LBP3): declared as such, the NVIDIA GPU
+            // was lost. Vertices past the cap are dropped instead.
+            const u32 per_vertex = info.gs_copy_data.num_attrs * 4 + 4 + 1 +
+                                   (info.stores.GetAny(IR::Attribute::ClipDistance) ? 8 : 0) +
+                                   (info.stores.GetAny(IR::Attribute::CullDistance) ? 8 : 0);
+            const u32 declared = ctx.runtime_info.hw.gs.output_vertices;
+            const u32 output_vertices = std::max(1u, std::min(declared, 1024u / per_vertex));
+            if (output_vertices < declared) {
+                std::printf("lbppc: geometry shader %016llx: %u output vertices capped to %u "
+                            "(%u components each, 1024 at most)\n",
+                            (unsigned long long)info.pgm_hash, declared, output_vertices, per_vertex);
+            }
+            ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, output_vertices);
+        }
         ctx.AddExecutionMode(main, spv::ExecutionMode::Invocations,
                              ctx.runtime_info.hw.gs.num_invocations);
         break;
