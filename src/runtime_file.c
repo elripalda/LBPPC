@@ -430,7 +430,8 @@ static int64_t do_open(const char *guest,int flags,int mode) {
 #endif
     pthread_mutex_lock(&lock);
     int fd=-1;
-    for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
+    /* 960-1023 are sockets (runtime_extra.c): descriptors stay below 1024, the size of a game's fd_set. */
+    for (int i=3;i<MAX_FILES-64;++i) if (!files[i].used) { fd=i; break; }
     if (fd<0) {
         pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir);
         if (temp) unlink(temp);

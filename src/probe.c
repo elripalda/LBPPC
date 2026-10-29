@@ -106,14 +106,35 @@ static uintptr_t trace_wrap(uintptr_t target, const char *name) {
 /* BB_HOOK=offset:length,... (diagnostics): at those guest offsets the first `length` bytes (whole
  * instructions, at least 5, no rip-relative ones) become a jump to a stub that logs the first two arguments,
  * the int each points to (when readable) and the return address, runs the moved bytes and jumps back. */
-static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t ret) {
+static volatile LONG watch_hits;
+/* BB_WATCH=offset (with BB_HOOK at the same function): a hardware watchpoint on the 8 bytes at entry rsp -
+ * offset (a stack canary slot: entry rsp - 0x38 for push rbp + canary at rbp-0x30), reporting every write. */
+static void watch_slot(uint64_t entry_rsp) {
+    const char *spec=getenv("BB_WATCH");
+    if (!spec) return;
+    CONTEXT c={.ContextFlags=CONTEXT_DEBUG_REGISTERS};
+    c.Dr0=entry_rsp-strtoull(spec,NULL,0);
+    c.Dr7=1 | (1u<<16) | (2u<<18); /* L0, break on write, 8 bytes */
+    SetThreadContext(GetCurrentThread(),&c);
+    char line[96];
+    int n=snprintf(line,sizeof(line),"WATCH %p (thread %lu)\n",(void *)(uintptr_t)c.Dr0,GetCurrentThreadId());
+    DWORD written;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
+}
+static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot) {
+    uint64_t ret=*(uint64_t *)(uintptr_t)slot;
+    watch_slot(slot);
     static volatile long count;
     long n=InterlockedIncrement(&count);
     if (n>200) return;
     char line[256];
     int32_t va=0, vb=0;
     SIZE_T got;
-    int ra=a && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)a,&va,4,&got) && got==4;
+    /* BB_HOOK_FIELD=offset: the int at that offset in the first argument instead of at its start. */
+    static const char *field;
+    if (!field) field=getenv("BB_HOOK_FIELD") ? getenv("BB_HOOK_FIELD") : "0";
+    uint64_t at=a ? a+strtoull(field,NULL,0) : 0;
+    int ra=at && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)at,&va,4,&got) && got==4;
     int rb=b && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)b,&vb,4,&got) && got==4;
     int len=snprintf(line,sizeof(line),"HOOK 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x]) from guest 0x%llx (thread %lu)\n",
                      (unsigned long long)offset,(unsigned long long)a,ra?"":"?",(unsigned)va,(unsigned long long)b,
@@ -140,7 +161,7 @@ static void hooks_install(const char *spec) {
            rdi=offset; call hook_log; pop; moved bytes; jmp back. */
         static const unsigned char push[]={0x57,0x56,0x52,0x51,0x41,0x50,0x41,0x51,0x50};
         memcpy(o,push,sizeof(push)); o+=sizeof(push);
-        *o++=0x48; *o++=0x8b; *o++=0x4c; *o++=0x24; *o++=0x38; /* mov rcx,[rsp+56] */
+        *o++=0x48; *o++=0x8d; *o++=0x4c; *o++=0x24; *o++=0x38; /* lea rcx,[rsp+56]: the return slot */
         *o++=0x48; *o++=0x89; *o++=0xf2;                       /* mov rdx,rsi */
         *o++=0x48; *o++=0x89; *o++=0xfe;                       /* mov rsi,rdi */
         *o++=0x48; *o++=0xbf; memcpy(o,&offset,8); o+=8;       /* mov rdi,offset */
@@ -380,6 +401,21 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if (code==EXCEPTION_SINGLE_STEP && (info->ContextRecord->Dr6&1)) { /* BB_WATCH: a write to the slot */
+        if (InterlockedIncrement(&watch_hits)<=12) {
+            char line[256], where[MAX_PATH+64], from[MAX_PATH+64];
+            describe_address(where,sizeof(where),(uintptr_t)info->ContextRecord->Rip);
+            uint64_t value=*(uint64_t *)(uintptr_t)info->ContextRecord->Dr0;
+            uint64_t top=*(uint64_t *)(uintptr_t)info->ContextRecord->Rsp;
+            describe_address(from,sizeof(from),(uintptr_t)top);
+            int n=snprintf(line,sizeof(line),"WATCH write before %s, value %016llx, [rsp] %s\n",where,
+                           (unsigned long long)value,from);
+            DWORD written;
+            WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
+        }
+        info->ContextRecord->Dr6=0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;

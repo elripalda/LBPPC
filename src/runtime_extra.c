@@ -354,7 +354,9 @@ static ABI int32_t jpeg_encode_failed(void) { note_once(&jpeg_seen,"JPEG: encodi
  * 3 online" for ever). Binding is to 127.0.0.1 whatever the game asks, so nothing listens on the network,
  * and sending anywhere else fails as unreachable: offline, as with the cable unplugged. Sockets never block
  * (games set that anyway); sceNetEpollWait waits for them with select. */
-enum { SOCKET_BASE=0x4000, MAX_SOCKETS=256 };
+/* Small numbers, as on PS4: games index fd_set bit arrays (1024 bits) with them. LBP3's set a bit 2 KiB past its
+   set with 0x4000, on another function's stack canary. Files take 3-959 (runtime_file.c). */
+enum { SOCKET_BASE=960, MAX_SOCKETS=64 };
 static struct { HostSocket host; int used, type; } sockets[MAX_SOCKETS];
 static pthread_mutex_t socket_lock=PTHREAD_MUTEX_INITIALIZER;
 static int socket_slot(int32_t fd) {
