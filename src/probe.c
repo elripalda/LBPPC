@@ -644,19 +644,24 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
+    char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+    uint32_t attributes=0;
+    snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
+    sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
+    sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
+    sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
+    /* The hooks below (Rebirth, PC menu, Discord status, The Hunter's Dream) work on Bloodborne's own code
+       at its addresses: any other game keeps them off. */
+    const int bloodborne=!strncmp(title,"Bloodborne",10);
     image = allocate(round_page(size));
-    runtime_rebirth_set_image(image);
-    bbgpu_pc_menu_set_image(image);
+    if (bloodborne) {
+        runtime_rebirth_set_image(image);
+        bbgpu_pc_menu_set_image(image);
+    }
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
-    runtime_discord_start(image);
+    if (bloodborne) runtime_discord_start(image);
     if (!cpu_only) {
-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
-        uint32_t attributes=0;
-        snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
-        sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
-        sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
-        sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
         uint64_t sdk=0;
         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
         BbGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080};
@@ -693,9 +698,9 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     /* The Hunter's Dream backend reads the game's code before the patches change it. */
-    bbnet_set_image(image, size);
+    if (bloodborne) bbnet_set_image(image, size);
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-    bbgpu_pc_menu_prepare(image);
+    if (bloodborne) bbgpu_pc_menu_prepare(image);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
@@ -744,7 +749,7 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
-    bbnet_initialize(); /* the online session starts with the game */
+    if (bloodborne) bbnet_initialize(); /* the online session starts with the game */
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

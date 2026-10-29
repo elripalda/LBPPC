@@ -241,10 +241,15 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"
 };
-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
+/* Symbol name for a scoped NID (NID#library#module), or NULL when the table has no name for it. Matched by
+ * the NID alone: the table's scopes are Bloodborne's, and its runtime exports have no scope. */
 const char *runtime_symbol(const char *nid) {
-    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
-        if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+    const char *hash=strchr(nid,'#');
+    size_t length=hash ? (size_t)(hash-nid) : strlen(nid);
+    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i) {
+        const char *entry=import_names[i].nid;
+        if (!strncmp(entry,nid,length) && (entry[length]=='#' || !entry[length])) return import_names[i].symbol;
+    }
     return NULL;
 }
 /* Same symbol name means same contract whether imported from libkernel or

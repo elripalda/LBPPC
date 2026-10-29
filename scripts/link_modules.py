@@ -177,6 +177,43 @@ def protect_image(image, segments, untranslated, relocs, path=RED_ZONE_SITES):
     return report
 
 
+# The runtime's tables name imports as Bloodborne's eboot spells them: NID#library id#module id, where the
+# ids are that eboot's own numbering (libkernel is p#J there). Every game numbers its libraries differently.
+RUNTIME_LIBRARIES = {
+    'libSceAjm': 'N', 'libSceAppContent': 'c', 'libSceAudioIn': 'Y', 'libSceAudioOut': 'G', 'libSceAvPlayer': 'm',
+    'libSceCommonDialog': 'Z', 'libSceFios2': 'F', 'libSceGameLiveStreaming': 'e', 'libSceGnmDriver': 'B',
+    'libSceHttp': 'K', 'libSceImeDialog': 'b', 'libSceMouse': 'U', 'libSceMsgDialog': 'j', 'libSceNet': 'E',
+    'libSceNetCtl': 'J', 'libSceNpAuth': 'X', 'libSceNpCommerce': 'k', 'libSceNpCommon': 'Q', 'libSceNpManager': 'R',
+    'libSceNpMatching2': 'P', 'libSceNpProfileDialog': 'h', 'libSceNpScore': 'o', 'libSceNpSignaling': 'T',
+    'libSceNpTrophy': 'l', 'libSceNpUtility': 'S', 'libSceNpWebApi': 'W', 'libScePad': 'A', 'libScePlayGo': 'n',
+    'libScePosix': 'I', 'libSceRtc': 'H', 'libSceSaveData': 'O', 'libSceSaveDataDialog': 'd', 'libSceScreenShot': 'g',
+    'libSceSsl': 'L', 'libSceSysmodule': 'M', 'libSceSystemService': 'V', 'libSceUserService': 'D',
+    'libSceVideoOut': 'C', 'libSceVideoRecording': 'f', 'libSceVoice': 'i', 'libSceWebBrowserDialog': 'a',
+    'libc': 'q', 'libkernel': 'p'}
+RUNTIME_MODULES = {
+    'libSceAjm': 'O', 'libSceAppContentUtil': 'd', 'libSceAudioIn': 'Z', 'libSceAudioOut': 'H', 'libSceAvPlayer': 'n',
+    'libSceCommonDialog': 'a', 'libSceFios2': 'G', 'libSceGameLiveStreaming': 'f', 'libSceGnmDriver': 'C',
+    'libSceHttp': 'L', 'libSceImeDialog': 'c', 'libSceMouse': 'V', 'libSceMsgDialog': 'k', 'libSceNet': 'F',
+    'libSceNetCtl': 'K', 'libSceNpAuth': 'Y', 'libSceNpCommerce': 'l', 'libSceNpCommon': 'R', 'libSceNpManager': 'S',
+    'libSceNpMatching2': 'Q', 'libSceNpProfileDialog': 'i', 'libSceNpScore': 'p', 'libSceNpSignaling': 'U',
+    'libSceNpTrophy': 'm', 'libSceNpUtility': 'T', 'libSceNpWebApi': 'X', 'libScePad': 'B', 'libScePlayGo': 'o',
+    'libSceRtc': 'I', 'libSceSaveData': 'P', 'libSceSaveDataDialog': 'e', 'libSceScreenShot': 'h', 'libSceSsl': 'M',
+    'libSceSysmodule': 'N', 'libSceSystemService': 'W', 'libSceUserService': 'E', 'libSceVideoOut': 'D',
+    'libSceVideoRecording': 'g', 'libSceVoice': 'j', 'libSceWebBrowserDialog': 'b', 'libc': 'q', 'libkernel': 'J'}
+
+
+def runtime_spelling(name, main):
+    """An import name of this game's eboot (NID#library id#module id) as the runtime spells it: Bloodborne's ids
+    for the libraries it imported, NID#library for the others (as the linker names new libraries)."""
+    parts = name.split('#')
+    if len(parts) != 3 or parts[1] not in main['libraries'] or parts[2] not in main['modules']:
+        return name
+    library, module_name = main['libraries'][parts[1]][0], main['modules'][parts[2]][0]
+    if library in RUNTIME_LIBRARIES and module_name in RUNTIME_MODULES:
+        return f'{parts[0]}#{RUNTIME_LIBRARIES[library]}#{RUNTIME_MODULES[module_name]}'
+    return f'{parts[0]}#{library}'
+
+
 def link(game, out, module_names=DEFAULT_MODULES):
     main = module(game / 'eboot.bin')
     raw = (out / 'boot.bin').read_bytes()
@@ -321,7 +358,7 @@ def link(game, out, module_names=DEFAULT_MODULES):
             f.write(struct.pack('<3Q', *binding))
         for segment in segments:
             f.write(struct.pack('<3Q', *segment))
-        for name in names:
+        for name in (runtime_spelling(n, main) for n in names):
             if len(name.encode()) >= 128:
                 raise ValueError('name too long')
             f.write(name.encode().ljust(128, b'\0'))
