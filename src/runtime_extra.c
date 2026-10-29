@@ -333,9 +333,16 @@ static int jpeg_seen;
 static ABI int32_t jpeg_decode_failed(void) { note_once(&jpeg_seen,"JPEG: decoding not implemented yet"); return JPEG_DEC_FAILED; }
 static ABI int32_t jpeg_encode_failed(void) { note_once(&jpeg_seen,"JPEG: encoding not implemented yet"); return JPEG_ENC_FAILED; }
 
-/* Sockets of the network library: no network yet. */
-static ABI int32_t socket_unavailable(void) { *runtime_errno()=runtime_guest_errno(EACCES); return -1; }
-static ABI int32_t socket_bad(void) { *runtime_errno()=runtime_guest_errno(EBADF); return -1; }
+/* Sockets as on a console with the cable unplugged: they are created and bound, nothing arrives and sending
+ * fails as unreachable (a failing socket() kept LBP3 retrying on "Connecting to LittleBigPlanet 3 online"). */
+static ABI int32_t socket_open(int32_t family,int32_t type,int32_t protocol) {
+    (void)family; (void)type; (void)protocol;
+    static int32_t next=0x4000;
+    return __atomic_add_fetch(&next,1,__ATOMIC_RELAXED);
+}
+static ABI int32_t socket_bind(void) { return 0; }
+static ABI int64_t socket_send(void) { *runtime_errno()=runtime_guest_errno(ENETUNREACH); return -1; }
+static ABI int64_t socket_receive(void) { *runtime_errno()=runtime_guest_errno(EAGAIN); return -1; }
 
 /* Modules the game loads itself (LBP3's FMOD plugins): run.py links them into the image at start, and they
  * have no initializer or module_start, so loading one only hands out a handle. A module that is not there
@@ -402,8 +409,8 @@ static const RuntimeExport exports[]={
     {"sceJpegDecParseHeader",jpeg_decode_failed}, {"sceJpegDecDecode",jpeg_decode_failed},
     {"sceJpegEncQueryMemorySize",jpeg_memory_size}, {"sceJpegEncCreate",jpeg_create}, {"sceJpegEncDelete",jpeg_delete},
     {"sceJpegEncEncode",jpeg_encode_failed},
-    {"socket",socket_unavailable}, {"bind",socket_bad}, {"recv",socket_bad}, {"recvfrom",socket_bad},
-    {"sendto",socket_bad},
+    {"socket",socket_open}, {"bind",socket_bind}, {"recv",socket_receive}, {"recvfrom",socket_receive},
+    {"sendto",socket_send},
     {"sceKernelLoadStartModule",load_start_module},
     {"sceSystemServiceGetDisplaySafeAreaInfo",safe_area}, {"scePadSetLightBar",pad_light_bar},
     {"sceVoiceGetPortAttr",voice_port_attr},

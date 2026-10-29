@@ -38,9 +38,10 @@ def main(argv):
     script('link_modules.py', game, '--out', OUT, '--modules', 'libc.prx', 'libSceFios2.prx', *plugins)
     script('content_profile.py', game, '--out', OUT)
     env = dict(os.environ)
-    # Bloodborne's parallel draw preparation corrupts its submission list under LBP3 (random crashes in
-    # Rasterizer::RetireSubmission); off until that is fixed.
+    # Bloodborne's parallel draw preparation (the draw pipeline and its workers) corrupts memory under LBP3
+    # (random crashes in Rasterizer::RetireSubmission and heap frees); off until that is fixed.
     env.setdefault('BB_DRAW_PIPE', '0')
+    env.setdefault('BB_PREP_WORKERS', '0')
     if MSYS2_BIN.is_dir():
         env['PATH'] = f'{MSYS2_BIN}{os.pathsep}{env.get("PATH", "")}'
     command = [str(probe), str(OUT / 'boot-linked.bin'), '--content-profile', str(OUT / 'content.bin'),
@@ -52,7 +53,12 @@ def main(argv):
             log.write(line)
             sys.stdout.buffer.write(line)
             sys.stdout.flush()
-        return process.wait()
+        code = process.wait()
+    if code:
+        # Windows status codes say how it ended: 0xC00000FD stack overflow, 0xC0000374 heap corruption,
+        # 0xC0000409 fast fail (abort, a security check), 0xC0000005 access violation.
+        print(f'Game exited with 0x{code & 0xffffffff:08X}', file=sys.stderr)
+    return 0 if code == 0 else 1
 
 
 if __name__ == '__main__':

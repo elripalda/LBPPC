@@ -190,8 +190,20 @@ static ABI const char *net_ntop(int af,const void *src,char *dst,uint32_t size) 
 }
 static ABI int32_t netctl_state(int32_t *state) { if (!state) return NET_CTL_INVALID_ADDR; *state=0; return 0; }
 static ABI int32_t netctl_info(int code,void *info) { (void)code; (void)info; return NET_CTL_NOT_CONNECTED; }
-static ABI int32_t netctl_register(void *cb,void *arg,int32_t *cid) { (void)cb; (void)arg; if (!cid) return NET_CTL_INVALID_ADDR; *cid=new_id(); return 0; }
-static ABI int32_t netctl_check(void) { return 0; }
+/* The registered callback hears once, at its next check, that the cable is unplugged: games that wait
+ * for it (LittleBigPlanet 3) go on offline instead of "connecting" for ever. */
+typedef void (ABI *NetCtlCallback)(int event,void *arg);
+static struct { NetCtlCallback fn; void *arg; int told; } netctl_cb;
+enum { NET_CTL_EVENT_DISCONNECTED=1 };
+static ABI int32_t netctl_register_cb(NetCtlCallback cb,void *arg,int32_t *cid) {
+    if (!cid) return NET_CTL_INVALID_ADDR;
+    netctl_cb.fn=cb; netctl_cb.arg=arg; netctl_cb.told=0;
+    *cid=new_id(); return 0;
+}
+static ABI int32_t netctl_check(void) {
+    if (netctl_cb.fn && !netctl_cb.told) { netctl_cb.told=1; netctl_cb.fn(NET_CTL_EVENT_DISCONNECTED,netctl_cb.arg); }
+    return 0;
+}
 static ABI int32_t netctl_unregister(int cid) { (void)cid; return 0; }
 static ABI int32_t netctl_nat(uint32_t *info) {
     if (!info) return NET_CTL_INVALID_ADDR;
@@ -226,6 +238,19 @@ static ABI int32_t np_state(int32_t user,int32_t *state) {
 }
 static ABI int32_t np_signed_out(void) { return NP_SIGNED_OUT; }
 static ABI int32_t np_register(void *cb,void *arg) { (void)cb; (void)arg; return new_id(); }
+/* PSN state: the callback hears once, at the next sceNpCheckCallback, that user 1 is signed out. */
+typedef void (ABI *NpStateCallback)(int32_t user,int32_t state,const void *np_id,void *arg);
+static struct { NpStateCallback fn; void *arg; int told; } np_cb;
+static const unsigned char no_np_id[36];
+enum { NP_STATE_SIGNED_OUT=1 };
+static ABI int32_t np_register_state(NpStateCallback cb,void *arg) {
+    np_cb.fn=cb; np_cb.arg=arg; np_cb.told=0;
+    return new_id();
+}
+static ABI int32_t np_check_callback(void) {
+    if (np_cb.fn && !np_cb.told) { np_cb.told=1; np_cb.fn(USER_ID,NP_STATE_SIGNED_OUT,no_np_id,np_cb.arg); }
+    return 0;
+}
 static ABI void np_register_void(void *cb,void *arg) { (void)cb; (void)arg; }
 static ABI int32_t np_request(const void *param) { (void)param; return new_id(); }
 static ABI int32_t np_request_ctx(int32_t ctx,const void *param) { (void)ctx; (void)param; return new_id(); }
@@ -463,7 +488,7 @@ static const RuntimeExport exports[]={
     {"sceNetEpollControl",net_unreachable}, {"sceNetEpollWait",net_unreachable}, {"sceNetEpollAbort",net_unreachable},
     {"sceNetResolverStartNtoa",net_unreachable}, {"sceNetResolverStartAton",net_unreachable},
     {"sceNetCtlGetState",netctl_state}, {"sceNetCtlGetInfo",netctl_info},
-    {"sceNetCtlRegisterCallback",netctl_register}, {"sceNetCtlCheckCallback",netctl_check},
+    {"sceNetCtlRegisterCallback",netctl_register_cb}, {"sceNetCtlCheckCallback",netctl_check},
     {"sceNetCtlUnregisterCallback",netctl_unregister}, {"sceNetCtlGetNatInfo",netctl_nat},
     {"sceSslInit",lib_init_id}, {"sceSslTerm",ok_void},
     {"sceHttpInit",lib_init_id}, {"sceHttpTerm",ok_void},
@@ -479,9 +504,9 @@ static const RuntimeExport exports[]={
     {"sceHttpGetStatusCode",http_fail}, {"sceHttpGetResponseContentLength",http_fail},
     {"sceHttpReadData",http_fail},
     {"sceNpGetState",np_state}, {"sceNpGetOnlineId",np_signed_out}, {"sceNpGetNpId",np_signed_out},
-    {"sceNpRegisterStateCallback",np_register}, {"sceNpUnregisterStateCallback",ok_void},
+    {"sceNpRegisterStateCallback",np_register_state}, {"sceNpUnregisterStateCallback",ok_void},
     {"sceNpRegisterGamePresenceCallback",np_register_void}, {"sceNpRegisterPlusEventCallback",np_register},
-    {"sceNpUnregisterPlusEventCallback",ok_void}, {"sceNpCheckCallback",ok_void},
+    {"sceNpUnregisterPlusEventCallback",ok_void}, {"sceNpCheckCallback",np_check_callback},
     {"sceNpSetNpTitleId",ok_void}, {"sceNpNotifyPlusFeature",ok_void}, {"sceNpSetContentRestriction",ok_void},
     {"sceNpCreateAsyncRequest",np_request}, {"sceNpDeleteRequest",ok_void}, {"sceNpAbortRequest",ok_void},
     {"sceNpPollAsync",np_poll}, {"sceNpCheckNpAvailability",np_signed_out},

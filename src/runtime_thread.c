@@ -24,7 +24,9 @@
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
-#define STACK_MARGIN (256*1024)
+/* Room for host code (the runtime, the GPU layer, Windows) running on a guest thread, beyond what the game
+   asked for: LBP3 gives several threads 64 KiB, and 256 KiB of margin overflowed now and then. */
+#define STACK_MARGIN (2*1024*1024)
 #define MIN_STACK (64*1024)
 #define DEFAULT_STACK (1024*1024)
 #define DEFAULT_PRIO 700

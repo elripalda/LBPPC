@@ -49,6 +49,60 @@ static uint64_t read64(FILE *f) {
     return n;
 }
 static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
+/* BB_TRACE=prefix,prefix: imports whose names start with one of them log each call (name, first three
+ * arguments; the first 30 calls of each, then every 1000th) before going on to their implementation. */
+typedef struct { const char *name; unsigned long calls; } TraceTarget;
+static ABI void trace_call(TraceTarget *t, uint64_t a, uint64_t b, uint64_t c) {
+    unsigned long n=__atomic_add_fetch(&t->calls,1,__ATOMIC_RELAXED);
+    static FILE *out;
+    if (!out) { const char *f=getenv("BB_TRACE_FILE"); out=f ? fopen(f,"w") : stderr; if (!out) out=stderr; }
+    if (n<=30 || n%1000==0)
+        fprintf(out,"TRACE %s(0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ") #%lu\n",t->name,a,b,c,n);
+}
+static void *allocate(size_t size);
+static uintptr_t trace_wrap(uintptr_t target, const char *name) {
+    static const char *prefixes;
+    static unsigned char *code;
+    static size_t used, capacity;
+    if (!prefixes) prefixes=getenv("BB_TRACE") ? getenv("BB_TRACE") : "";
+    if (!*prefixes || !name) return target;
+    int match=0;
+    for (const char *p=prefixes; *p && !match;) {
+        const char *end=strchr(p,',');
+        size_t n=end ? (size_t)(end-p) : strlen(p);
+        match=n && !strncmp(name,p,n);
+        p=end ? end+1 : p+n;
+    }
+    if (!match) return target;
+    if (!code || used+96>capacity) {
+        capacity=1<<20; used=0;
+#ifdef _WIN32
+        code=VirtualAlloc(NULL,capacity,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+#else
+        code=mmap(NULL,capacity,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+#endif
+    }
+    TraceTarget *t=calloc(1,sizeof(*t));
+    t->name=name;
+    unsigned char *s=code+used, *o=s;
+    /* push rdi,rsi,rdx,rcx,r8,r9,rax (rsp 16-aligned again); rcx=rdx; rdx=rsi; rsi=rdi; rdi=t;
+       call trace_call; pop in reverse; jmp target (r11 is scratch at a call). */
+    static const unsigned char push[]={0x57,0x56,0x52,0x51,0x41,0x50,0x41,0x51,0x50};
+    memcpy(o,push,sizeof(push)); o+=sizeof(push);
+    *o++=0x48; *o++=0x89; *o++=0xd1; /* mov rcx,rdx */
+    *o++=0x48; *o++=0x89; *o++=0xf2; /* mov rdx,rsi */
+    *o++=0x48; *o++=0x89; *o++=0xfe; /* mov rsi,rdi */
+    *o++=0x48; *o++=0xbf; memcpy(o,&t,8); o+=8; /* mov rdi,t */
+    uintptr_t fn=(uintptr_t)trace_call;
+    *o++=0x48; *o++=0xb8; memcpy(o,&fn,8); o+=8; /* mov rax,trace_call */
+    *o++=0xff; *o++=0xd0; /* call rax */
+    static const unsigned char pop[]={0x58,0x41,0x59,0x41,0x58,0x59,0x5a,0x5e,0x5f};
+    memcpy(o,pop,sizeof(pop)); o+=sizeof(pop);
+    *o++=0x49; *o++=0xbb; memcpy(o,&target,8); o+=8; /* mov r11,target */
+    *o++=0x41; *o++=0xff; *o++=0xe3; /* jmp r11 */
+    used+=(size_t)((o-s+15)&~15);
+    return (uintptr_t)s;
+}
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
@@ -227,21 +281,32 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
             WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
             LocalFree(wide);
         }
+        /* Copy the registers and the top of the stack, then let the thread go at once: a suspended thread
+           can hold a lock that printing needs (stdio's, the loader's). */
         CONTEXT c={.ContextFlags=CONTEXT_FULL};
-        if (SuspendThread(thread)!=(DWORD)-1 && GetThreadContext(thread,&c)) {
+        static uintptr_t stack[512];
+        size_t words=0;
+        int captured=0;
+        if (SuspendThread(thread)!=(DWORD)-1) {
+            captured=GetThreadContext(thread,&c);
+            for (; captured && words<512; ++words) {
+                SIZE_T got=0;
+                if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c.Rsp+words*8),&stack[words],8,&got) || got!=8) break;
+            }
+            ResumeThread(thread);
+        }
+        if (captured) {
             char where[MAX_PATH+64];
             describe_address(where,sizeof(where),(uintptr_t)c.Rip);
             fprintf(stderr,"  thread %lu '%s' at %s\n",entry.th32ThreadID,name,where);
-            for (int slot=0, shown=0; slot<512 && shown<8; ++slot) {
-                uintptr_t value=0;
-                SIZE_T got=0;
-                if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c.Rsp+slot*8),&value,sizeof(value),&got) || got!=sizeof(value)) break;
+            for (size_t slot=0, shown=0; slot<words && shown<8; ++slot) {
+                uintptr_t value=stack[slot];
                 HMODULE owner=NULL;
                 int code_ref=(image && value-(uintptr_t)image<0x20000000) ||
                              (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)value,&owner) && owner==GetModuleHandleA(NULL));
                 if (!code_ref) continue;
                 describe_address(where,sizeof(where),value);
-                fprintf(stderr,"    [rsp+0x%x] %s\n",slot*8,where);
+                fprintf(stderr,"    [rsp+0x%zx] %s\n",slot*8,where);
                 ++shown;
             }
         }
@@ -733,6 +798,7 @@ int main(int argc, char **argv) {
                         : (uintptr_t)image + relocs[i].value;
         if (relocs[i].kind) {
             uintptr_t resolved = runtime_resolve(names[relocs[i].value], relocs[i].kind == 2);
+            if (resolved && relocs[i].kind == 1) resolved = trace_wrap(resolved, runtime_import_name(names[relocs[i].value]));
             if (resolved) value = resolved + relocs[i].addend;
             else if (native_libc && bindings[relocs[i].value]) {
                 uint64_t address=bindings[relocs[i].value];
