@@ -107,6 +107,35 @@ static uintptr_t trace_wrap(uintptr_t target, const char *name) {
  * instructions, at least 5, no rip-relative ones) become a jump to a stub that logs the first two arguments,
  * the int each points to (when readable) and the return address, runs the moved bytes and jumps back. */
 static volatile LONG watch_hits;
+/* BB_WATCH_ADDR=address: hardware write watchpoints on its first 32 bytes (four 8-byte slots) on every
+ * thread, re-applied every 50 ms for new threads; each write is logged (vectored_fault, first 40). */
+static uint64_t watch_address;
+static DWORD WINAPI watch_all_threads(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        THREADENTRY32 entry={.dwSize=sizeof(entry)};
+        for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
+            if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
+            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_SET_CONTEXT,FALSE,entry.th32ThreadID);
+            if (!thread) continue;
+            if (SuspendThread(thread)!=(DWORD)-1) {
+                CONTEXT c={.ContextFlags=CONTEXT_DEBUG_REGISTERS};
+                if (GetThreadContext(thread,&c) && c.Dr0!=watch_address) {
+                    c.Dr0=watch_address; c.Dr1=watch_address+8; c.Dr2=watch_address+16; c.Dr3=watch_address+24;
+                    /* L0-L3, each: break on write (01), 8 bytes (10) */
+                    c.Dr7=0x55 | (0x9u<<16) | (0x9u<<20) | (0x9u<<24) | (0x9u<<28);
+                    SetThreadContext(thread,&c);
+                }
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+        Sleep(50);
+    }
+    return 0;
+}
 /* BB_WATCH=offset (with BB_HOOK at the same function): a hardware watchpoint on the 8 bytes at entry rsp -
  * offset (a stack canary slot: entry rsp - 0x38 for push rbp + canary at rbp-0x30), reporting every write. */
 static void watch_slot(uint64_t entry_rsp) {
@@ -314,6 +343,17 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
+    {
+        typedef HRESULT (WINAPI *GetDescription)(HANDLE,PWSTR *);
+        GetDescription get=(GetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+        PWSTR wide=NULL;
+        char name[96]="";
+        if (get && SUCCEEDED(get(GetCurrentThread(),&wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
+            LocalFree(wide);
+        }
+        fprintf(stderr,"  thread name '%s'\n",name);
+    }
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
     /* Return addresses near the top of the stack: system libraries (the C runtime's memcpy)
      * keep no frame pointers, so the rbp chain below can skip their caller. */
@@ -401,15 +441,18 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
-    if (code==EXCEPTION_SINGLE_STEP && (info->ContextRecord->Dr6&1)) { /* BB_WATCH: a write to the slot */
-        if (InterlockedIncrement(&watch_hits)<=12) {
+    if (code==EXCEPTION_SINGLE_STEP && (info->ContextRecord->Dr6&15)) { /* BB_WATCH / BB_WATCH_ADDR: a write */
+        if (InterlockedIncrement(&watch_hits)<=40) {
             char line[256], where[MAX_PATH+64], from[MAX_PATH+64];
             describe_address(where,sizeof(where),(uintptr_t)info->ContextRecord->Rip);
-            uint64_t value=*(uint64_t *)(uintptr_t)info->ContextRecord->Dr0;
+            DWORD64 dr6=info->ContextRecord->Dr6;
+            DWORD64 slot=dr6&1 ? info->ContextRecord->Dr0 : dr6&2 ? info->ContextRecord->Dr1 :
+                         dr6&4 ? info->ContextRecord->Dr2 : info->ContextRecord->Dr3;
+            uint64_t value=*(uint64_t *)(uintptr_t)slot;
             uint64_t top=*(uint64_t *)(uintptr_t)info->ContextRecord->Rsp;
             describe_address(from,sizeof(from),(uintptr_t)top);
-            int n=snprintf(line,sizeof(line),"WATCH write before %s, value %016llx, [rsp] %s\n",where,
-                           (unsigned long long)value,from);
+            int n=snprintf(line,sizeof(line),"WATCH write to %p before %s, value %016llx, [rsp] %s (thread %lu)\n",
+                           (void *)(uintptr_t)slot,where,(unsigned long long)value,from,GetCurrentThreadId());
             DWORD written;
             WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
         }
@@ -751,6 +794,10 @@ int main(int argc, char **argv) {
             fprintf(stderr,"BB_STRICT_HANDLES: policy not set (%lu)\n",GetLastError());
     }
     if (timeout_seconds) CloseHandle(CreateThread(NULL,0,watchdog_thread,(LPVOID)(uintptr_t)timeout_seconds,0,NULL));
+    if (getenv("BB_WATCH_ADDR")) {
+        watch_address=strtoull(getenv("BB_WATCH_ADDR"),NULL,0);
+        CloseHandle(CreateThread(NULL,0,watch_all_threads,NULL,0,NULL));
+    }
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
