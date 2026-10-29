@@ -192,6 +192,7 @@ static ABI int32_t audio_init(void) {
 static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_t length, uint32_t freq, uint32_t param) {
     (void)user; (void)index;
     if (!initialized) return ERR_NOT_INIT;
+    if (getenv("LBPPC_NO_AUDIO")) return ERR_NOT_INIT; /* lbppc test: no audio output at all */
     if (!length || length>2048 || (length & 0xff)) return ERR_INVALID_SIZE;
     if (freq!=48000) return ERR_INVALID_FREQ;
     uint32_t format=param & 0xff;

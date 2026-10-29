@@ -150,9 +150,22 @@ static void watch_slot(uint64_t entry_rsp) {
     DWORD written;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
 }
-static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot) {
-    uint64_t ret=*(uint64_t *)(uintptr_t)slot;
+static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot, uint64_t c, uint64_t rax) {
+    /* BB_HOOK_RET_SLOT=n: the return address is n slots up (a hook in an epilogue, before its pops). */
+    static long ret_slot=-1;
+    if (ret_slot<0) ret_slot=getenv("BB_HOOK_RET_SLOT") ? strtol(getenv("BB_HOOK_RET_SLOT"),NULL,0) : 0;
+    uint64_t ret=*(uint64_t *)(uintptr_t)(slot+8*(uint64_t)ret_slot);
     watch_slot(slot);
+    /* BB_HOOK_RANGE=lo:hi: only calls with one of the first three arguments in [lo, hi). */
+    static uint64_t range_lo, range_hi;
+    static int range_read;
+    if (!range_read) {
+        const char *r=getenv("BB_HOOK_RANGE");
+        if (r) { char *end; range_lo=strtoull(r,&end,0); range_hi=*end==':' ? strtoull(end+1,NULL,0) : 0; }
+        range_read=1;
+    }
+    if (range_hi && !((a>=range_lo && a<range_hi) || (b>=range_lo && b<range_hi) || (c>=range_lo && c<range_hi) ||
+                      (rax>=range_lo && rax<range_hi))) return;
     static volatile long count;
     long n=InterlockedIncrement(&count);
     if (n>200) return;
@@ -165,9 +178,10 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot)
     uint64_t at=a ? a+strtoull(field,NULL,0) : 0;
     int ra=at && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)at,&va,4,&got) && got==4;
     int rb=b && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)b,&vb,4,&got) && got==4;
-    int len=snprintf(line,sizeof(line),"HOOK 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x]) from guest 0x%llx (thread %lu)\n",
+    int len=snprintf(line,sizeof(line),"HOOK 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x], 0x%llx) rax 0x%llx from guest 0x%llx (thread %lu)\n",
                      (unsigned long long)offset,(unsigned long long)a,ra?"":"?",(unsigned)va,(unsigned long long)b,
-                     rb?"":"?",(unsigned)vb,(unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
+                     rb?"":"?",(unsigned)vb,(unsigned long long)c,(unsigned long long)rax,
+                     (unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
     DWORD written;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
 }
@@ -190,6 +204,8 @@ static void hooks_install(const char *spec) {
            rdi=offset; call hook_log; pop; moved bytes; jmp back. */
         static const unsigned char push[]={0x57,0x56,0x52,0x51,0x41,0x50,0x41,0x51,0x50};
         memcpy(o,push,sizeof(push)); o+=sizeof(push);
+        *o++=0x49; *o++=0x89; *o++=0xd0;                       /* mov r8,rdx: the third argument */
+        *o++=0x49; *o++=0x89; *o++=0xc1;                       /* mov r9,rax: a result */
         *o++=0x48; *o++=0x8d; *o++=0x4c; *o++=0x24; *o++=0x38; /* lea rcx,[rsp+56]: the return slot */
         *o++=0x48; *o++=0x89; *o++=0xf2;                       /* mov rdx,rsi */
         *o++=0x48; *o++=0x89; *o++=0xfe;                       /* mov rsi,rdi */

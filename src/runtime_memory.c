@@ -615,6 +615,11 @@ static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int fl
     if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return NO_MEMORY;
     uint64_t phys=flex_alloc(size);
     if (phys==UINT64_MAX) return NO_MEMORY;
+    /* lbppc test: LBPPC_FLEX_BASE=address: flexible mappings without a hint are placed from there,
+       away from where direct memory goes. */
+    static uint64_t flex_base=UINT64_MAX;
+    if (flex_base==UINT64_MAX) flex_base=getenv("LBPPC_FLEX_BASE") ? strtoull(getenv("LBPPC_FLEX_BASE"),NULL,0) : 0;
+    if (flex_base && !*inout && !(flags & MAP_FIXED_FLAG)) *inout=(void *)(uintptr_t)flex_base;
     int32_t result=place(inout,size,prot,flags,PAGE,KIND_FLEXIBLE,0,phys);
     if (result) flex_free(phys,size); else ++flexible_maps;
     return result;
