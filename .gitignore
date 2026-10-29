@@ -9,8 +9,8 @@ eboot.bin
 *.farc
 sce_sys/
 sce_module/
-game/
-dumps/
+/game/
+/dumps/
 *.dmp
 
 # Saves and user data
@@ -18,9 +18,9 @@ savedata/
 user/
 
 # Build output
-out/
-build/
-dist/
+/out/
+/build/
+/dist/
 *.exe
 *.dll
 *.pdb
@@ -41,3 +41,13 @@ __pycache__/
 .idea/
 .vscode/
 .claude/
+
+# Build and runtime leftovers (from the Bloodborne port)
+/out
+pgo/
+perf.data
+vkd3d-proton.cache
+/*.spv
+/fsr4vk/
+fsr4_shaders/
+/benchmarks/
