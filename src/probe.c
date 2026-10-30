@@ -184,6 +184,29 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
                      (unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
     DWORD written;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
+    /* BB_HOOK_DUMP=bytes: a hex dump of the first argument's object, once. */
+    static int dumped;
+    const char *dump=getenv("BB_HOOK_DUMP");
+    if (dump && !dumped && a) {
+        dumped=1;
+        size_t bytes=strtoul(dump,NULL,0);
+        for (size_t at=0; at<bytes; at+=32) {
+            uint64_t row[4]={0};
+            if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(a+at),row,sizeof(row),&got)) break;
+            len=snprintf(line,sizeof(line),"  +%04zx: %016llx %016llx %016llx %016llx\n",at,(unsigned long long)row[0],
+                         (unsigned long long)row[1],(unsigned long long)row[2],(unsigned long long)row[3]);
+            WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
+        }
+    }
+    /* With BB_HOOK_RANGE: the 16 bytes before and after the third argument (an allocator's header). */
+    uint64_t around[4];
+    if (range_hi && c>=16 && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c-16),around,sizeof(around),&got) &&
+        got==sizeof(around)) {
+        len=snprintf(line,sizeof(line),"  around 0x%llx: %016llx %016llx | %016llx %016llx\n",(unsigned long long)c,
+                     (unsigned long long)around[0],(unsigned long long)around[1],(unsigned long long)around[2],
+                     (unsigned long long)around[3]);
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
+    }
 }
 static void hooks_install(const char *spec) {
     if (!spec || !*spec) return;
@@ -200,25 +223,43 @@ static void hooks_install(const char *spec) {
         p=*end==',' ? end+1 : end+strlen(end);
         if (length<5 || length>32) { fprintf(stderr,"BB_HOOK: %llx needs a length of 5-32\n",(unsigned long long)offset); continue; }
         unsigned char *site=image+offset, *s=o;
-        /* push rdi,rsi,rdx,rcx,r8,r9,rax; rcx=[rsp+56] (return address); rdx=rsi; rsi=rdi; rcx moves to 4th;
-           rdi=offset; call hook_log; pop; moved bytes; jmp back. */
-        static const unsigned char push[]={0x57,0x56,0x52,0x51,0x41,0x50,0x41,0x51,0x50};
-        memcpy(o,push,sizeof(push)); o+=sizeof(push);
-        *o++=0x49; *o++=0x89; *o++=0xd0;                       /* mov r8,rdx: the third argument */
+        /* Safe in the middle of a function too: below the red zone, the flags, every scratch register and
+           xmm0-15 saved on an aligned stack, and back through a memory jump (no register touched). */
+        static const unsigned char enter[]={
+            0x48,0x8d,0x64,0x24,0x80,                   /* lea rsp,[rsp-128]: past the red zone */
+            0x55, 0x48,0x89,0xe5, 0x9c,                 /* push rbp; mov rbp,rsp; pushfq */
+            0x50,0x51,0x52,0x56,0x57,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53, /* rax rcx rdx rsi rdi r8-r11 */
+            0x48,0x83,0xe4,0xf0, 0x48,0x81,0xec,0x00,0x01,0x00,0x00};          /* and rsp,-16; sub rsp,256 */
+        memcpy(o,enter,sizeof(enter)); o+=sizeof(enter);
+        for (int x=0;x<16;++x) {                                /* movups [rsp+16x],xmmx */
+            if (x>=8) *o++=0x44;
+            *o++=0x0f; *o++=0x11; *o++=(unsigned char)(0x84|((x&7)<<3)); *o++=0x24;
+            int32_t disp=16*x; memcpy(o,&disp,4); o+=4;
+        }
         *o++=0x49; *o++=0x89; *o++=0xc1;                       /* mov r9,rax: a result */
-        *o++=0x48; *o++=0x8d; *o++=0x4c; *o++=0x24; *o++=0x38; /* lea rcx,[rsp+56]: the return slot */
+        *o++=0x49; *o++=0x89; *o++=0xd0;                       /* mov r8,rdx: the third argument */
+        *o++=0x48; *o++=0x8d; *o++=0x8d; { int32_t d=136; memcpy(o,&d,4); o+=4; } /* lea rcx,[rbp+136]: the site's rsp */
         *o++=0x48; *o++=0x89; *o++=0xf2;                       /* mov rdx,rsi */
         *o++=0x48; *o++=0x89; *o++=0xfe;                       /* mov rsi,rdi */
         *o++=0x48; *o++=0xbf; memcpy(o,&offset,8); o+=8;       /* mov rdi,offset */
         uintptr_t fn=(uintptr_t)hook_log;
         *o++=0x48; *o++=0xb8; memcpy(o,&fn,8); o+=8;           /* mov rax,hook_log */
         *o++=0xff; *o++=0xd0;                                  /* call rax */
-        static const unsigned char pop[]={0x58,0x41,0x59,0x41,0x58,0x59,0x5a,0x5e,0x5f};
-        memcpy(o,pop,sizeof(pop)); o+=sizeof(pop);
+        for (int x=0;x<16;++x) {                                /* movups xmmx,[rsp+16x] */
+            if (x>=8) *o++=0x44;
+            *o++=0x0f; *o++=0x10; *o++=(unsigned char)(0x84|((x&7)<<3)); *o++=0x24;
+            int32_t disp=16*x; memcpy(o,&disp,4); o+=4;
+        }
+        static const unsigned char leave[]={
+            0x48,0x8d,0x65,0xb0,                                /* lea rsp,[rbp-80] */
+            0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5f,0x5e,0x5a,0x59,0x58, /* r11-r8 rdi rsi rdx rcx rax */
+            0x9d, 0x5d,                                         /* popfq; pop rbp */
+            0x48,0x8d,0xa4,0x24,0x80,0x00,0x00,0x00};            /* lea rsp,[rsp+128] */
+        memcpy(o,leave,sizeof(leave)); o+=sizeof(leave);
         memcpy(o,site,length); o+=length;
         uintptr_t back=(uintptr_t)site+length;
-        *o++=0x49; *o++=0xbb; memcpy(o,&back,8); o+=8;         /* mov r11,back */
-        *o++=0x41; *o++=0xff; *o++=0xe3;                       /* jmp r11 */
+        *o++=0xff; *o++=0x25; *o++=0; *o++=0; *o++=0; *o++=0;   /* jmp [rip+0] */
+        memcpy(o,&back,8); o+=8;
         int32_t rel=(int32_t)((intptr_t)s-((intptr_t)site+5));
         DWORD old;
         VirtualProtect(site,length,PAGE_EXECUTE_READWRITE,&old);

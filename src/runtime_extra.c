@@ -216,7 +216,7 @@ static ABI int32_t flag_create(EventFlag **out,const char *name,uint32_t attr,ui
     return ORBIS_OK;
 }
 static ABI int32_t flag_set(EventFlag *f,uint64_t bits) {
-    if (!f) return KERNEL_EINVAL;
+    if (!f) { fprintf(stderr,"Runtime: event flag set on a null flag\n"); return KERNEL_EINVAL; }
     pthread_mutex_lock(&f->lock);
     f->pattern|=bits;
     pthread_cond_broadcast(&f->changed);
@@ -227,7 +227,10 @@ static int flag_met(uint64_t pattern,uint64_t want,uint32_t mode) {
     return mode&WAIT_AND ? (pattern&want)==want : (pattern&want)!=0;
 }
 static ABI int32_t flag_wait(EventFlag *f,uint64_t want,uint32_t mode,uint64_t *result,uint32_t *timeout_us) {
-    if (!f || !want || !(mode&(WAIT_AND|WAIT_OR))) return KERNEL_EINVAL;
+    if (!f || !want || !(mode&(WAIT_AND|WAIT_OR))) {
+        fprintf(stderr,"Runtime: event flag wait refused (flag %p, bits 0x%llx, mode 0x%x)\n",(void *)f,(unsigned long long)want,mode);
+        return KERNEL_EINVAL;
+    }
     struct timespec deadline;
     if (timeout_us) {
         clock_gettime(CLOCK_REALTIME,&deadline);
@@ -261,7 +264,12 @@ static ABI int32_t kernel_sleep(uint32_t seconds) {
 /* POSIX semaphores: the guest's sem_t holds a pointer to a host semaphore made of a count, a lock and a
  * condition. Errors go to the guest errno (FreeBSD numbers) with -1, as POSIX does. */
 typedef struct { pthread_mutex_t lock; pthread_cond_t posted; int64_t count; } Sem;
-static int32_t sem_fail(int host_errno) { *runtime_errno()=runtime_guest_errno(host_errno); return -1; }
+static int32_t sem_fail(int host_errno) {
+    static int logged;
+    if (host_errno!=ETIMEDOUT && logged++<10)
+        fprintf(stderr,"Runtime: semaphore call failed (errno %d)\n",host_errno);
+    *runtime_errno()=runtime_guest_errno(host_errno); return -1;
+}
 static ABI int32_t sem_init_guest(Sem **sem,int32_t shared,uint32_t value) {
     (void)shared;
     if (!sem) return sem_fail(EINVAL);
