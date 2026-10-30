@@ -150,7 +150,9 @@ static void watch_slot(uint64_t entry_rsp) {
     DWORD written;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
 }
-static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot, uint64_t c, uint64_t rax) {
+static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot, uint64_t c, uint64_t *frame) {
+    /* frame: the stub's saved registers, below its rbp: flags, rax rcx rdx rsi rdi r8-r11 rbx r12-r15. */
+    uint64_t rax=frame[-2];
     /* BB_HOOK_RET_SLOT=n: the return address is n slots up (a hook in an epilogue, before its pops). */
     static long ret_slot=-1;
     if (ret_slot<0) ret_slot=getenv("BB_HOOK_RET_SLOT") ? strtol(getenv("BB_HOOK_RET_SLOT"),NULL,0) : 0;
@@ -168,8 +170,10 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
                       (rax>=range_lo && rax<range_hi))) return;
     static volatile long count;
     long n=InterlockedIncrement(&count);
-    if (n>200) return;
-    char line[256];
+    static long max_lines=-1;
+    if (max_lines<0) max_lines=getenv("BB_HOOK_MAX") ? strtol(getenv("BB_HOOK_MAX"),NULL,0) : 200;
+    if (n>max_lines) return;
+    char line[512];
     int32_t va=0, vb=0;
     SIZE_T got;
     /* BB_HOOK_FIELD=offset: the int at that offset in the first argument instead of at its start. */
@@ -178,21 +182,37 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
     uint64_t at=a ? a+strtoull(field,NULL,0) : 0;
     int ra=at && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)at,&va,4,&got) && got==4;
     int rb=b && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)b,&vb,4,&got) && got==4;
-    int len=snprintf(line,sizeof(line),"HOOK 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x], 0x%llx) rax 0x%llx from guest 0x%llx (thread %lu)\n",
-                     (unsigned long long)offset,(unsigned long long)a,ra?"":"?",(unsigned)va,(unsigned long long)b,
+    /* One write per event, the registers on the same line: lines of different threads cannot interleave. */
+    int len=snprintf(line,sizeof(line),"HOOK #%ld 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x], 0x%llx) rax 0x%llx from guest 0x%llx (thread %lu)",
+                     n,(unsigned long long)offset,(unsigned long long)a,ra?"":"?",(unsigned)va,(unsigned long long)b,
                      rb?"":"?",(unsigned)vb,(unsigned long long)c,(unsigned long long)rax,
                      (unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
+    if (getenv("BB_HOOK_REGS"))
+        len+=snprintf(line+len,sizeof(line)-len," | rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
+                      (unsigned long long)frame[-11],(unsigned long long)frame[-3],(unsigned long long)frame[-4],
+                      (unsigned long long)frame[-5],(unsigned long long)frame[-6],(unsigned long long)frame[-7],
+                      (unsigned long long)frame[-12],(unsigned long long)frame[-13],(unsigned long long)frame[-14],
+                      (unsigned long long)frame[-15]);
+    /* BB_HOOK_STACK=n: the first n stack slots at the hook site ([rsp] is a function's return address). */
+    static long stack_slots=-1;
+    if (stack_slots<0) stack_slots=getenv("BB_HOOK_STACK") ? strtol(getenv("BB_HOOK_STACK"),NULL,0) : 0;
+    for (long s=0; s<stack_slots && s<12 && len<(int)sizeof(line)-24; ++s)
+        len+=snprintf(line+len,sizeof(line)-len,"%s%llx",s ? " " : " | stack ",(unsigned long long)((uint64_t *)(uintptr_t)slot)[s]);
+    len+=snprintf(line+len,sizeof(line)-len,"\n");
     DWORD written;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
     /* BB_HOOK_DUMP=bytes: a hex dump of the first argument's object, once. */
     static int dumped;
     const char *dump=getenv("BB_HOOK_DUMP");
-    if (dump && !dumped && a) {
+    /* BB_HOOK_DUMP_ARG=3: dump the third argument's object instead. */
+    uint64_t dump_at=getenv("BB_HOOK_DUMP_ADDR") ? strtoull(getenv("BB_HOOK_DUMP_ADDR"),NULL,0) :
+                     getenv("BB_HOOK_DUMP_ARG") && atoi(getenv("BB_HOOK_DUMP_ARG"))==3 ? c : a;
+    if (dump && !dumped && dump_at) {
         dumped=1;
         size_t bytes=strtoul(dump,NULL,0);
         for (size_t at=0; at<bytes; at+=32) {
             uint64_t row[4]={0};
-            if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(a+at),row,sizeof(row),&got)) break;
+            if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(dump_at+at),row,sizeof(row),&got)) break;
             len=snprintf(line,sizeof(line),"  +%04zx: %016llx %016llx %016llx %016llx\n",at,(unsigned long long)row[0],
                          (unsigned long long)row[1],(unsigned long long)row[2],(unsigned long long)row[3]);
             WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
@@ -229,6 +249,7 @@ static void hooks_install(const char *spec) {
             0x48,0x8d,0x64,0x24,0x80,                   /* lea rsp,[rsp-128]: past the red zone */
             0x55, 0x48,0x89,0xe5, 0x9c,                 /* push rbp; mov rbp,rsp; pushfq */
             0x50,0x51,0x52,0x56,0x57,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53, /* rax rcx rdx rsi rdi r8-r11 */
+            0x53,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,                     /* rbx r12-r15 */
             0x48,0x83,0xe4,0xf0, 0x48,0x81,0xec,0x00,0x01,0x00,0x00};          /* and rsp,-16; sub rsp,256 */
         memcpy(o,enter,sizeof(enter)); o+=sizeof(enter);
         for (int x=0;x<16;++x) {                                /* movups [rsp+16x],xmmx */
@@ -236,7 +257,7 @@ static void hooks_install(const char *spec) {
             *o++=0x0f; *o++=0x11; *o++=(unsigned char)(0x84|((x&7)<<3)); *o++=0x24;
             int32_t disp=16*x; memcpy(o,&disp,4); o+=4;
         }
-        *o++=0x49; *o++=0x89; *o++=0xc1;                       /* mov r9,rax: a result */
+        *o++=0x49; *o++=0x89; *o++=0xe9;                       /* mov r9,rbp: the saved registers */
         *o++=0x49; *o++=0x89; *o++=0xd0;                       /* mov r8,rdx: the third argument */
         *o++=0x48; *o++=0x8d; *o++=0x8d; { int32_t d=136; memcpy(o,&d,4); o+=4; } /* lea rcx,[rbp+136]: the site's rsp */
         *o++=0x48; *o++=0x89; *o++=0xf2;                       /* mov rdx,rsi */
@@ -251,7 +272,8 @@ static void hooks_install(const char *spec) {
             int32_t disp=16*x; memcpy(o,&disp,4); o+=4;
         }
         static const unsigned char leave[]={
-            0x48,0x8d,0x65,0xb0,                                /* lea rsp,[rbp-80] */
+            0x48,0x8d,0x65,0x88,                                /* lea rsp,[rbp-120] */
+            0x41,0x5f,0x41,0x5e,0x41,0x5d,0x41,0x5c,0x5b,       /* r15-r12 rbx */
             0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5f,0x5e,0x5a,0x59,0x58, /* r11-r8 rdi rsi rdx rcx rax */
             0x9d, 0x5d,                                         /* popfq; pop rbp */
             0x48,0x8d,0xa4,0x24,0x80,0x00,0x00,0x00};            /* lea rsp,[rsp+128] */

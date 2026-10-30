@@ -77,11 +77,15 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     pthread_mutex_unlock(&static_init);
     return e;
 }
+static void note_failure(const char *what, GuestMutex **mutex, int32_t e) {
+    static int logged;
+    if (logged++ < 20) fprintf(stderr, "Runtime: mutex %s failed 0x%08x (handle at %p)\n", what, (unsigned)e, (void *)mutex);
+}
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
-    if (e) return e;
+    if (e) { note_failure("lock", mutex, e); return e; }
     e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
-    if (!e) ++locks;
+    if (!e) ++locks; else note_failure("lock", mutex, e);
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
@@ -95,7 +99,7 @@ static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
     if ((uintptr_t)*mutex < 2) return orbis_error(EPERM);
     int32_t e = orbis_error(pthread_mutex_unlock(&(*mutex)->native));
-    if (!e) ++unlocks;
+    if (!e) ++unlocks; else note_failure("unlock", mutex, e);
     return e;
 }
 static ABI int32_t mutex_destroy(GuestMutex **mutex) {
