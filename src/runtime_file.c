@@ -504,9 +504,21 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+/* LBPPC_IO_WATCH=address (test): reads whose destination covers that address are logged. */
+static void io_watch(int fd,const void *buffer,uint64_t size,int64_t offset,const char *phase) {
+    static uint64_t at=UINT64_MAX;
+    if (at==UINT64_MAX) at=getenv("LBPPC_IO_WATCH") ? strtoull(getenv("LBPPC_IO_WATCH"),NULL,0) : 0;
+    if (!at || at<(uint64_t)(uintptr_t)buffer || at>=(uint64_t)(uintptr_t)buffer+size) return;
+    File *f=get(fd);
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    fprintf(stderr,"Runtime: [t=%lld.%06ld, thread %lu] %s read of %llu bytes at offset %lld into %p..%p covers the watched address (fd %d %s)\n",
+            (long long)now.tv_sec,now.tv_nsec/1000,(unsigned long)GetCurrentThreadId(),phase,
+            (unsigned long long)size,(long long)offset,buffer,(void *)((char *)buffer+size),fd,f ? f->path : "?");
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    io_watch(fd,buffer,size,-1,"start");
     touch_for_write(buffer,size);
     ssize_t n=host_read(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
@@ -516,8 +528,10 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    io_watch(fd,buffer,size,offset,"start");
     touch_for_write(buffer,size);
     ssize_t n=pread(h,buffer,size,offset);
+    io_watch(fd,buffer,size,offset,"end");
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

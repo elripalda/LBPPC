@@ -183,7 +183,9 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
     int ra=at && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)at,&va,4,&got) && got==4;
     int rb=b && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)b,&vb,4,&got) && got==4;
     /* One write per event, the registers on the same line: lines of different threads cannot interleave. */
-    int len=snprintf(line,sizeof(line),"HOOK #%ld 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x], 0x%llx) rax 0x%llx from guest 0x%llx (thread %lu)",
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    int len=snprintf(line,sizeof(line),"[t=%lld.%06ld] ",(long long)now.tv_sec,now.tv_nsec/1000);
+    len+=snprintf(line+len,sizeof(line)-len,"HOOK #%ld 0x%llx(0x%llx [%s0x%x], 0x%llx [%s0x%x], 0x%llx) rax 0x%llx from guest 0x%llx (thread %lu)",
                      n,(unsigned long long)offset,(unsigned long long)a,ra?"":"?",(unsigned)va,(unsigned long long)b,
                      rb?"":"?",(unsigned)vb,(unsigned long long)c,(unsigned long long)rax,
                      (unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
