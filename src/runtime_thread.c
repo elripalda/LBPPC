@@ -267,11 +267,23 @@ static void set_host_priority(int prio) {
     (void)prio;
 #endif
 }
+/* LBPPC_AFFINITY=1 (test): the guest's core mask (PS4 cores 0-6) applied to the host thread, core for core. */
+static void set_host_affinity(uint64_t mask) {
+#ifdef _WIN32
+    static int enabled=-1;
+    if (enabled<0) enabled=getenv("LBPPC_AFFINITY")!=NULL;
+    DWORD_PTR host=(DWORD_PTR)(mask & 0x7f);
+    if (enabled && host) SetThreadAffinityMask(GetCurrentThread(),host);
+#else
+    (void)mask;
+#endif
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
     set_host_priority(t->attr.prio);
+    set_host_affinity(t->attr.affinity);
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
@@ -375,7 +387,9 @@ static ABI int32_t attr_set_stack_at(ThreadAttr **slot,void *address,uint64_t si
 }
 static ABI int32_t thread_set_affinity(GuestThread *t,uint64_t mask) {
     if (!find_thread(t)) return ERR(3);
-    t->attr.affinity=mask; return 0;
+    t->attr.affinity=mask;
+    if (t==runtime_thread_current()) set_host_affinity(mask);
+    return 0;
 }
 static ABI int32_t thread_get_affinity(GuestThread *t,uint64_t *mask) {
     if (!find_thread(t)) return ERR(3);
