@@ -21,6 +21,8 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <zlib.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -435,6 +437,89 @@ bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& 
              orig_scheme, orig_host, orig_port, scheme, host, port, it->first);
     return true;
 }
+
+// lbppc: a PS3 NP ticket (version 2.1, the layout NPTicket reads: big-endian typed fields in a body and a
+// footer section) for the locally signed-in player, as LittleBigPlanet 3 (BCUS98362) on PS3. It is not
+// signed: a custom server accepts it with ticket verification off (a private server); public servers will
+// need a PS4 login of their own.
+static std::vector<u8> BuildLocalLoginTicket(const std::string& name) {
+    std::vector<u8> out;
+    const auto u16be = [&](u16 v) { out.push_back(u8(v >> 8)); out.push_back(u8(v)); };
+    const auto u32be = [&](u32 v) { u16be(u16(v >> 16)); u16be(u16(v)); };
+    const auto u64be = [&](u64 v) { u32be(u32(v >> 32)); u32be(u32(v)); };
+    const auto field = [&](u16 type, std::string_view bytes, size_t length) {
+        u16be(type);
+        u16be(u16(length));
+        for (size_t i = 0; i < length; ++i) {
+            out.push_back(i < bytes.size() ? u8(bytes[i]) : 0);
+        }
+    };
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count());
+    u64 user_id = 0xcbf29ce484222325ull; // FNV-1a of the name, as the local account id
+    for (const char c : name) {
+        user_id = (user_id ^ u8(c)) * 0x100000001b3ull;
+    }
+
+    std::vector<u8> body;
+    std::swap(out, body);
+    field(8, "lbppc-local-ticket", 0x14); // serial
+    u16be(1), u16be(4), u32be(0x100);     // issuer: PSN (PS3)
+    u16be(7), u16be(8), u64be(now);       // issued
+    u16be(7), u16be(8), u64be(now + 4ull * 3600 * 1000); // expires
+    u16be(2), u16be(8), u64be(user_id);
+    field(4, name, 0x20);                // online id
+    field(8, "us", 4);                   // country
+    field(4, "un", 4);                   // domain
+    field(8, "UP9000-BCUS98362_00", 0x18); // service id: LittleBigPlanet 3 (US)
+    u16be(1), u16be(4), u32be(0);        // status
+    u16be(0), u16be(0), u16be(0), u16be(0);
+    std::swap(out, body);
+
+    std::vector<u8> footer;
+    std::swap(out, footer);
+    field(8, "LBPC", 4);              // signature identifier
+    field(8, std::string_view{}, 0x38); // signature (none)
+    std::swap(out, footer);
+
+    std::vector<u8> sections;
+    std::swap(out, sections);
+    out.push_back(0x30), out.push_back(0x00), u16be(u16(body.size()));
+    out.insert(out.end(), body.begin(), body.end());
+    out.push_back(0x30), out.push_back(0x02), u16be(u16(footer.size()));
+    out.insert(out.end(), footer.begin(), footer.end());
+    std::swap(out, sections);
+
+    out = {0x21, 0x01, 0, 0, 0, 0};
+    u16be(u16(sections.size()));
+    out.insert(out.end(), sections.begin(), sections.end());
+    return out;
+}
+
+// lbppc: signed in locally (LBPPC_NP_USER) there is no PSN behind the game's PSN Web API calls; they go to
+// this host (np_web_api_internal.cpp) and are answered here, without a network: the friend and block lists
+// are empty, and anything else is an empty JSON object.
+constexpr std::string_view LocalWebApiHost = "lbppc.local";
+static void AnswerLocalWebApi(const std::string& path, HttpResponse& res) {
+    const auto list = [&](std::string_view name) {
+        return fmt::format("{{\"{}\":[],\"start\":0,\"size\":0,\"totalResults\":0}}", name);
+    };
+    const std::string body = path.find("/friendList") != std::string::npos  ? list("friendList")
+                             : path.find("/blockList") != std::string::npos ? list("blockList")
+                                                                            : std::string{"{}"};
+    res.status_code = 200;
+    res.body.assign(body.begin(), body.end());
+    res.content_length = body.size();
+    res.content_length_result = 0;
+    res.read_cursor = 0;
+    res.all_headers_blob = fmt::format(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.size());
+    LOG_INFO(Lib_Http, "local PSN Web API: {} -> {}", path, body);
+}
+
+struct SendRequestPlan;
+static void AnswerGoneEndpoint(const SendRequestPlan& plan, HttpResponse& res);
 
 struct SendRequestPlan {
     std::string scheme;
@@ -1703,6 +1788,54 @@ int PS4_SYSV_ABI sceHttpRequestGetAllHeaders() {
     return ORBIS_OK;
 }
 
+// lbppc: custom servers built for the PS3 game answer /farc_hashes and /t_conf with 410 (the PS3 game does without
+// them); the PS4 game treats a failed farc_hashes as a failed connection and plays offline. Signed in locally, those
+// replies become empty lists (200), signed as the server signs its replies (X-Digest-A: HMAC-SHA1 with the custom
+// server key over body, MM_AUTH cookie and path), which the game checks.
+static void AnswerGoneEndpoint(const SendRequestPlan& plan, HttpResponse& res) {
+    if (res.status_code != 410 || EmulatorSettings.GetOnlineName().empty()) {
+        return;
+    }
+    const std::string path = plan.path.substr(0, plan.path.find('?'));
+    const auto ends_with = [&](std::string_view tail) {
+        return path.size() >= tail.size() && path.compare(path.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    std::string body;
+    if (ends_with("/farc_hashes")) {
+        body = "<farc_hashes></farc_hashes>";
+    } else if (!ends_with("/t_conf")) {
+        return;
+    }
+    std::string cookie;
+    for (const auto& [k, v] : plan.headers) {
+        if (HeaderNameMatches(k, "Cookie")) {
+            if (const auto at = v.find("MM_AUTH="); at != std::string::npos) {
+                cookie = v.substr(at + 8, v.find(';', at) == std::string::npos ? std::string::npos
+                                                                                : v.find(';', at) - at - 8);
+            }
+        }
+    }
+    const std::string signed_data = body + cookie + path;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_size = 0;
+    constexpr std::string_view key = "CustomServerDigest";
+    HMAC(EVP_sha1(), key.data(), int(key.size()), reinterpret_cast<const unsigned char*>(signed_data.data()),
+         signed_data.size(), digest, &digest_size);
+    std::string hex;
+    for (unsigned int i = 0; i < digest_size; ++i) {
+        hex += fmt::format("{:02x}", digest[i]);
+    }
+    res.status_code = 200;
+    res.body.assign(body.begin(), body.end());
+    res.content_length = body.size();
+    res.content_length_result = 0;
+    res.read_cursor = 0;
+    res.all_headers_blob = fmt::format("HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n"
+                                       "X-Digest-A: {}\r\n\r\n",
+                                       body.size(), hex);
+    LOG_INFO(Lib_Http, "{}: the server's 410 answered as an empty 200 (signed)", path);
+}
+
 int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
     LOG_INFO(Lib_Http, "called reqId={}, postData={}, size={}", reqId, fmt::ptr(postData), size);
     std::shared_ptr<HttpRequest> req_ptr;
@@ -1787,6 +1920,15 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             plan.body.assign(static_cast<const u8*>(postData),
                              static_cast<const u8*>(postData) + size);
         }
+        // lbppc: LBP3 on PS4 logs in with a PSN authorization code, which the server then checked with
+        // PSN; custom servers (Refresh, Lighthouse) read the PS3 game's NP ticket instead. Signed in
+        // locally, the login carries a ticket for the local player in that format.
+        if (plan.method == ORBIS_HTTP_METHOD_POST && !EmulatorSettings.GetOnlineName().empty() &&
+            plan.path.find("/login?") != std::string::npos) {
+            plan.body = BuildLocalLoginTicket(EmulatorSettings.GetOnlineName());
+            LOG_INFO(Lib_Http, "reqId={} login: a {}-byte ticket for '{}'", reqId, plan.body.size(),
+                     EmulatorSettings.GetOnlineName());
+        }
     }
 
     const bool online = EmulatorSettings.IsConnectedToNetwork();
@@ -1802,8 +1944,32 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
         if (!online) {
             SynthesizeTransportFailureResponse(local_res);
             worker_errno = ORBIS_HTTP_ERROR_RESOLVER_ENODNS;
+        } else if (plan.host == LocalWebApiHost) {
+            AnswerLocalWebApi(plan.path, local_res);
+            success_event_bits =
+                ORBIS_HTTP_NB_EVENT_IN | ORBIS_HTTP_NB_EVENT_OUT | ORBIS_HTTP_NB_EVENT_RESOLVED;
         } else {
             worker_errno = RunRealHttpRequest(plan, local_res, success_event_bits);
+            // lbppc diagnostics: LBPPC_HTTP_TRACE=1 prints each request's headers and its reply's headers
+            // and body (hex for binary bodies) to stderr.
+            AnswerGoneEndpoint(plan, local_res);
+            // lbppc diagnostics: LBPPC_HTTP_410=<status> answers the game's 410 replies with that status instead.
+            static const int status_410 = std::getenv("LBPPC_HTTP_410") ? std::atoi(std::getenv("LBPPC_HTTP_410")) : 0;
+            if (status_410 && local_res.status_code == 410) {
+                local_res.status_code = status_410;
+                local_res.all_headers_blob = fmt::format("HTTP/1.1 {} OK\r\nContent-Length: 0\r\n\r\n", status_410);
+            }
+            static const bool trace = std::getenv("LBPPC_HTTP_TRACE") != nullptr;
+            if (trace) {
+                std::string out = fmt::format("HTTP> {} {}\n", HttpMethodName(plan.method), plan.path);
+                for (const auto& [k, v] : plan.headers) {
+                    out += fmt::format("HTTP>   {}: {}\n", k, v);
+                }
+                out += fmt::format("HTTP>   body {} bytes\nHTTP< {}", plan.body.size(), local_res.all_headers_blob);
+                out += fmt::format("HTTP< body {} bytes: ", local_res.body.size());
+                out.append(local_res.body.begin(), local_res.body.begin() + std::min<size_t>(local_res.body.size(), 2048));
+                std::fprintf(stderr, "%s\nHTTP< end\n", out.c_str());
+            }
         }
 
         std::lock_guard<std::mutex> lock(g_state.m_mutex);

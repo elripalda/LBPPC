@@ -4,6 +4,9 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
@@ -158,6 +161,18 @@ s32 PS4_SYSV_ABI sceNpCmpNpIdInOrder(OrbisNpId* np_id1, OrbisNpId* np_id2, u32* 
 s32 PS4_SYSV_ABI sceNpCmpOnlineId(OrbisNpOnlineId* online_id1, OrbisNpOnlineId* online_id2) {
     if (online_id1 == nullptr || online_id2 == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // lbppc diagnostics: LBPPC_CMPID_LOG=1 prints each distinct pair of online ids compared.
+    static const bool log_pairs = std::getenv("LBPPC_CMPID_LOG") != nullptr;
+    if (log_pairs) {
+        static std::mutex mutex;
+        static std::set<std::string> seen;
+        const std::string a(online_id1->data, strnlen(online_id1->data, ORBIS_NP_ONLINEID_MAX_LENGTH));
+        const std::string b(online_id2->data, strnlen(online_id2->data, ORBIS_NP_ONLINEID_MAX_LENGTH));
+        std::scoped_lock lock{mutex};
+        if (seen.insert(a + "|" + b).second) {
+            std::fprintf(stderr, "CMPID '%s' vs '%s'\n", a.c_str(), b.c_str());
+        }
     }
 
     if (std::strncmp(online_id1->data, online_id2->data, ORBIS_NP_ONLINEID_MAX_LENGTH) != 0) {

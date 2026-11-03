@@ -18,9 +18,24 @@ public:
     }
     bool IsConnectedToNetwork() const { return Flag("BB_ONLINE", false); }
     bool IsShadNetEnabled() const { return IsConnectedToNetwork() && !shadnet_session_disabled.load(); }
+    /// lbppc: LBPPC_NP_USER=<online id>: signed in locally as that player, no shadNet or PSN connection
+    /// (the game's own servers are custom ones: run.py LBPPC_SERVER).
+    std::string GetLocalNpUser() const {
+        return Text("BB_SHADNET_NPID").empty() ? Text("LBPPC_NP_USER").substr(0, 16) : std::string{};
+    }
+    /// lbppc: the player's online id on a custom game server: the shadNet account (BB_SHADNET_NPID, real PSN-style
+    /// sign-in with friends and P2P signaling) or the local one (LBPPC_NP_USER).
+    std::string GetOnlineName() const {
+        const std::string shadnet = Text("BB_SHADNET_NPID");
+        return shadnet.empty() ? GetLocalNpUser() : shadnet.substr(0, 16);
+    }
     void SetShadNetSessionDisabled(bool v) { shadnet_session_disabled.store(v); }
     std::string GetShadNetServer() const { return Text("BB_SHADNET_SERVER"); }
-    std::string GetShadNetWebApiServer() const { return Text("BB_SHADNET_WEBAPI"); }
+    /// lbppc: signed in locally, the PSN Web API is answered by the HTTP layer itself (http.cpp LocalWebApiHost).
+    std::string GetShadNetWebApiServer() const {
+        const std::string server = Text("BB_SHADNET_WEBAPI");
+        return server.empty() && !Text("LBPPC_NP_USER").empty() ? "http://lbppc.local" : server;
+    }
     bool IsUPnPEnabled() const { return Flag("BB_UPNP", false); }
     /// shadPS4's disable_https: HTTPS requests the game makes go out as plain HTTP.
     bool IsForcedHttpsDisabled() const { return Flag("BB_DISABLE_HTTPS", false); }

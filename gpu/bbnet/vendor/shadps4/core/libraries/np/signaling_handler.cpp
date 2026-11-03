@@ -8,7 +8,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -968,9 +971,41 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port,
     }
 }
 
+// lbppc: join consent. LittleBigPlanet's custom servers were shut down by a "force join" exploit: a stranger's forged
+// invite made the game accept their connection and they joined the session uninvited. Here a connection another player
+// asks for is only accepted from a shadNet friend, from a player named in LBPPC_JOIN_ALLOW (comma separated; "*"
+// accepts everyone), or from a player this game itself connected to (joining them, or them answering). Anyone else's
+// request is dropped unanswered: they never reach the game.
+static bool JoinAllowedByList(const std::string& online_id) {
+    const char* env = std::getenv("LBPPC_JOIN_ALLOW");
+    const std::string list = env ? env : "";
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t end = list.find(',', start);
+        if (end == std::string::npos) {
+            end = list.size();
+        }
+        std::string item = list.substr(start, end - start);
+        item.erase(0, item.find_first_not_of(' '));
+        item.erase(item.find_last_not_of(' ') + 1);
+        if (item == "*" || (!item.empty() && item == online_id)) {
+            return true;
+        }
+        start = end + 1;
+    }
+    const u32 friends = NpHandler::GetInstance().GetNumFriends(1);
+    for (u32 i = 0; i < friends; ++i) {
+        if (NpHandler::GetInstance().GetFriendNpid(1, i) == online_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void HandleControlPacket(u32 from_addr, u16 from_port, const NpSignaling::SignalingControl& pkt) {
     const std::string from_id = PacketOnlineIdString(pkt.online_id_from);
     const NpSignaling::ControlKind kind = static_cast<NpSignaling::ControlKind>(pkt.kind);
+    const bool listed = kind == NpSignaling::ControlKind::ActivationRequest && JoinAllowedByList(from_id);
 
     s32 establish_transport = 0;
     s32 dead_conn = 0;
@@ -986,6 +1021,26 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const NpSignaling::Signal
         s32 transport_id = FindTransportByOnlineIdLocked(from_id);
 
         if (kind == NpSignaling::ControlKind::ActivationRequest) {
+            bool ours = false; // a connection this game asked for itself
+            for (const auto& [cid, ci] : NpHandler::GetInstance().GetSignalingState().connections) {
+                if (ci.locally_activated && OnlineIdString(ci.online_id) == from_id) {
+                    ours = true;
+                }
+            }
+            if (!listed && !ours) {
+                static std::mutex logged_mutex;
+                static std::set<std::string> logged;
+                std::scoped_lock logged_lock{logged_mutex};
+                if (logged.insert(from_id).second) {
+                    LOG_WARNING(Lib_NpSignaling,
+                                "join refused: '{}' is not a friend, not in LBPPC_JOIN_ALLOW and was not "
+                                "invited by this game",
+                                from_id);
+                    std::printf("Online: refused a connection from %s (not a friend; LBPPC_JOIN_ALLOW)\n",
+                                from_id.c_str());
+                }
+                return;
+            }
             const std::string to_id = PacketOnlineIdString(pkt.online_id_to);
             s32 ctx_id = 0;
             for (auto& [cid, ctx] : NpHandler::GetInstance().GetSignalingState().contexts) {

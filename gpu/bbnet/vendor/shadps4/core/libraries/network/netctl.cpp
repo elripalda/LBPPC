@@ -278,6 +278,12 @@ int PS4_SYSV_ABI sceNetCtlGetNatInfo(OrbisNetCtlNatInfo* nat_info) {
         if (netinfo->RetrieveIp()) {
             nat_info->mapped_addr = inet_addr(netinfo->GetIp().c_str());
         }
+        // lbppc: signed in locally there is no shadNet server to learn the external address from: the NAT
+        // check is reported done (STUN OK, type 2) with the local address, instead of never finishing.
+        if (!EmulatorSettings.GetLocalNpUser().empty()) {
+            nat_info->stun_status = 2;
+            nat_info->nat_type = 2;
+        }
     }
 
     LOG_DEBUG(Lib_NetCtl, "stun_status={} nat_type={} mapped_addr={:#x}", nat_info->stun_status,

@@ -126,6 +126,24 @@ bool NpHandler::ConnectUserById(s32 user_id) {
                        u->shadnet_token);
 }
 
+// lbppc: the local player (LBPPC_NP_USER): its online id, and an account id derived from it.
+static bool LocalMode() {
+    return !EmulatorSettings.GetLocalNpUser().empty();
+}
+static OrbisNpId LocalNpId() {
+    OrbisNpId id{};
+    const std::string name = EmulatorSettings.GetLocalNpUser();
+    std::memcpy(id.handle.data, name.data(), std::min(name.size(), sizeof(id.handle.data)));
+    return id;
+}
+static OrbisNpAccountId LocalAccountId() {
+    u64 hash = 0xcbf29ce484222325ull; // FNV-1a
+    for (const char c : EmulatorSettings.GetLocalNpUser()) {
+        hash = (hash ^ u8(c)) * 0x100000001b3ull;
+    }
+    return static_cast<OrbisNpAccountId>(hash | 1);
+}
+
 void NpHandler::StartWorker() {
     bool expected = false;
     if (m_worker_running.compare_exchange_strong(expected, true)) {
@@ -142,6 +160,12 @@ void NpHandler::Initialize() {
 
     if (!EmulatorSettings.IsShadNetEnabled()) {
         LOG_INFO(NpHandler, "shadNet disabled globally we are in offline mode");
+        return;
+    }
+    if (LocalMode()) {
+        LOG_INFO(NpHandler, "signed in locally as '{}' (LBPPC_NP_USER)", EmulatorSettings.GetLocalNpUser());
+        std::printf("Online: signed in locally as %s\n", EmulatorSettings.GetLocalNpUser().c_str());
+        FireStateCallback(1, NpManager::OrbisNpState::SignedIn);
         return;
     }
 
@@ -446,6 +470,10 @@ void NpHandler::DisconnectUser(s32 user_id, bool tell_game) {
 }
 
 void NpHandler::OnUserLoggedIn(s32 user_id) {
+    if (LocalMode()) {
+        FireStateCallback(user_id, NpManager::OrbisNpState::SignedIn);
+        return;
+    }
     if (ConnectUserById(user_id))
         StartWorker();
 }
@@ -585,12 +613,16 @@ void NpHandler::TellOverdueSignedOut() {
 }
 
 bool NpHandler::IsPsnSignedIn(s32 user_id) const {
+    if (LocalMode())
+        return user_id > 0;
     std::lock_guard lock(m_mutex_clients);
     auto it = m_clients.find(user_id);
     return it != m_clients.end() && it->second->IsAuthenticated();
 }
 
 bool NpHandler::IsAnySignedIn() const {
+    if (LocalMode())
+        return true;
     std::lock_guard lock(m_mutex_clients);
     for (auto& [_, client] : m_clients)
         if (client->IsAuthenticated())
@@ -599,6 +631,8 @@ bool NpHandler::IsAnySignedIn() const {
 }
 
 OrbisNpId NpHandler::GetNpId(s32 user_id) const {
+    if (LocalMode())
+        return LocalNpId();
     std::lock_guard lock(m_mutex_clients);
     auto it = m_np_ids.find(user_id);
     return it != m_np_ids.end() ? it->second : OrbisNpId{};
@@ -615,6 +649,8 @@ std::string NpHandler::GetAvatarUrl(s32 user_id) const {
 }
 
 OrbisNpAccountId NpHandler::GetAccountId(s32 user_id) const {
+    if (LocalMode())
+        return LocalAccountId();
     std::lock_guard lock(m_mutex_clients);
     auto it = m_clients.find(user_id);
     return it != m_clients.end() ? static_cast<OrbisNpAccountId>(it->second->GetUserId()) : 0;
@@ -633,6 +669,8 @@ u32 NpHandler::GetLocalIpAddr(s32 user_id) const {
 }
 
 s32 NpHandler::GetUserIdByAccountId(u64 account_id) const {
+    if (LocalMode())
+        return account_id == static_cast<u64>(LocalAccountId()) ? 1 : -1;
     std::lock_guard lock(m_mutex_clients);
     for (auto& [uid, client] : m_clients) {
         if (static_cast<u64>(client->GetUserId()) == account_id)
@@ -642,6 +680,8 @@ s32 NpHandler::GetUserIdByAccountId(u64 account_id) const {
 }
 
 s32 NpHandler::GetUserIdByOnlineId(const OrbisNpOnlineId& online_id) const {
+    if (LocalMode())
+        return strncmp(LocalNpId().handle.data, online_id.data, ORBIS_NP_ONLINEID_MAX_LENGTH) == 0 ? 1 : -1;
     std::lock_guard lock(m_mutex_clients);
     for (auto& [uid, np_id] : m_np_ids) {
         if (strncmp(np_id.handle.data, online_id.data, ORBIS_NP_ONLINEID_MAX_LENGTH) == 0)
