@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
@@ -14,6 +15,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#include <timeapi.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -32,6 +34,7 @@ typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
 static uint64_t import_count;
 static unsigned char *image;
+static uint64_t image_size_hint;
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -56,8 +59,15 @@ static ABI void trace_call(TraceTarget *t, uint64_t a, uint64_t b, uint64_t c) {
     unsigned long n=__atomic_add_fetch(&t->calls,1,__ATOMIC_RELAXED);
     static FILE *out;
     if (!out) { const char *f=getenv("BB_TRACE_FILE"); out=f ? fopen(f,"w") : stderr; if (!out) out=stderr; }
+    /* The guest's return address: the first image address above this frame (the wrapper saved seven registers). */
+    uint64_t from=(uint64_t)(uintptr_t)image;
+    {
+        const uint64_t *f=(const uint64_t *)__builtin_frame_address(0);
+        for (int k=1;k<32;++k) if (f[k]-(uint64_t)(uintptr_t)image<0xe00000) { from=f[k]; break; } /* eboot code, not data */
+    }
     if (n<=30 || n%1000==0)
-        fprintf(out,"TRACE %s(0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ") #%lu\n",t->name,a,b,c,n);
+        fprintf(out,"TRACE %s(0x%" PRIx64 ", 0x%" PRIx64 ", 0x%" PRIx64 ") #%lu from g%llx thread %lu\n",t->name,a,b,c,n,
+                (unsigned long long)(from-(uint64_t)(uintptr_t)image),(unsigned long)GetCurrentThreadId());
 }
 static void *allocate(size_t size);
 static uintptr_t trace_wrap(uintptr_t target, const char *name) {
@@ -107,12 +117,172 @@ static uintptr_t trace_wrap(uintptr_t target, const char *name) {
  * instructions, at least 5, no rip-relative ones) become a jump to a stub that logs the first two arguments,
  * the int each points to (when readable) and the return address, runs the moved bytes and jumps back. */
 static volatile LONG watch_hits;
+/* LBPPC_PROFILE=start,seconds (diagnostics): from `start` seconds after launch, for `seconds`, every thread is
+ * sampled about once a millisecond; samples in the image walk the guest frame-pointer chain. At the end, per thread
+ * with samples: the call sites (return addresses, image offsets) by inclusive count, deepest frame first per line. */
+typedef struct { DWORD tid; uint64_t samples; uint32_t nsites; uint64_t site[4096]; uint32_t hits[4096]; } ProfThread;
+static void prof_add(ProfThread *t, uint64_t site) {
+    for (uint32_t i=0;i<t->nsites;++i) if (t->site[i]==site) { ++t->hits[i]; return; }
+    if (t->nsites<4096) { t->site[t->nsites]=site; t->hits[t->nsites++]=1; }
+}
+static DWORD WINAPI profile_threads(LPVOID arg) {
+    (void)arg;
+    const char *spec=getenv("LBPPC_PROFILE");
+    char *e; unsigned start=(unsigned)strtoul(spec,&e,0), span=*e==',' ? (unsigned)strtoul(e+1,NULL,0) : 10;
+    Sleep(start*1000);
+    static ProfThread threads[64]; int nthreads=0;
+    const uint64_t lo=(uint64_t)(uintptr_t)image, hi=lo+image_size_hint;
+    fprintf(stderr,"PROFILE: sampling %u s\n",span);
+    ULONGLONG end=GetTickCount64()+span*1000ull;
+    while (GetTickCount64()<end) {
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        THREADENTRY32 entry={.dwSize=sizeof(entry)};
+        for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
+            if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
+            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,entry.th32ThreadID);
+            if (!thread) continue;
+            if (SuspendThread(thread)!=(DWORD)-1) {
+                CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
+                /* LBPPC_PROFILE_HOST=1: also samples taken in the runtime (a guest loop around a host call): the
+                   frame-pointer chain is followed through the runtime's frames into the guest's. */
+                static int host_frames=-1;
+                if (host_frames<0) host_frames=getenv("LBPPC_PROFILE_HOST")!=NULL;
+                int in_image=0;
+                if (host_frames && GetThreadContext(thread,&c) && (c.Rip<lo || c.Rip>=hi)) {
+                    uint64_t rbp=c.Rbp;
+                    for (int d=0; d<16 && rbp>c.Rsp && rbp-c.Rsp<(16u<<20); ++d) {
+                        uint64_t frame[2]; SIZE_T got;
+                        if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)rbp,frame,16,&got)) break;
+                        if (frame[1]>=lo && frame[1]<hi) { in_image=1; break; }
+                        if (frame[0]<=rbp) break;
+                        rbp=frame[0];
+                    }
+                }
+                if (GetThreadContext(thread,&c) && ((c.Rip>=lo && c.Rip<hi) || in_image)) {
+                    int ti=0;
+                    while (ti<nthreads && threads[ti].tid!=entry.th32ThreadID) ++ti;
+                    if (ti==nthreads && nthreads<64) { threads[nthreads].tid=entry.th32ThreadID; ++nthreads; }
+                    if (ti<64) {
+                        ProfThread *t=&threads[ti];
+                        ++t->samples;
+                        if (c.Rip>=lo && c.Rip<hi) prof_add(t,c.Rip-lo);
+                        uint64_t rbp=c.Rbp, seen[48]; int depth=0, host=!(c.Rip>=lo && c.Rip<hi);
+                        while (depth<48 && rbp>c.Rsp && rbp-c.Rsp<(16u<<20)) {
+                            uint64_t frame[2]; SIZE_T got;
+                            if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)rbp,frame,16,&got)) break;
+                            if (frame[1]<lo || frame[1]>=hi) {
+                                if (!host || frame[0]<=rbp) break; /* runtime frames before the first guest one */
+                                rbp=frame[0]; continue;
+                            }
+                            host=0;
+                            int dup=0;
+                            for (int k=0;k<depth;++k) dup|=seen[k]==frame[1];
+                            seen[depth++]=frame[1];
+                            if (!dup) prof_add(t,frame[1]-lo);
+                            if (frame[0]<=rbp) break;
+                            rbp=frame[0];
+                        }
+                    }
+                }
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+        Sleep(1);
+    }
+    fprintf(stderr,"PROFILE: done, %d threads in the image (image %llx size %llx)\n",nthreads,
+            (unsigned long long)lo,(unsigned long long)image_size_hint);
+    for (int ti=0;ti<nthreads;++ti) {
+        ProfThread *t=&threads[ti];
+        if (t->samples<5) continue;
+        fprintf(stderr,"PROFILE thread %lu: %llu samples\n",t->tid,(unsigned long long)t->samples);
+        for (int shown=0;shown<60;++shown) {
+            uint32_t best=0; int bi=-1;
+            for (uint32_t i=0;i<t->nsites;++i) if (t->hits[i]>best) { best=t->hits[i]; bi=(int)i; }
+            if (bi<0) break;
+            fprintf(stderr,"  %5.1f%%  0x%llx\n",100.0*best/t->samples,(unsigned long long)t->site[bi]);
+            t->hits[bi]=0;
+        }
+    }
+    return 0;
+}
+/* LBPPC_FPTRAP=seconds (diagnostics): after that delay, the SSE invalid-operation and divide-by-zero exceptions are
+ * unmasked on every thread, again every 100 ms; vectored_fault logs each instruction that raises one (once per
+ * site), masks them on that thread and lets the instruction run again (its usual NaN or infinity). */
+static DWORD WINAPI fptrap_threads(LPVOID arg) {
+    Sleep((DWORD)(uintptr_t)arg*1000);
+    fputs("FPTRAP: armed\n",stderr);
+    for (;;) {
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        THREADENTRY32 entry={.dwSize=sizeof(entry)};
+        for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
+            if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
+            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_SET_CONTEXT,FALSE,entry.th32ThreadID);
+            if (!thread) continue;
+            if (SuspendThread(thread)!=(DWORD)-1) {
+                CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_FLOATING_POINT};
+                if (GetThreadContext(thread,&c) && (c.MxCsr&0x280)) {
+                    c.MxCsr&=~(DWORD)0x2bf; c.FltSave.MxCsr=c.MxCsr;
+                    static unsigned armed;
+                    if (SetThreadContext(thread,&c) && ++armed<=3) {
+                        CONTEXT v={.ContextFlags=CONTEXT_FLOATING_POINT};
+                        GetThreadContext(thread,&v);
+                        fprintf(stderr,"FPTRAP: thread %lu mxcsr now %08lx\n",entry.th32ThreadID,(unsigned long)v.MxCsr);
+                    }
+                }
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snapshot);
+        Sleep(100);
+    }
+    return 0;
+}
+static void describe_address(char *out, size_t size, uintptr_t address);
+static int fptrap_report(EXCEPTION_POINTERS *info) {
+    static uintptr_t sites[1024]; static unsigned hits[1024]; static unsigned char learnt[1024]; static long nsites;
+    CONTEXT *c=info->ContextRecord;
+    uintptr_t rip=(uintptr_t)c->Rip;
+    /* With LBPPC_UNCAP_TRIGGER: sites trapping before the game goes to 60 FPS are learnt silently; after it,
+       only new ones print, with the guest return addresses on the stack. */
+    extern volatile int lbppc_nan_armed;
+    const int learning=getenv("LBPPC_UNCAP_TRIGGER") && !lbppc_nan_armed;
+    long i;
+    for (i=0;i<nsites && sites[i]!=rip;++i) {}
+    if (i==nsites && nsites<1024) { sites[i]=rip; nsites=i+1; hits[i]=0; learnt[i]=(unsigned char)learning; }
+    if (i<1024 && !learnt[i] && ++hits[i]<=2) {
+        char where[MAX_PATH+64], line[768];
+        describe_address(where,sizeof(where),rip);
+        int n=snprintf(line,sizeof(line),"FPTRAP %08lx at %s (hit %u, thread %lu) mxcsr %08lx xmm0 %08x xmm1 %08x xmm2 %08x",
+                       info->ExceptionRecord->ExceptionCode,where,hits[i],GetCurrentThreadId(),(unsigned long)c->MxCsr,
+                       *(unsigned *)&c->Xmm0,*(unsigned *)&c->Xmm1,*(unsigned *)&c->Xmm2);
+        const uint64_t *sp=(const uint64_t *)(uintptr_t)c->Rsp;
+        for (int k=0,found=0; k<512 && found<6 && n<(int)sizeof(line)-24; ++k) {
+            uint64_t v; SIZE_T got;
+            if (!ReadProcessMemory(GetCurrentProcess(),sp+k,&v,8,&got)) break;
+            if (image && v-(uintptr_t)image<image_size_hint) { n+=snprintf(line+n,sizeof(line)-n," g%llx",(unsigned long long)(v-(uintptr_t)image)); ++found; }
+        }
+        line[n++]='\n';
+        DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&w,NULL);
+    }
+    c->MxCsr|=0x280; c->FltSave.MxCsr=c->MxCsr;
+    return 1;
+}
 /* BB_WATCH_ADDR=address: hardware write watchpoints on its first 32 bytes (four 8-byte slots) on every
  * thread, re-applied every 50 ms for new threads; each write is logged (vectored_fault, first 40). */
 static uint64_t watch_address;
 static DWORD WINAPI watch_all_threads(LPVOID arg) {
     (void)arg;
+    /* BB_WATCH_DELAY=seconds: armed only after that long. */
+    if (getenv("BB_WATCH_DELAY")) Sleep((DWORD)strtoul(getenv("BB_WATCH_DELAY"),NULL,0)*1000);
     for (;;) {
+        /* BB_WATCH_IMAGE=offset: the watched address is that image offset (the image's base differs between runs). */
+        if (getenv("BB_WATCH_IMAGE")) {
+            if (!image) { Sleep(50); continue; }
+            watch_address=(uint64_t)(uintptr_t)image+strtoull(getenv("BB_WATCH_IMAGE"),NULL,0);
+        }
         HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
         THREADENTRY32 entry={.dwSize=sizeof(entry)};
         for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
@@ -123,8 +293,11 @@ static DWORD WINAPI watch_all_threads(LPVOID arg) {
                 CONTEXT c={.ContextFlags=CONTEXT_DEBUG_REGISTERS};
                 if (GetThreadContext(thread,&c) && c.Dr0!=watch_address) {
                     c.Dr0=watch_address; c.Dr1=watch_address+8; c.Dr2=watch_address+16; c.Dr3=watch_address+24;
-                    /* L0-L3, each: break on write (01), 8 bytes (10) */
-                    c.Dr7=0x55 | (0x9u<<16) | (0x9u<<20) | (0x9u<<24) | (0x9u<<28);
+                    /* L0-L3, each: break on write (01), 8 bytes (10); BB_WATCH_RW=1: on reads too (11). */
+                    static int rw=-1;
+                    if (rw<0) rw=getenv("BB_WATCH_RW")!=NULL;
+                    const unsigned slot=rw ? 0xbu : 0x9u;
+                    c.Dr7=0x55 | (slot<<16) | (slot<<20) | (slot<<24) | (slot<<28);
                     SetThreadContext(thread,&c);
                 }
                 ResumeThread(thread);
@@ -158,6 +331,15 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
     if (ret_slot<0) ret_slot=getenv("BB_HOOK_RET_SLOT") ? strtol(getenv("BB_HOOK_RET_SLOT"),NULL,0) : 0;
     uint64_t ret=*(uint64_t *)(uintptr_t)(slot+8*(uint64_t)ret_slot);
     watch_slot(slot);
+    /* BB_HOOK_SLEEP_US=n (test): every hit sleeps n microseconds first (timing experiments). */
+    static long sleep_us=-1;
+    if (sleep_us<0) sleep_us=getenv("BB_HOOK_SLEEP_US") ? strtol(getenv("BB_HOOK_SLEEP_US"),NULL,0) : 0;
+    if (sleep_us>0) {
+        LARGE_INTEGER f, s, n; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&s);
+        if (sleep_us>=2000) Sleep((DWORD)(sleep_us/1000));
+        else do { YieldProcessor(); QueryPerformanceCounter(&n); } while ((n.QuadPart-s.QuadPart)*1000000/f.QuadPart<sleep_us);
+        if (getenv("BB_HOOK_QUIET")) return;
+    }
     /* BB_HOOK_RANGE=lo:hi: only calls with one of the first three arguments in [lo, hi). */
     static uint64_t range_lo, range_hi;
     static int range_read;
@@ -168,12 +350,164 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
     }
     if (range_hi && !((a>=range_lo && a<range_hi) || (b>=range_lo && b<range_hi) || (c>=range_lo && c<range_hi) ||
                       (rax>=range_lo && rax<range_hi))) return;
+    /* BB_HOOK_FILTER=reg,offset,lo,hi (saved-register slot as in BB_HOOK_ARRAY: rax=1 ... rbx=10 ... r15=14,
+       rbp=-1 for the stub's frame pointer, i.e. the guest rbp): only events where the qword at reg+offset is in [lo,hi). */
+    if (getenv("BB_HOOK_FILTER")) {
+        static int freg; static long long foff; static uint64_t flo, fhi; static int fread_done;
+        if (!fread_done) {
+            char *e=(char *)getenv("BB_HOOK_FILTER");
+            freg=(int)strtol(e,&e,0); foff=strtoll(e+1,&e,0); flo=strtoull(e+1,&e,0); fhi=strtoull(e+1,NULL,0);
+            fread_done=1;
+        }
+        uint64_t base=freg<0 ? frame[0] : frame[-(1+freg)];
+        uint64_t v=0; SIZE_T fgot;
+        if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(base+foff),&v,8,&fgot) || v<flo || v>=fhi) return;
+    }
+    /* BB_HOOK_FIXNAN=array_slot,count_slot (register slots as in BB_HOOK_FILTER): non-finite floats in the array
+       become 1e19 (LBP3's sort keys: below the 1e20 of the padding, so a NaN key no longer sorts the padding's
+       indices in front of real ones). Counted, the first few logged. */
+    if (getenv("BB_HOOK_FIXNAN")) {
+        char *e=(char *)getenv("BB_HOOK_FIXNAN");
+        int ar=(int)strtol(e,&e,0), cr=(int)strtol(e+1,NULL,0);
+        float *list=(float *)(uintptr_t)frame[-(1+ar)];
+        uint32_t count=(uint32_t)frame[-(1+cr)];
+        if (!list || count>1000000) return;
+        static long fixed;
+        for (uint32_t i=0;i<count;++i) {
+            if (__builtin_isfinite(list[i])) continue;
+            list[i]=1e19f;
+            if (++fixed<=20 || fixed%1000==0) {
+                char l[128]; int n=snprintf(l,sizeof(l),"FIXNAN #%ld: key %u of %u\n",fixed,i,count);
+                DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE),l,(DWORD)n,&w,NULL);
+            }
+        }
+        return;
+    }
+    /* BB_HOOK_SET_WATCH=reg,offset,add (register slot as in BB_HOOK_FILTER; with BB_WATCH_ADDR=0): each hit points
+       the hardware watchpoints at *(reg+offset)+add (a field of an object found at run time), and logs nothing else. */
+    if (getenv("BB_HOOK_SET_WATCH")) {
+        char *e=(char *)getenv("BB_HOOK_SET_WATCH");
+        int wr=(int)strtol(e,&e,0); long long woff=strtoll(e+1,&e,0); long long wadd=strtoll(e+1,NULL,0);
+        uint64_t q=0; SIZE_T wgot;
+        uint64_t holder=(wr<0 ? frame[0] : frame[-(1+wr)])+woff;
+        if (ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)holder,&q,8,&wgot) && q) {
+            uint64_t want=(q+wadd)&~(uint64_t)7;
+            if (want!=watch_address) {
+                watch_address=want;
+                char l[128]; int n=snprintf(l,sizeof(l),"SET_WATCH 0x%llx\n",(unsigned long long)want);
+                DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE),l,(DWORD)n,&w,NULL);
+            }
+        }
+        return;
+    }
+    /* BB_HOOK_FLOATS=array_slot,count_slot[,count_offset] (register slots as in BB_HOOK_FILTER; count_slot -1: the
+       u32 at guest rbp+count_offset): reports only hits whose float array has a NaN, an infinity or a value of 1e20
+       or more (a sort key past the padding), with the first such entries. */
+    if (getenv("BB_HOOK_FLOATS")) {
+        char *e=(char *)getenv("BB_HOOK_FLOATS");
+        int ar=(int)strtol(e,&e,0), cr=(int)strtol(e+1,&e,0);
+        long long coff=*e==',' ? strtoll(e+1,NULL,0) : 0;
+        const float *list=(const float *)(uintptr_t)frame[-(1+ar)];
+        uint32_t count=cr==-1 ? *(const uint32_t *)(uintptr_t)(frame[0]+coff) : (uint32_t)frame[-(1+cr)];
+        /* BB_HOOK_FLOATS_DEREF=off: the array is *(array_reg+off) and, with count_slot -2, the count is the u32 at
+           array_reg+count_offset in bytes / 4 (a DMA list entry: size, then address). */
+        if (getenv("BB_HOOK_FLOATS_DEREF")) {
+            const uint64_t entry=frame[-(1+ar)];
+            if (!entry) return;
+            list=*(const float *const *)(uintptr_t)(entry+strtoll(getenv("BB_HOOK_FLOATS_DEREF"),NULL,0));
+            if (cr==-2) count=*(const uint32_t *)(uintptr_t)(entry+coff)/4;
+        }
+        if (!list || count>1000000) return;
+        char l[512]; int n=0, bad=0;
+        for (uint32_t i=0; i<count; ++i) {
+            const float v=list[i];
+            /* FLT_MAX is the jobs' own padding: only NaN and infinities count (BB_HOOK_FLOATS_BIG=1: 1e20 and up too). */
+            if (__builtin_isfinite(v) && (!getenv("BB_HOOK_FLOATS_BIG") || v<1e20f)) continue;
+            if (!bad) n=snprintf(l,sizeof(l),"FLOATS 0x%llx: %u entries at %p, bad:",(unsigned long long)offset,count,(const void *)list);
+            /* BB_HOOK_FLOATS_WATCH=1 (with BB_WATCH_ADDR=0): the first bad entry's address becomes the watched one. */
+            if (!bad && getenv("BB_HOOK_FLOATS_WATCH") && !watch_address) watch_address=(uint64_t)(uintptr_t)&list[i]&~(uint64_t)7;
+            if (++bad<=8) n+=snprintf(l+n,sizeof(l)-n," [%u]=%g(%08x)",i,v,*(const uint32_t *)&list[i]);
+        }
+        if (!bad) return;
+        n+=snprintf(l+n,sizeof(l)-n," (%d bad)\n",bad);
+        DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE),l,(DWORD)n,&w,NULL);
+        return;
+    }
+    /* BB_HOOK_UNIQUE=array_slot,count_slot (register slots as in BB_HOOK_FILTER): the array's length and its number
+       of distinct entries, one line per hit. */
+    if (getenv("BB_HOOK_UNIQUE")) {
+        char *e=(char *)getenv("BB_HOOK_UNIQUE");
+        int ar=(int)strtol(e,&e,0), cr=(int)strtol(e+1,NULL,0);
+        const uint64_t *list=(const uint64_t *)(uintptr_t)frame[-(1+ar)];
+        uint32_t count=(uint32_t)frame[-(1+cr)];
+        if (!list || count>200000) return;
+        uint64_t *copy=malloc(count*sizeof(uint64_t)+8);
+        if (!copy) return;
+        memcpy(copy,list,count*sizeof(uint64_t));
+        for (uint32_t i=1; i<count; ++i) { uint64_t v=copy[i]; uint32_t j=i; while (j && copy[j-1]>v) { copy[j]=copy[j-1]; --j; } copy[j]=v; }
+        uint32_t unique=count ? 1 : 0;
+        for (uint32_t i=1; i<count; ++i) unique+=copy[i]!=copy[i-1];
+        free(copy);
+        char l[160]; struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+        int n=snprintf(l,sizeof(l),"UNIQUE [t=%lld] 0x%llx: %u entries, %u distinct\n",(long long)now.tv_sec,(unsigned long long)offset,count,unique);
+        DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE),l,(DWORD)n,&w,NULL);
+        return;
+    }
+    /* BB_HOOK_ARRAY=array_reg:count_reg (saved-register names, e.g. rbx:r15): checks every entry of that
+       pointer array and reports only calls with an entry outside guest memory, with the array's contents. */
+    static int array_reg=-1, count_reg=-1;
+    if (array_reg==-1) {
+        static const char *names[]={"flags","rax","rcx","rdx","rsi","rdi","r8","r9","r10","r11","rbx","r12","r13","r14","r15"};
+        const char *spec=getenv("BB_HOOK_ARRAY");
+        array_reg=count_reg=-2;
+        if (spec) for (int i=0; i<15; ++i) {
+            size_t n=strlen(names[i]);
+            if (!strncmp(spec,names[i],n) && spec[n]==':') array_reg=i+1;
+            const char *colon=strchr(spec,':');
+            if (colon && !strcmp(colon+1,names[i])) count_reg=i+1;
+        }
+    }
+    if (array_reg>0 && count_reg>0) {
+        const uint64_t *list=(const uint64_t *)(uintptr_t)frame[-array_reg];
+        /* BB_HOOK_ARRAY_DEREF=offset: the array's address is stored at register+offset;
+           BB_HOOK_ARRAY_INDEX=n (saved-register slot as in BB_HOOK_ARRAY's names: rax=1 ... r15=14): it starts at that index. */
+        if (getenv("BB_HOOK_ARRAY_DEREF")) {
+            uint64_t holder=frame[-array_reg]+strtoull(getenv("BB_HOOK_ARRAY_DEREF"),NULL,0);
+            list=*(const uint64_t **)(uintptr_t)holder;
+            if (getenv("BB_HOOK_ARRAY_INDEX")) list+=(uint32_t)frame[-(1+atoi(getenv("BB_HOOK_ARRAY_INDEX")))];
+        }
+        uint64_t count=frame[-count_reg]&0xffffffff, bad=UINT64_MAX;
+        static volatile long checked;
+        InterlockedIncrement(&checked);
+        static __thread int dr_reported;
+        if (getenv("BB_WATCH_ADDR") && !dr_reported++) {
+            CONTEXT dc={.ContextFlags=CONTEXT_DEBUG_REGISTERS};
+            GetThreadContext(GetCurrentThread(),&dc);
+            char l[160];
+            int n=snprintf(l,sizeof(l),"DR check (thread %lu): Dr0=%llx Dr7=%llx\n",GetCurrentThreadId(),(unsigned long long)dc.Dr0,(unsigned long long)dc.Dr7);
+            DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE),l,(DWORD)n,&w,NULL);
+        }
+        if (!list || count>4096) return;
+        for (uint64_t i=0; i<count && bad==UINT64_MAX; ++i)
+            if (list[i]<0x800000000ull || list[i]>=0xfc00000000ull) bad=i;
+        if (bad==UINT64_MAX) return;
+        { extern void runtime_memory_check_view(uintptr_t address); runtime_memory_check_view((uintptr_t)list); }
+        char line[1024];
+        int len=snprintf(line,sizeof(line),"ARRAY at 0x%llx (call %ld): %llu entries at %p, entry %llu = %llx (thread %lu):",
+                         (unsigned long long)offset,checked,(unsigned long long)count,(void *)list,(unsigned long long)bad,
+                         (unsigned long long)list[bad],GetCurrentThreadId());
+        for (uint64_t i=0; i<count && i<48 && len<(int)sizeof(line)-20; ++i) len+=snprintf(line+len,sizeof(line)-len," %llx",(unsigned long long)list[i]);
+        len+=snprintf(line+len,sizeof(line)-len,"\n");
+        DWORD written;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
+        return;
+    }
     static volatile long count;
     long n=InterlockedIncrement(&count);
     static long max_lines=-1;
     if (max_lines<0) max_lines=getenv("BB_HOOK_MAX") ? strtol(getenv("BB_HOOK_MAX"),NULL,0) : 200;
     if (n>max_lines) return;
-    char line[512];
+    char line[1024];
     int32_t va=0, vb=0;
     SIZE_T got;
     /* BB_HOOK_FIELD=offset: the int at that offset in the first argument instead of at its start. */
@@ -190,11 +524,38 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
                      rb?"":"?",(unsigned)vb,(unsigned long long)c,(unsigned long long)rax,
                      (unsigned long long)(ret-(uintptr_t)image),GetCurrentThreadId());
     if (getenv("BB_HOOK_REGS"))
-        len+=snprintf(line+len,sizeof(line)-len," | rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
+        len+=snprintf(line+len,sizeof(line)-len," | rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
                       (unsigned long long)frame[-11],(unsigned long long)frame[-3],(unsigned long long)frame[-4],
                       (unsigned long long)frame[-5],(unsigned long long)frame[-6],(unsigned long long)frame[-7],
+                      (unsigned long long)frame[-8],(unsigned long long)frame[-9],(unsigned long long)frame[-10],
                       (unsigned long long)frame[-12],(unsigned long long)frame[-13],(unsigned long long)frame[-14],
                       (unsigned long long)frame[-15]);
+    /* BB_HOOK_PEEK=reg,offset,index_reg,n (register slots as in BB_HOOK_FILTER): q=*(reg+offset); prints q+index*8
+       and the n qwords there. */
+    if (getenv("BB_HOOK_PEEK")) {
+        char *e=(char *)getenv("BB_HOOK_PEEK");
+        int preg=(int)strtol(e,&e,0); long long poff=strtoll(e+1,&e,0); int pidx=(int)strtol(e+1,&e,0); int pn=(int)strtol(e+1,NULL,0);
+        uint64_t q=0; SIZE_T pgot;
+        uint64_t holder=(preg<0 ? frame[0] : frame[-(1+preg)])+poff;
+        /* BB_HOOK_PEEK_DIRECT=1: q is register+offset itself. */
+        if (getenv("BB_HOOK_PEEK_DIRECT") || ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)holder,&q,8,&pgot)) {
+            if (getenv("BB_HOOK_PEEK_DIRECT")) q=holder;
+            uint64_t at=q+(pidx<0 ? 0 : 8*(uint64_t)(uint32_t)frame[-(1+pidx)]);
+            len+=snprintf(line+len,sizeof(line)-len," | peek %llx->%llx:",(unsigned long long)holder,(unsigned long long)at);
+            /* BB_HOOK_PEEK_DEREF=1: the qwords of the object the first entry points to instead. */
+            if (getenv("BB_HOOK_PEEK_DEREF")) {
+                uint64_t first=0;
+                ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)at,&first,8,&pgot);
+                len+=snprintf(line+len,sizeof(line)-len," *%llx:",(unsigned long long)first);
+                at=first;
+            }
+            for (int i=0; i<pn && i<24 && len<(int)sizeof(line)-24; ++i) {
+                uint64_t v=0;
+                ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(at+8*i),&v,8,&pgot);
+                len+=snprintf(line+len,sizeof(line)-len," %llx",(unsigned long long)v);
+            }
+        }
+    }
     /* BB_HOOK_STACK=n: the first n stack slots at the hook site ([rsp] is a function's return address). */
     static long stack_slots=-1;
     if (stack_slots<0) stack_slots=getenv("BB_HOOK_STACK") ? strtol(getenv("BB_HOOK_STACK"),NULL,0) : 0;
@@ -230,11 +591,209 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
         WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)len,&written,NULL);
     }
 }
+/* lbppc: LBPPC_RENDER_RES=WxH: LBP3 renders at that size instead of 1920x1080. Its video setup (0x5bed0) stores
+ * the display size and pitch, and its render target setup (0x424790, 0x426dc0, 0x427940) creates every
+ * screen-sized target with immediate sizes: full, double height, 2/3, 1/3, 1/4 and 1/6 of 1920x1080. Each is
+ * scaled to the requested size (CUSA00473 1.28; checked against the original bytes, else nothing changes). */
+static void render_res_install(void) {
+    const char *spec=getenv("LBPPC_RENDER_RES");
+    if (!spec || !*spec) return;
+    unsigned w=0, h=0;
+    if (sscanf(spec,"%ux%u",&w,&h)!=2 || w<640 || h<360 || w>7680 || h>4320) {
+        fprintf(stderr,"LBPPC_RENDER_RES: '%s' is not WxH\n",spec); return;
+    }
+    /* 5120 wide stops the game (a corrupted shader or a fault while loading, every time); 4480 works. */
+    if (w>4480) { fprintf(stderr,"LBPPC_RENDER_RES: %ux%u is wider than 4480, which LBP3 does not survive yet\n",w,h); return; }
+    static const struct { uint32_t w_at, h_at; uint16_t w, h; } targets[]={
+    {0x424bf6,0x424bfb,1920,1080}, {0x424c46,0x424c4b,1920,1080}, {0x4270ad,0x4270b2,1920,1080},
+    {0x42711a,0x42711f,1920,1080}, {0x427a14,0x427a19,1920,1080}, {0x427a3f,0x427a44,1920,1080},
+    {0x427a67,0x427a6c,480,270}, {0x427a8f,0x427a94,480,270}, {0x427b83,0x427b88,1920,1080},
+    {0x427bab,0x427bb0,1920,1080}, {0x427bd3,0x427bd8,1920,1080}, {0x427bfe,0x427c03,1920,1080},
+    {0x427c29,0x427c2e,1920,1080}, {0x427c51,0x427c56,1920,1080}, {0x427c79,0x427c7e,1920,1080},
+    {0x427ca1,0x427ca6,1920,1080}, {0x427d1d,0x427d22,1280,720}, {0x427d3e,0x427d43,640,360},
+    {0x427d62,0x427d67,320,180}, {0x427d8d,0x427d92,1920,1080}, {0x427db5,0x427dba,1920,1080},
+    {0x427e91,0x427e96,1920,1080}, {0x427ebc,0x427ec1,1920,1080}, {0x427ef1,0x427ef6,1920,2160},
+    {0x427f19,0x427f1e,1920,1080}, {0x427f4b,0x427f50,1920,2160}, {0x427f73,0x427f78,1920,1080},
+    {0x427fce,0x427fd3,1920,1080}, {0x427ff6,0x427ffb,1920,1080}, {0x42809f,0x4280a4,1920,1080}
+    };
+    static const struct { uint32_t at, value; } display[]={{0x5bf85,0x780},{0x5bf93,0x438},{0x5bfa0,0x1e00}};
+    /* The same setup also describes some of those targets as textures, to read them back (the screen copies the pod
+       computer and pause menu fade from): 16-bit width and height, a 32-bit row pitch (1920*4) and one 32-bit
+       height. Left at 1080p, they show a zoomed corner of the screen (a grey wash with a giant Sackboy). */
+    static const struct { uint32_t at; uint16_t value; } texture16[]={
+    {0x424c94,1920}, {0x424c9a,1080}, {0x424ce0,1920}, {0x424ce9,1080},
+    {0x42704d,1920}, {0x427053,1080}, {0x4271ba,1920}, {0x4271c3,1080}
+    };
+    static const struct { uint32_t at, value; } texture32[]={{0x424c8c,0x1e00},{0x4271cb,0x1e00},{0x424bf1,0x438}};
+    for (size_t i=0;i<sizeof(display)/sizeof(*display);++i) {
+        uint32_t v; memcpy(&v,image+display[i].at,4);
+        if (v!=display[i].value) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
+    }
+    for (size_t i=0;i<sizeof(targets)/sizeof(*targets);++i) {
+        uint32_t a, b; memcpy(&a,image+targets[i].w_at,4); memcpy(&b,image+targets[i].h_at,4);
+        if (a!=targets[i].w || b!=targets[i].h) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
+    }
+    for (size_t i=0;i<sizeof(texture16)/sizeof(*texture16);++i) {
+        uint16_t v; memcpy(&v,image+texture16[i].at,2);
+        if (v!=texture16[i].value) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
+    }
+    for (size_t i=0;i<sizeof(texture32)/sizeof(*texture32);++i) {
+        uint32_t v; memcpy(&v,image+texture32[i].at,4);
+        if (v!=texture32[i].value) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
+    }
+    /* The render targets of the second memory type come out of a region of fixed size (0x2441400 bytes, set at
+       0x1517d): past it the game stops with a fatal error (0xa0020006). It grows with the pixel count. */
+    uint32_t region; memcpy(&region,image+0x15180,4);
+    if (region!=0x2441400) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
+    const double area=(double)w*h/(1920.0*1080.0);
+    const uint64_t grown=((uint64_t)(0x2441400*(area>1.0 ? area : 1.0))+0xfffff)&~(uint64_t)0xfffff;
+    if (grown>0xffffffffull) { fprintf(stderr,"LBPPC_RENDER_RES: %ux%u is too large\n",w,h); return; }
+    /* The camera's constructor (0x3fdba0) stores its aspect, 16:9, beside its 60 degree vertical field of view: with the
+       size's aspect the view widens (ultrawide) instead of stretching. The menus and HUD lay themselves out by it. */
+    uint32_t aspect_bits; memcpy(&aspect_bits,image+0x3fdbc3,4);
+    if (aspect_bits!=0x3fe38e39) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
+    const float aspect=(float)w/(float)h;
+    memcpy(image+0x3fdbc3,&aspect,4);
+    region=(uint32_t)grown;
+    memcpy(image+0x15180,&region,4);
+    const uint32_t pitch=w*4;
+    memcpy(image+0x5bf85,&w,4); memcpy(image+0x5bf93,&h,4); memcpy(image+0x5bfa0,&pitch,4);
+    for (size_t i=0;i<sizeof(texture16)/sizeof(*texture16);++i) {
+        const uint16_t v=(uint16_t)(texture16[i].value==1920 ? w : h);
+        memcpy(image+texture16[i].at,&v,2);
+    }
+    memcpy(image+0x424c8c,&pitch,4); memcpy(image+0x4271cb,&pitch,4); memcpy(image+0x424bf1,&h,4);
+    /* LBPPC_RENDER_RES_MASK=bits (diagnostics): only the targets with their bit set are scaled. */
+    const uint64_t mask=getenv("LBPPC_RENDER_RES_MASK") ? strtoull(getenv("LBPPC_RENDER_RES_MASK"),NULL,0) : ~0ull;
+    for (size_t i=0;i<sizeof(targets)/sizeof(*targets);++i) {
+        if (!(mask>>i&1)) continue;
+        const uint32_t tw=(uint32_t)(((uint64_t)targets[i].w*w+960)/1920), th=(uint32_t)(((uint64_t)targets[i].h*h+540)/1080);
+        memcpy(image+targets[i].w_at,&tw,4); memcpy(image+targets[i].h_at,&th,4);
+    }
+    printf("Runtime: rendering at %ux%u (aspect %.3f)\n",w,h,aspect);
+}
+/* lbppc: with a custom server (LBPPC_SERVER), the key LBP3 signs its requests and checks the server's replies with
+ * (HMAC-SHA1, the X-Digest-A/B headers) becomes "CustomServerDigest", the one custom servers (Refresh, Lighthouse)
+ * use, as PS3 patchers do. The game builds the 18-character key from three immediates in 0x1ec60 (CUSA00473 1.28;
+ * checked against the original bytes, else nothing changes). */
+static void custom_server_install(void) {
+    const char *server=getenv("LBPPC_SERVER");
+    if (!server || !*server) return;
+    /* The replies are checked (0x222a0, X-Digest-A) with the same key kept as a string, at 0xe4aff1. */
+    static const struct { uint32_t at; const char *original, *custom; } key[]={
+        {0x1edb9,"C5S^FWw*","CustomSe"}, {0x1eda8,"8yIp3O%M","rverDige"}, {0x1edd6,"e!","st"},
+        {0xe4aff1,"C5S^FWw*8yIp3O%Me!","CustomServerDigest"}
+    };
+    for (size_t i=0;i<sizeof(key)/sizeof(*key);++i)
+        if (memcmp(image+key[i].at,key[i].original,strlen(key[i].original))) {
+            fprintf(stderr,"LBPPC_SERVER: unexpected game code, the server's replies will not be accepted\n"); return;
+        }
+    for (size_t i=0;i<sizeof(key)/sizeof(*key);++i) memcpy(image+key[i].at,key[i].custom,strlen(key[i].custom));
+    printf("Online: custom server %s\n",server);
+}
+/* Executable memory within 2 GiB of the image (for rel32 jumps and calls into stubs). */
+static unsigned char *near_image_alloc(void) {
+    unsigned char *p=NULL;
+    for (uintptr_t at=((uintptr_t)image-0x10000000)&~(uintptr_t)0xffff;
+         !p && (uintptr_t)image>0x70000000 && at>(uintptr_t)image-0x70000000; at-=0x10000000)
+        p=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    for (uintptr_t at=((uintptr_t)image+0x08000000)&~(uintptr_t)0xffff; !p && at<(uintptr_t)image+0x70000000; at+=0x01000000)
+        p=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    for (uintptr_t at=0x10000; !p && at+65536<=(uintptr_t)image; at+=0x10000)
+        p=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    return p;
+}
+/* lbppc: LBPPC_SIM_DIVIDE=n: LBP3's main loop calls the world update (one simulation step, 0x254450) at 0xb2aa
+ * once a frame. With n, a stub calls it once every n frames: the loop may run at 60 FPS while the world keeps
+ * its 30 steps a second. The counter is lbppc_sim_phase (0 on the frames that step). */
+volatile int32_t *lbppc_sim_phase;
+volatile unsigned char *lbppc_sim_active;
+/* LBPPC_UNCAP_TRIGGER=file (with LBPPC_SIM_DIVIDE): when the file appears (removed then), the game goes to one
+ * frame per vblank: its own vsync interval (0x1060a10) to 0, the port's flip rate to 0, and the world update to
+ * every n frames. Creating it again goes back to 30 FPS. */
+static DWORD WINAPI uncap_thread(LPVOID arg) {
+    (void)arg;
+    const char *trigger=getenv("LBPPC_UNCAP_TRIGGER");
+    for (int uncapped=0;;) {
+        while (remove(trigger)!=0) Sleep(50);
+        uncapped=!uncapped;
+        *(volatile int32_t *)(image+0x1060a10)=uncapped ? 0 : 2;
+        bbgpu_set_flip_rate(uncapped ? 0 : 1);
+        if (lbppc_sim_phase) *lbppc_sim_phase=1;
+        if (lbppc_sim_active) *lbppc_sim_active=(unsigned char)uncapped;
+        { extern volatile int lbppc_nan_armed; lbppc_nan_armed=uncapped; }
+        printf("Runtime: %s\n",uncapped ? "60 FPS (world update every other frame)" : "30 FPS");
+    }
+    return 0;
+}
+/* LBPPC_ARENA_MON=1 (diagnostics): LBP3's per-frame arena (used at 0x118ffc8, capacity at 0x118ffd0), sampled
+ * every millisecond: the peak and the number of resets each second. */
+static DWORD WINAPI arena_monitor(LPVOID arg) {
+    (void)arg;
+    volatile uint32_t *used=(volatile uint32_t *)(image+0x118ffc8), *cap=(volatile uint32_t *)(image+0x118ffd0);
+    for (;;) {
+        uint32_t peak=0, last=0, resets=0;
+        ULONGLONG end=GetTickCount64()+1000;
+        while (GetTickCount64()<end) {
+            uint32_t u=*used;
+            if (u>peak) peak=u;
+            if (u<last) ++resets;
+            last=u;
+            Sleep(1);
+        }
+        printf("ARENA peak %u of %u (%.0f%%), %u resets\n",peak,*cap,*cap ? 100.0*peak/ *cap : 0.0,resets);
+    }
+    return 0;
+}
+static void sim_divide_install(void) {
+    if (getenv("LBPPC_ARENA_MON")) CloseHandle(CreateThread(NULL,0,arena_monitor,NULL,0,NULL));
+    const char *spec=getenv("LBPPC_SIM_DIVIDE");
+    if (!spec) return;
+    const int32_t n=(int32_t)strtol(spec,NULL,0);
+    const uint64_t site=0xb2aa, update=0x254450;
+    if (n<1 || image[site]!=0xe8) { fprintf(stderr,"LBPPC_SIM_DIVIDE: not applied\n"); return; }
+    unsigned char *s=near_image_alloc();
+    if (!s) { fputs("LBPPC_SIM_DIVIDE: no memory near the image\n",stderr); return; }
+    /* stub: cmp byte [rip+active],0; je direct; sub dword [rip+counter],1; jg skip;
+     *       mov dword [rip+counter],n; direct: jmp [rip+target]; skip: ret */
+    unsigned char *o=s;
+    int32_t *counter=(int32_t *)(s+64);
+    uint64_t *target=(uint64_t *)(s+72);
+    unsigned char *active=s+80;
+    *counter=1; *target=(uint64_t)(uintptr_t)(image+update);
+    /* LBPPC_UNCAP_TRIGGER: inactive (every frame) until the trigger file appears. */
+    *active=getenv("LBPPC_UNCAP_TRIGGER") ? 0 : 1;
+    *o++=0x80; *o++=0x3d; { int32_t d=(int32_t)(active-(o+5)); memcpy(o,&d,4); o+=4; } *o++=0x00;
+    unsigned char *je=o; *o++=0x74; *o++=0x00;
+    *o++=0x83; *o++=0x2d; { int32_t d=(int32_t)((unsigned char *)counter-(o+5)); memcpy(o,&d,4); o+=4; } *o++=0x01;
+    unsigned char *jg=o; *o++=0x7f; *o++=0x00;
+    *o++=0xc7; *o++=0x05; { int32_t d=(int32_t)((unsigned char *)counter-(o+8)); memcpy(o,&d,4); o+=4; } memcpy(o,&n,4); o+=4;
+    je[1]=(unsigned char)(o-(je+2));
+    *o++=0xff; *o++=0x25; { int32_t d=(int32_t)((unsigned char *)target-(o+4)); memcpy(o,&d,4); o+=4; }
+    jg[1]=(unsigned char)(o-(jg+2));
+    *o++=0xc3;
+    lbppc_sim_phase=counter;
+    lbppc_sim_active=active;
+    const int32_t rel=(int32_t)((intptr_t)s-(intptr_t)(image+site+5));
+    memcpy(image+site+1,&rel,4);
+    printf("Runtime: world update every %d frames (stub at %p)\n",n,(void *)s);
+    if (getenv("LBPPC_UNCAP_TRIGGER")) CloseHandle(CreateThread(NULL,0,uncap_thread,NULL,0,NULL));
+}
 static void hooks_install(const char *spec) {
     if (!spec || !*spec) return;
     /* Stubs within 2 GiB of the image, for 5-byte jumps. */
     unsigned char *stubs=NULL;
-    for (uintptr_t at=((uintptr_t)image-0x10000000)&~(uintptr_t)0xffff; !stubs && at>(uintptr_t)image-0x70000000; at-=0x10000000)
+    for (uintptr_t at=((uintptr_t)image-0x10000000)&~(uintptr_t)0xffff;
+         !stubs && (uintptr_t)image>0x70000000 && at>(uintptr_t)image-0x70000000; at-=0x10000000)
+        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    /* lbppc: an image at the low base (0x400000) has no room below it: above it, past the modules. */
+    for (uintptr_t at=((uintptr_t)image+0x08000000)&~(uintptr_t)0xffff; !stubs && at<(uintptr_t)image+0x70000000; at+=0x01000000)
+        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    for (uintptr_t at=0x10000; !stubs && at+65536<=(uintptr_t)image; at+=0x10000)
+        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    /* Any free 64 KiB just past the image (the GPU and network libraries take much of the space above it). */
+    for (uintptr_t at=((uintptr_t)image+image_size_hint+0xffff)&~(uintptr_t)0xffff;
+         !stubs && at<(uintptr_t)image+0x70000000; at+=0x10000)
         stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
     if (!stubs) { fprintf(stderr,"BB_HOOK: no memory near the image\n"); return; }
     unsigned char *o=stubs;
@@ -437,6 +996,12 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         }
         fprintf(stderr,"  thread name '%s'\n",name);
     }
+    {   /* lbppc diagnostics: physical aliases of the registers' targets */
+        extern void runtime_memory_report_aliases(uintptr_t address);
+        const CONTEXT *c=info->ContextRecord;
+        const DWORD64 regs[]={c->Rbx,c->Rsi,c->Rdi,c->R11,c->R14};
+        for (int i=0; i<5; ++i) if (regs[i]>=0x1000000000ull && regs[i]<0xfc00000000ull) runtime_memory_report_aliases((uintptr_t)regs[i]);
+    }
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
     /* Return addresses near the top of the stack: system libraries (the C runtime's memcpy)
      * keep no frame pointers, so the rbp chain below can skip their caller. */
@@ -524,9 +1089,26 @@ static DWORD WINAPI watchdog_thread(LPVOID arg) {
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if ((code==STATUS_FLOAT_MULTIPLE_TRAPS || code==EXCEPTION_FLT_INVALID_OPERATION ||
+         code==EXCEPTION_FLT_DIVIDE_BY_ZERO) && getenv("LBPPC_FPTRAP") && fptrap_report(info))
+        return EXCEPTION_CONTINUE_EXECUTION;
     if (code==EXCEPTION_SINGLE_STEP && (info->ContextRecord->Dr6&15)) { /* BB_WATCH / BB_WATCH_ADDR: a write */
-        if (InterlockedIncrement(&watch_hits)<=40) {
-            char line[256], where[MAX_PATH+64], from[MAX_PATH+64];
+        /* BB_WATCH_MAX=n: hits printed (default 40). */
+        static long watch_max=-1;
+        if (watch_max<0) watch_max=getenv("BB_WATCH_MAX") ? strtol(getenv("BB_WATCH_MAX"),NULL,0) : 40;
+        /* BB_WATCH_VALUE=u32: only writes leaving that value in either half of the watched 8 bytes. */
+        int wanted=1;
+        if (getenv("BB_WATCH_VALUE")) {
+            static uint32_t want; static int want_read;
+            if (!want_read) { want=(uint32_t)strtoul(getenv("BB_WATCH_VALUE"),NULL,0); want_read=1; }
+            DWORD64 d6=info->ContextRecord->Dr6;
+            DWORD64 s=d6&1 ? info->ContextRecord->Dr0 : d6&2 ? info->ContextRecord->Dr1 :
+                      d6&4 ? info->ContextRecord->Dr2 : info->ContextRecord->Dr3;
+            const uint32_t *h=(const uint32_t *)(uintptr_t)s;
+            wanted=h[0]==want || h[1]==want;
+        }
+        if (wanted && InterlockedIncrement(&watch_hits)<=watch_max) {
+            char line[512], where[MAX_PATH+64], from[MAX_PATH+64];
             describe_address(where,sizeof(where),(uintptr_t)info->ContextRecord->Rip);
             DWORD64 dr6=info->ContextRecord->Dr6;
             DWORD64 slot=dr6&1 ? info->ContextRecord->Dr0 : dr6&2 ? info->ContextRecord->Dr1 :
@@ -534,8 +1116,26 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
             uint64_t value=*(uint64_t *)(uintptr_t)slot;
             uint64_t top=*(uint64_t *)(uintptr_t)info->ContextRecord->Rsp;
             describe_address(from,sizeof(from),(uintptr_t)top);
-            int n=snprintf(line,sizeof(line),"WATCH write to %p before %s, value %016llx, [rsp] %s (thread %lu)\n",
-                           (void *)(uintptr_t)slot,where,(unsigned long long)value,from,GetCurrentThreadId());
+            const CONTEXT *cx=info->ContextRecord;
+            int n=snprintf(line,sizeof(line),"WATCH write to %p before %s, value %016llx, [rsp] %s (thread %lu)"
+                           " rsi %llx rdi %llx rcx %llx rdx %llx\n",
+                           (void *)(uintptr_t)slot,where,(unsigned long long)value,from,GetCurrentThreadId(),
+                           (unsigned long long)cx->Rsi,(unsigned long long)cx->Rdi,(unsigned long long)cx->Rcx,
+                           (unsigned long long)cx->Rdx);
+            /* The guest code that led here: the first image addresses on the stack (BB_WATCH_STACK=1). */
+            if (getenv("BB_WATCH_STACK") && n>0 && n<(int)sizeof(line)) {
+                --n;
+                const uint64_t *sp=(const uint64_t *)(uintptr_t)cx->Rsp;
+                int found=0;
+                for (int k=0; k<512 && found<6; ++k) {
+                    uint64_t v; SIZE_T got;
+                    if (!ReadProcessMemory(GetCurrentProcess(),sp+k,&v,8,&got)) break;
+                    if (image && v-(uintptr_t)image<image_size_hint && n<(int)sizeof(line)-24) {
+                        n+=snprintf(line+n,sizeof(line)-n," g%llx",(unsigned long long)(v-(uintptr_t)image)); ++found;
+                    }
+                }
+                if (n<(int)sizeof(line)-1) line[n++]='\n';
+            }
             DWORD written;
             WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
         }
@@ -739,6 +1339,56 @@ static int patchable(Segment *segments, uint64_t count, uint64_t address, uint64
     }
     return 0;
 }
+/* LBPPC_POKE / LBPPC_POKE_LATE (test): off:hex[,off:hex...] byte writes at image offsets; `live` while the game
+ * runs (code made writable for the write). `saved` keeps the bytes replaced, for undoing them. */
+static unsigned char poke_saved[4096];
+static size_t poke_saved_used;
+static void apply_pokes(const char *p, Segment *segments, uint64_t ns, int live) {
+    while (p && *p) {
+        char *end; uint64_t off=strtoull(p,&end,16), n=0;
+        if (*end!=':') break;
+        unsigned char bytes[256];
+        for (p=end+1; isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1]) && n<sizeof(bytes); p+=2, ++n) {
+            char byte[3]={p[0],p[1],0};
+            bytes[n]=(unsigned char)strtoul(byte,NULL,16);
+        }
+        if (n && patchable(segments,ns,off,n)) {
+            DWORD old=0;
+            if (live) VirtualProtect(image+off,n,PAGE_EXECUTE_READWRITE,&old);
+            if (poke_saved_used+n<=sizeof(poke_saved)) { memcpy(poke_saved+poke_saved_used,image+off,n); poke_saved_used+=n; }
+            memcpy(image+off,bytes,n);
+            if (live) { VirtualProtect(image+off,n,old,&old); FlushInstructionCache(GetCurrentProcess(),image+off,n); }
+            printf("Runtime: poked %" PRIu64 " bytes at image offset %#" PRIx64 "%s\n",n,off,live ? " (live)" : "");
+        }
+        if (*p==',') ++p;
+    }
+}
+static struct { Segment *segments; uint64_t count; } late_pokes;
+static DWORD WINAPI late_poke_thread(LPVOID arg) {
+    (void)arg;
+    const char *at=getenv("LBPPC_POKE_AT"), *span=getenv("LBPPC_POKE_FOR"), *trigger=getenv("LBPPC_POKE_TRIGGER");
+    /* LBPPC_POKE_TRIGGER=file: applied when the file appears (and removed), instead of after LBPPC_POKE_AT. */
+    if (trigger) { while (remove(trigger)!=0) Sleep(50); }
+    else Sleep((DWORD)(at ? strtoul(at,NULL,0) : 60)*1000);
+    size_t first=poke_saved_used;
+    apply_pokes(getenv("LBPPC_POKE_LATE"),late_pokes.segments,late_pokes.count,1);
+    if (!span) return 0;
+    Sleep((DWORD)strtoul(span,NULL,0)*1000);
+    /* Undo: the saved bytes go back in the order they were taken. */
+    size_t used=first;
+    for (const char *p=getenv("LBPPC_POKE_LATE"); p && *p; ) {
+        char *end; uint64_t off=strtoull(p,&end,16), n=0;
+        if (*end!=':') break;
+        for (p=end+1; isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1]); p+=2) ++n;
+        DWORD old=0;
+        VirtualProtect(image+off,n,PAGE_EXECUTE_READWRITE,&old);
+        memcpy(image+off,poke_saved+used,n); used+=n;
+        VirtualProtect(image+off,n,old,&old); FlushInstructionCache(GetCurrentProcess(),image+off,n);
+        printf("Runtime: unpoked %" PRIu64 " bytes at image offset %#" PRIx64 "\n",n,off);
+        if (*p==',') ++p;
+    }
+    return 0;
+}
 /* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
  * function pointers): the patch holds the address at the patches' base, rebased here. */
@@ -821,6 +1471,15 @@ int main(int argc, char **argv) {
      * TCB needs one of the 64 TEB TLS slots before DLLs (Vulkan drivers) take them. */
     runtime_memory_reserve();
     runtime_thread_tcb_offset();
+    /* Windows 11 throttles a process whose window is not in front (EcoQoS: lower clocks, and
+     * the 1 ms timer resolution ignored): the guest's timed waits then round to 15.6 ms. LBP3
+     * fell from 30 to 15 FPS a few minutes into every unattended session. */
+    PROCESS_POWER_THROTTLING_STATE throttling={
+        .Version=PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask=PROCESS_POWER_THROTTLING_EXECUTION_SPEED|PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        .StateMask=0};
+    SetProcessInformation(GetCurrentProcess(),ProcessPowerThrottling,&throttling,sizeof(throttling));
+    timeBeginPeriod(1);
 #endif
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
@@ -877,10 +1536,13 @@ int main(int argc, char **argv) {
             fprintf(stderr,"BB_STRICT_HANDLES: policy not set (%lu)\n",GetLastError());
     }
     if (timeout_seconds) CloseHandle(CreateThread(NULL,0,watchdog_thread,(LPVOID)(uintptr_t)timeout_seconds,0,NULL));
-    if (getenv("BB_WATCH_ADDR")) {
-        watch_address=strtoull(getenv("BB_WATCH_ADDR"),NULL,0);
+    if (getenv("BB_WATCH_ADDR") || getenv("BB_WATCH_IMAGE")) {
+        watch_address=getenv("BB_WATCH_ADDR") ? strtoull(getenv("BB_WATCH_ADDR"),NULL,0) : 0;
         CloseHandle(CreateThread(NULL,0,watch_all_threads,NULL,0,NULL));
     }
+    if (getenv("LBPPC_PROFILE")) CloseHandle(CreateThread(NULL,0,profile_threads,NULL,0,NULL));
+    if (getenv("LBPPC_FPTRAP"))
+        CloseHandle(CreateThread(NULL,0,fptrap_threads,(LPVOID)(uintptr_t)strtoul(getenv("LBPPC_FPTRAP"),NULL,0),0,NULL));
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
@@ -899,6 +1561,9 @@ int main(int argc, char **argv) {
     char magic[8];
     if (fread(magic, 1, 8, f) != 8 || (memcmp(magic, "BBPROBE1", 8) && memcmp(magic, "BBPROBE2", 8) && memcmp(magic,"BBPROBE3",8) && memcmp(magic,"BBPROBE4",8) && memcmp(magic,"BBPROBE5",8))) fail("bad boot file signature");
     uint64_t size = read64(f), entry = read64(f), ns = read64(f), nr = read64(f);
+#ifdef _WIN32
+    image_size_hint=size;
+#endif
     import_count = read64(f);
     uint64_t capabilities = memcmp(magic, "BBPROBE1", 8) ? read64(f) : 0;
     if (capabilities & ~UINT64_C(1)) fail("unknown runtime capabilities");
@@ -1013,6 +1678,13 @@ int main(int argc, char **argv) {
         uint64_t sdk=0;
         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
         BbGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080};
+        /* lbppc: a window opens at LBPPC_RENDER_RES (its aspect: ultrawide is not letterboxed into 16:9); the
+           GPU layer fits it to the screen. */
+        unsigned render_w=0, render_h=0;
+        if (getenv("LBPPC_RENDER_RES") && sscanf(getenv("LBPPC_RENDER_RES"),"%ux%u",&render_w,&render_h)==2 &&
+            render_w>=640 && render_h>=360 && render_w<=4480 && render_h<=4320) {
+            gpu.width=render_w; gpu.height=render_h;
+        }
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
@@ -1064,6 +1736,20 @@ int main(int argc, char **argv) {
     /* The Hunter's Dream backend reads the game's code before the patches change it. */
     if (bloodborne) bbnet_set_image(image, size);
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    /* LBPPC_POKE=off:hex[,off:hex...] (test): byte writes at image offsets, after the patches. */
+    apply_pokes(getenv("LBPPC_POKE"),segments,ns,0);
+    /* LBPPC_POKE_LATE=spec with LBPPC_POKE_AT=seconds (test): the same, that long after the start (in a level),
+       and undone LBPPC_POKE_FOR seconds later if given. */
+    if (getenv("LBPPC_POKE_LATE")) {
+        late_pokes.segments=segments; late_pokes.count=ns;
+        CloseHandle(CreateThread(NULL,0,late_poke_thread,NULL,0,NULL));
+    }
+    /* LBPPC_PROCESS_AFFINITY=mask (test): every thread of the process on those host cores. */
+    if (getenv("LBPPC_PROCESS_AFFINITY")) SetProcessAffinityMask(GetCurrentProcess(),(DWORD_PTR)strtoull(getenv("LBPPC_PROCESS_AFFINITY"),NULL,0));
+    { extern uintptr_t lbppc_image_base; lbppc_image_base=(uintptr_t)image; }
+    render_res_install();
+    custom_server_install();
+    sim_divide_install();
     hooks_install(getenv("BB_HOOK"));
     if (bloodborne) bbgpu_pc_menu_prepare(image);
 #ifdef _WIN32
@@ -1115,7 +1801,9 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
-    if (bloodborne) bbnet_initialize(); /* the online session starts with the game */
+    /* The online session starts with the game (lbppc: LBP3's when signed in locally, LBPPC_NP_USER). */
+    if (bloodborne || (getenv("LBPPC_NP_USER") && *getenv("LBPPC_NP_USER")) ||
+        (getenv("BB_SHADNET_NPID") && *getenv("BB_SHADNET_NPID"))) bbnet_initialize();
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

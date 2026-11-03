@@ -55,11 +55,27 @@ static int host_clock(uint32_t id,clockid_t *out) {
     default: return 0;
     }
 }
+/* LBPPC_TIME_SCALE=x (diagnostics): the guest's monotonic clocks and process time run at x times real speed
+   from the start (0.5: a game at 30 FPS measures 60 FPS frame times). */
+static double time_scale(void) {
+    static double scale=-1;
+    if (scale<0) { const char *e=getenv("LBPPC_TIME_SCALE"); scale=e ? strtod(e,NULL) : 1.0; if (scale<=0) scale=1.0; }
+    return scale;
+}
+static void scale_monotonic(struct timespec *t) {
+    const double scale=time_scale();
+    if (scale==1.0) return;
+    const int64_t start=(int64_t)process_start.tv_sec*1000000000+process_start.tv_nsec;
+    const int64_t now=(int64_t)t->tv_sec*1000000000+t->tv_nsec;
+    const int64_t scaled=start+(int64_t)((double)(now-start)*scale);
+    t->tv_sec=scaled/1000000000; t->tv_nsec=scaled%1000000000;
+}
 static int clock_read(uint32_t id,GuestTimespec *ts) {
     clockid_t host;
     if (!ts || !host_clock(id,&host)) return EINVAL;
     struct timespec t;
     if (clock_gettime(host,&t)) return errno;
+    if (host==CLOCK_MONOTONIC) scale_monotonic(&t);
     if (id==13) t.tv_nsec=0;
     ts->sec=t.tv_sec; ts->nsec=t.tv_nsec; return 0;
 }
@@ -77,11 +93,11 @@ static ABI int32_t posix_clock_getres(uint32_t id,GuestTimespec *ts) {
     return 0;
 }
 static ABI uint64_t process_time(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); scale_monotonic(&t);
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000+(uint64_t)((t.tv_nsec-process_start.tv_nsec)/1000);
 }
 static ABI uint64_t process_time_counter(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); scale_monotonic(&t);
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
 }
 static ABI uint64_t process_time_frequency(void) { return 1000000000; }
@@ -164,6 +180,17 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
 }
 static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+    {
+        /* The guest's frame-pointer chain: where the game decided to stop (image offsets). */
+        extern uintptr_t lbppc_image_base;
+        const uintptr_t *stack=(const uintptr_t *)__builtin_frame_address(0);
+        fputs("  guest code addresses on the stack:",stderr);
+        for (int k=0,found=0; k<1024 && found<16; ++k) {
+            const uintptr_t v=stack[k];
+            if (lbppc_image_base && v-lbppc_image_base<0xe00000) { fprintf(stderr," g%llx",(unsigned long long)(v-lbppc_image_base)); ++found; }
+        }
+        fputc('\n',stderr);
+    }
     runtime_report();
     exit(23);
 }

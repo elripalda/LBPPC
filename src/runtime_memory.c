@@ -447,6 +447,10 @@ static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
+    /* Hints below the guest range move up by USER_MIN, a multiple of 4 GiB, so their low 32 bits
+       survive: LBP3's SPU emulation asks for its local stores at 0x4'0i00'0000 and stacks at
+       0x5'0i00'0000 and takes addresses' low 32 bits as SPU-relative. */
+    if (hint && hint<USER_MIN && hint+USER_MIN+size<=USER_MAX) hint+=USER_MIN;
     uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
     for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
         if (i==vma_count || vmas[i].start>=at+size) return at;
@@ -473,8 +477,11 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         if (!address || address%PAGE) return INVALID;
         if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return NO_MEMORY;
     } else {
+        uintptr_t hint=address;
         address=find_free(address,size,alignment);
         if (!address) return NO_MEMORY;
+        if (hint && hint!=address && getenv("LBPPC_HINT_LOG"))
+            fprintf(stderr,"Memory: hint %p for 0x%" PRIx64 " bytes (kind %d) placed at %p\n",(void *)hint,size,kind,(void *)address);
     }
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
     void *mapped=(void *)address;
@@ -763,6 +770,14 @@ static uintptr_t low_next=LOW_MIN;
 void *runtime_low_map(size_t size, int prot) {
     size=align_up(size,PAGE);
     write_lock();
+    /* LBPPC_LOW_BASE=address: where the search starts instead (the PS4 loads executables at 0x400000, and
+       LBP3's SPU code keeps pointers to the executable's globals in 32 bits). */
+    static int based;
+    if (!based) {
+        based=1;
+        const char *e=getenv("LBPPC_LOW_BASE");
+        if (e) low_next=(uintptr_t)strtoull(e,NULL,0);
+    }
 #ifdef _WIN32
     void *p=NULL;
     while (!p && low_next+size<=USER_MIN) {
@@ -946,3 +961,40 @@ void runtime_memory_report(void) {
            flexible_maps, flexible_bytes, protects, queries, vma_count);
 }
 
+
+/* Diagnostics: every mapping whose physical memory covers the page behind address
+   (more than one means another guest address writes the same memory). */
+void runtime_memory_report_aliases(uintptr_t address) {
+    read_lock();
+    size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
+        uint64_t phys=vmas[i].phys+(address-vmas[i].start);
+        fprintf(stderr,"Memory: %p is kind %d, physical 0x%" PRIx64 "; mappings of that memory:\n",(void *)address,vmas[i].kind,phys);
+        for (size_t j=0; j<vma_count; ++j)
+            if (vmas[j].kind!=KIND_RESERVED && phys>=vmas[j].phys && phys<vmas[j].phys+(vmas[j].end-vmas[j].start))
+                fprintf(stderr,"  %p..%p kind %d prot 0x%x physical 0x%" PRIx64 "\n",(void *)vmas[j].start,(void *)vmas[j].end,
+                        vmas[j].kind,vmas[j].prot,vmas[j].phys);
+    } else fprintf(stderr,"Memory: %p is not mapped memory\n",(void *)address);
+    read_unlock();
+}
+
+/* Diagnostics: compares guest memory at address with the physical memory the region table says is
+   behind it (through the backing view), and reports the host region covering it. */
+void runtime_memory_check_view(uintptr_t address) {
+    read_lock();
+    size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED && backing_base) {
+        uint64_t phys=vmas[i].phys+(address-vmas[i].start);
+        int same=!memcmp((const void *)address,backing_base+phys,64);
+        fprintf(stderr,"Memory: %p (vma %p..%p phys 0x%" PRIx64 "): guest view %s the backing view (%016llx vs %016llx)\n",
+                (void *)address,(void *)vmas[i].start,(void *)vmas[i].end,phys,same ? "matches" : "DIFFERS from",
+                *(unsigned long long *)address,*(unsigned long long *)(backing_base+phys));
+#ifdef _WIN32
+        size_t r=region_index(address);
+        if (r<region_count) fprintf(stderr,"Memory: host region %p..%p phys 0x%" PRIx64 " mapped %d (region table says phys here 0x%" PRIx64 ")\n",
+                                    (void *)regions[r].start,(void *)regions[r].end,regions[r].phys,regions[r].mapped,
+                                    regions[r].phys+(address-regions[r].start));
+#endif
+    }
+    read_unlock();
+}

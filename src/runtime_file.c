@@ -506,9 +506,13 @@ static void touch_for_write(void *buffer,uint64_t size) {
 }
 /* LBPPC_IO_WATCH=address (test): reads whose destination covers that address are logged. */
 static void io_watch(int fd,const void *buffer,uint64_t size,int64_t offset,const char *phase) {
-    static uint64_t at=UINT64_MAX;
-    if (at==UINT64_MAX) at=getenv("LBPPC_IO_WATCH") ? strtoull(getenv("LBPPC_IO_WATCH"),NULL,0) : 0;
-    if (!at || at<(uint64_t)(uintptr_t)buffer || at>=(uint64_t)(uintptr_t)buffer+size) return;
+    static uint64_t at=UINT64_MAX, at_end;
+    if (at==UINT64_MAX) {
+        const char *e=getenv("LBPPC_IO_WATCH"); char *end=NULL;
+        at=e ? strtoull(e,&end,0) : 0;
+        at_end=e && *end==':' ? strtoull(end+1,NULL,0) : at+1;
+    }
+    if (!at || at_end<=(uint64_t)(uintptr_t)buffer || at>=(uint64_t)(uintptr_t)buffer+size) return;
     File *f=get(fd);
     struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
     fprintf(stderr,"Runtime: [t=%lld.%06ld, thread %lu] %s read of %llu bytes at offset %lld into %p..%p covers the watched address (fd %d %s)\n",

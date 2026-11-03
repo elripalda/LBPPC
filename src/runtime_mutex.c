@@ -10,6 +10,29 @@
 typedef struct { int type; } GuestAttr;
 typedef struct { pthread_mutex_t native; } GuestMutex;
 static size_t created, locks, unlocks;
+/* Mutexes come from one pool, so a handle can be checked before use: the PS4 kernel rejects a handle
+ * that is not a mutex with EINVAL, where following it crashed inside winpthreads (LBP3 times out on a
+ * lock whose handle holds garbage now and then at startup). Never freed, like destroyed mutexes. */
+#define MUTEX_POOL (1u << 20)
+static GuestMutex mutex_pool[MUTEX_POOL];
+static uint32_t mutex_pool_used;
+static GuestMutex *mutex_alloc(void) {
+    uint32_t i = __atomic_fetch_add(&mutex_pool_used, 1, __ATOMIC_RELAXED);
+    return i < MUTEX_POOL ? &mutex_pool[i] : NULL;
+}
+static int mutex_valid(const GuestMutex *m) {
+    uintptr_t at = (uintptr_t)m, base = (uintptr_t)mutex_pool;
+    uint32_t used = __atomic_load_n(&mutex_pool_used, __ATOMIC_ACQUIRE);
+    if (used > MUTEX_POOL) used = MUTEX_POOL;
+    return at >= base && at < base + (uintptr_t)used * sizeof(GuestMutex) && (at - base) % sizeof(GuestMutex) == 0;
+}
+static int32_t invalid_handle(const char *what, GuestMutex **mutex, void *caller) {
+    static int logged;
+    if (logged++ < 20)
+        fprintf(stderr, "Runtime: mutex %s with an invalid handle %p (stored at %p, called from %p)\n", what,
+                (void *)*mutex, (void *)mutex, caller);
+    return (int32_t)UINT32_C(0x80020016);
+}
 static int32_t orbis_error(int e) {
     if (!e) return 0;
     unsigned code;
@@ -48,31 +71,35 @@ static ABI int32_t mutex_init(GuestMutex **out, GuestAttr **attr, const char *na
     if (!out || (attr && !*attr)) return orbis_error(EINVAL);
     int type = attr ? (*attr)->type : 1;
     if (type < 1 || type > 4) return orbis_error(EINVAL);
-    GuestMutex *mutex = malloc(sizeof(*mutex));
+    GuestMutex *mutex = mutex_alloc();
     if (!mutex) return orbis_error(ENOMEM);
     pthread_mutexattr_t native_attr;
     int e = pthread_mutexattr_init(&native_attr);
-    if (e) { free(mutex); return orbis_error(e); }
+    if (e) return orbis_error(e);
     int native_type = type == 2 ? PTHREAD_MUTEX_RECURSIVE : type == 3 ? PTHREAD_MUTEX_NORMAL : PTHREAD_MUTEX_ERRORCHECK;
     e = pthread_mutexattr_settype(&native_attr, native_type);
     if (!e) e = pthread_mutex_init(&mutex->native, &native_attr);
     pthread_mutexattr_destroy(&native_attr);
-    if (e) { free(mutex); return orbis_error(e); }
+    if (e) return orbis_error(e);
     *out = mutex; ++created; return 0;
 }
 static pthread_mutex_t static_init = PTHREAD_MUTEX_INITIALIZER;
 /* Statically initialized handles (0/1) are created once, even under contention. */
-static int32_t ensure_mutex(GuestMutex **mutex) {
+static int32_t ensure_mutex(GuestMutex **mutex, void *caller) {
     if (!mutex) return orbis_error(EINVAL);
     uintptr_t value = __atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
     if (value == 2) return orbis_error(EINVAL);
-    if (value >= 2) return 0;
+    if (value > 2) return mutex_valid((GuestMutex *)value) ? 0 : invalid_handle("use", mutex, caller);
     pthread_mutex_lock(&static_init);
     int32_t e = 0;
     if ((uintptr_t)*mutex < 2) {
         GuestMutex *created_mutex = NULL;
         e = mutex_init(&created_mutex, NULL, NULL);
         if (!e) __atomic_store_n(mutex, created_mutex, __ATOMIC_RELEASE);
+        /* LBPPC_MUTEX_LOG (diagnostics): lazily created mutexes, with the guest variable's address. */
+        static int log_lazy=-1;
+        if (log_lazy<0) log_lazy=getenv("LBPPC_MUTEX_LOG")!=NULL;
+        if (log_lazy) fprintf(stderr,"MUTEX lazily created for handle at %p\n",(void *)mutex);
     }
     pthread_mutex_unlock(&static_init);
     return e;
@@ -82,14 +109,14 @@ static void note_failure(const char *what, GuestMutex **mutex, int32_t e) {
     if (logged++ < 20) fprintf(stderr, "Runtime: mutex %s failed 0x%08x (handle at %p)\n", what, (unsigned)e, (void *)mutex);
 }
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
-    int32_t e = ensure_mutex(mutex);
+    int32_t e = ensure_mutex(mutex, __builtin_return_address(0));
     if (e) { note_failure("lock", mutex, e); return e; }
     e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
     if (!e) ++locks; else note_failure("lock", mutex, e);
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
-    int32_t e = ensure_mutex(mutex);
+    int32_t e = ensure_mutex(mutex, __builtin_return_address(0));
     if (e) return e;
     e = orbis_error(pthread_mutex_trylock(&(*mutex)->native));
     if (!e) ++locks;
@@ -97,7 +124,8 @@ static ABI int32_t mutex_trylock(GuestMutex **mutex) {
 }
 static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
-    if ((uintptr_t)*mutex < 2) return orbis_error(EPERM);
+    if ((uintptr_t)*mutex < 2) { note_failure("unlock of an uninitialized handle", mutex, orbis_error(EPERM)); return orbis_error(EPERM); }
+    if (!mutex_valid(*mutex)) return invalid_handle("unlock", mutex, __builtin_return_address(0));
     int32_t e = orbis_error(pthread_mutex_unlock(&(*mutex)->native));
     if (!e) ++unlocks; else note_failure("unlock", mutex, e);
     return e;
@@ -105,6 +133,7 @@ static ABI int32_t mutex_unlock(GuestMutex **mutex) {
 static ABI int32_t mutex_destroy(GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
     if ((uintptr_t)*mutex < 2) return 0;
+    if (!mutex_valid(*mutex)) return invalid_handle("destroy", mutex, __builtin_return_address(0));
     /* A locked mutex is busy, as on PS4. An unlocked one is only marked destroyed: its host mutex stays,
      * since another thread may already hold the old pointer and be about to lock it (freeing it made
      * LBP3's timed locks crash inside winpthreads now and then). Games destroy few mutexes. */
@@ -124,7 +153,7 @@ static int deadline_after(struct timespec *end, uint64_t usec) {
 }
 static int32_t timed_error(int e) { return e == ETIMEDOUT ? (int32_t)UINT32_C(0x8002003c) : orbis_error(e); }
 static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
-    int32_t e = ensure_mutex(mutex);
+    int32_t e = ensure_mutex(mutex, __builtin_return_address(0));
     if (e) return e;
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
@@ -169,6 +198,7 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
+    if (!mutex_valid(*mutex)) return invalid_handle("condition wait", mutex, __builtin_return_address(0));
     ++waits;
     return orbis_error(pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
 }
@@ -176,6 +206,7 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
+    if (!mutex_valid(*mutex)) return invalid_handle("condition wait", mutex, __builtin_return_address(0));
     ++waits;
     return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
 }

@@ -165,7 +165,62 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);
 }
+/* LBPPC_ARENA_CHECK=1 (diagnostics, LBP3 1.28): copies into LBP3's scratch arena (base at guest
+   0x80118ffc0, bump offset at 0x80118ffc8) above its current allocation point: memory handed out before
+   the arena was last reset, i.e. a job that outlived its frame. */
+static void arena_check(const void *dst, size_t size, void *caller) {
+    static int on=-1;
+    if (on<0) on=getenv("LBPPC_ARENA_CHECK")!=NULL;
+    if (!on || !size) return;
+    static atomic_int dumped;
+    if (*(volatile uint64_t *)(uintptr_t)0x801190070ull && !atomic_exchange(&dumped,1)) {
+        const uint64_t *d=(const uint64_t *)(uintptr_t)0x801190010ull;
+        for (int i=0; i<0x200/8; i+=4)
+            fprintf(stderr,"LAYOUT +%03x: %016llx %016llx %016llx %016llx\n",i*8,(unsigned long long)d[i],(unsigned long long)d[i+1],
+                    (unsigned long long)d[i+2],(unsigned long long)d[i+3]);
+    }
+    uint64_t base=*(volatile uint64_t *)(uintptr_t)0x80118ffc0ull;
+    uint32_t used=*(volatile uint32_t *)(uintptr_t)0x80118ffc8ull, limit=*(volatile uint32_t *)(uintptr_t)0x80118ffd0ull;
+    uint64_t at=(uint64_t)(uintptr_t)dst;
+    if (!base || at<base || at>=base+limit || at+size<=base+used) return;
+    static atomic_long reported;
+    if (atomic_fetch_add(&reported,1)>=200) return;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    fprintf(stderr,"ARENA [t=%lld.%06ld] copy of %zu bytes to arena+0x%llx, allocated only up to +0x%x (caller %p, thread %p)\n",
+            (long long)now.tv_sec,now.tv_nsec/1000,size,(unsigned long long)(at-base),used,caller,(void *)pthread_self());
+}
+/* LBPPC_NAN_MEMCPY=1 (diagnostics): copies whose source holds the default NaN (0x7fc00000) at a 4-byte
+   boundary, with the guest code that made them (image offsets; lbppc_image_base is set by the loader). */
+uintptr_t lbppc_image_base;
+volatile int lbppc_nan_armed;
+static void nan_check(const void *dst, const void *src, size_t size, void *caller) {
+    static int on=-1;
+    if (on<0) on=getenv("LBPPC_NAN_MEMCPY")!=NULL;
+    if (!on || size<4 || size>(1u<<20) || ((uintptr_t)src&3)) return;
+    const uint32_t *w=(const uint32_t *)src;
+    size_t i=0;
+    for (; i<size/4 && w[i]!=0x7fc00000u; ++i) {}
+    if (i==size/4) return;
+    /* Copies seen before lbppc_nan_armed (set at LBPPC_UNCAP_TRIGGER) are learnt: only new ones print after. */
+    static uint64_t seen[4096]; static atomic_int nseen;
+    const uint64_t key=((uint64_t)(uintptr_t)caller*0x9e3779b97f4a7c15ull)^((uint64_t)(uintptr_t)src<<7)^(i*4);
+    int known=0;
+    for (int k=0,n=atomic_load(&nseen); k<n && k<4096; ++k) if (seen[k]==key) { known=1; break; }
+    if (!lbppc_nan_armed) { if (!known) { int k=atomic_fetch_add(&nseen,1); if (k<4096) seen[k]=key; } return; }
+    if (known) return;
+    static atomic_long reported;
+    if (atomic_fetch_add(&reported,1)>=60) return;
+    const uintptr_t base=lbppc_image_base;
+    uintptr_t g[6]={0}; int ng=0;
+    const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
+    for (int k=0; k<256 && ng<6; ++k) if (base && sp[k]-base<0x2000000) g[ng++]=sp[k]-base;
+    fprintf(stderr,"NANCOPY %zu bytes %p -> %p, NaN at +0x%zx, caller g%llx, stack g%llx g%llx g%llx g%llx g%llx\n",size,src,dst,i*4,
+            (unsigned long long)((uintptr_t)caller-base),(unsigned long long)g[1],(unsigned long long)g[2],(unsigned long long)g[3],
+            (unsigned long long)g[4],(unsigned long long)g[5]);
+}
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
+    arena_check(dst,size,__builtin_return_address(0));
+    nan_check(dst,src,size,__builtin_return_address(0));
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {

@@ -215,13 +215,52 @@ static ABI int32_t flag_create(EventFlag **out,const char *name,uint32_t attr,ui
     *out=f;
     return ORBIS_OK;
 }
+/* LBPPC_FLAG_LOG (diagnostics): every set and wait, one line each, with the pattern before and after. */
+static int flag_log(void) { static int on=-1; if (on<0) on=getenv("LBPPC_FLAG_LOG")!=NULL; return on; }
+static void flag_note(const char *what,EventFlag *f,uint64_t bits,uint32_t mode,uint64_t before,uint64_t after,int32_t status) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    char line[256];
+    int n=snprintf(line,sizeof(line),"FLAG [t=%lld.%06ld] %s '%s' %p bits %llx mode %x pattern %llx -> %llx status %x (thread %lu)%s",
+                   (long long)now.tv_sec,now.tv_nsec/1000,what,f->name,(void *)f,(unsigned long long)bits,mode,
+                   (unsigned long long)before,(unsigned long long)after,(unsigned)status,(unsigned long)GetCurrentThreadId(),"\n");
+    fwrite(line,1,(size_t)n,stderr);
+}
 static ABI int32_t flag_set(EventFlag *f,uint64_t bits) {
     if (!f) { fprintf(stderr,"Runtime: event flag set on a null flag\n"); return KERNEL_EINVAL; }
     pthread_mutex_lock(&f->lock);
+    uint64_t before=f->pattern;
     f->pattern|=bits;
+    if (flag_log()) flag_note("set",f,bits,0,before,f->pattern,0);
     pthread_cond_broadcast(&f->changed);
     pthread_mutex_unlock(&f->lock);
     return ORBIS_OK;
+}
+/* lbppc: LBP3's SPU threads block in sceKernelWaitEventFlag on 'SpuEventFlag', each on its own bit. While one is
+ * out of its wait it runs jobs; a set bit is work queued. lbppc_spu_barrier (LBPPC_SPU_BARRIER, at each flip)
+ * waits until none runs and none has work: a frame's SPU jobs cannot spill into the next. */
+static volatile int spu_waiters;
+static EventFlag *spu_flag;
+static uint64_t spu_bits;
+void lbppc_spu_barrier(void) {
+    static int on=-1;
+    if (on<0) on=getenv("LBPPC_SPU_BARRIER")!=NULL;
+    static long calls, waited;
+    if (!on) return;
+    if (!spu_flag) { if (!calls++) fputs("SPU barrier: no SpuEventFlag wait seen yet\n",stderr); return; }
+    for (int spins=0;;++spins) {
+        pthread_mutex_lock(&spu_flag->lock);
+        const int idle=spu_waiters>=5 && !(spu_flag->pattern&spu_bits);
+        const int waiters=spu_waiters; const uint64_t pending=spu_flag->pattern&spu_bits;
+        pthread_mutex_unlock(&spu_flag->lock);
+        if (spins==1) ++waited;
+        if (idle || spins>200000) {
+            if (++calls%300==0)
+                fprintf(stderr,"SPU barrier: %ld flips, %ld waited; now %d waiters, pending %llx, bits %llx%s\n",calls,waited,
+                        waiters,(unsigned long long)pending,(unsigned long long)spu_bits,idle ? "" : " (gave up)");
+            return;
+        }
+        SwitchToThread();
+    }
 }
 static int flag_met(uint64_t pattern,uint64_t want,uint32_t mode) {
     return mode&WAIT_AND ? (pattern&want)==want : (pattern&want)!=0;
@@ -240,15 +279,21 @@ static ABI int32_t flag_wait(EventFlag *f,uint64_t want,uint32_t mode,uint64_t *
     }
     int32_t status=ORBIS_OK;
     pthread_mutex_lock(&f->lock);
+    uint64_t entry=f->pattern;
+    if (flag_log()) flag_note("wait-begin",f,want,mode,entry,entry,0);
+    const int spu=!timeout_us && !strcmp(f->name,"SpuEventFlag");
+    if (spu) { spu_flag=f; spu_bits|=want; ++spu_waiters; }
     while (!flag_met(f->pattern,want,mode)) {
         int e=timeout_us ? pthread_cond_timedwait(&f->changed,&f->lock,&deadline) : pthread_cond_wait(&f->changed,&f->lock);
         if (e==ETIMEDOUT) { status=KERNEL_ETIMEDOUT; break; }
     }
+    if (spu) --spu_waiters;
     if (result) *result=f->pattern;
     if (status==ORBIS_OK) {
         if (mode&CLEAR_ALL) f->pattern=0;
         else if (mode&CLEAR_PAT) f->pattern&=~want;
     } else if (timeout_us) *timeout_us=0;
+    if (flag_log()) flag_note("wait-end",f,want,mode,result ? *result : 0,f->pattern,status);
     pthread_mutex_unlock(&f->lock);
     return status;
 }
@@ -333,7 +378,12 @@ static ABI int32_t trophy_unlock_state(int32_t ctx,int32_t handle,uint32_t *flag
 static ABI int32_t zero_result(void *result) { if (result) memset(result,0,32); return ORBIS_OK; }
 static ABI int32_t np_new_id(void) { static int32_t next=1; return next++; }
 #define NP_SIGNED_OUT ((int32_t)0x80550006)
-static ABI int32_t np_offline(void) { return NP_SIGNED_OUT; }
+/* lbppc: signed in (LBPPC_NP_USER, or shadNet: BB_SHADNET_NPID), in-game messages (between players in a session) are accepted and go
+   nowhere: there is no PSN to carry them; LBP3 gives up on its messaging otherwise and waits at "Connecting". */
+static ABI int32_t np_message_local(void) {
+    const char *user=getenv("LBPPC_NP_USER"), *shadnet=getenv("BB_SHADNET_NPID");
+    return (user && *user) || (shadnet && *shadnet) ? ORBIS_OK : NP_SIGNED_OUT;
+}
 static ABI int32_t coredump_write(const void *data,uint64_t size) { (void)data; return (int32_t)size; }
 /* Content search (other installed content): nothing besides this game. */
 static ABI int32_t search_index(int64_t *index) { if (index) *index=0; return ORBIS_OK; }
@@ -387,7 +437,9 @@ static ABI int32_t socket_open(int32_t family,int32_t type,int32_t protocol) {
 #endif
     if (family!=2) return socket_fail(EAFNOSUPPORT);
     int stream=type==1 || type==10; /* SOCK_STREAM, PS4 SOCK_STREAM_P2P */
-    if (!stream && type!=2 && type!=6) return socket_fail(EPROTONOSUPPORT); /* SOCK_DGRAM, SOCK_DGRAM_P2P */
+    /* SOCK_RAW (3, LBP3's ICMP pings for latency): raw sockets need administrator rights on Windows; an ordinary
+       datagram socket stands in, its pings unanswered (the latency stays unknown) instead of the socket failing. */
+    if (!stream && type!=2 && type!=6 && type!=3) return socket_fail(EPROTONOSUPPORT); /* SOCK_DGRAM(_P2P) */
     HostSocket s=socket(AF_INET,stream ? SOCK_STREAM : SOCK_DGRAM,0);
     if (socket_error(s)) return socket_fail(EMFILE);
 #ifdef _WIN32
@@ -434,6 +486,11 @@ static ABI int64_t socket_receive_from(int32_t fd,void *data,uint64_t size,int32
     struct sockaddr_in host={0};
     socklen_t host_size=sizeof(host);
     int64_t n=recvfrom(sockets[i].host,data,(int)size,0,(struct sockaddr *)&host,&host_size);
+    if (getenv("LBPPC_SOCK_LOG") && n>=0) {
+        uint64_t first=0; memcpy(&first,data,n<8 ? (size_t)n : 8);
+        fprintf(stderr,"Runtime: socket %d received %lld of %llu bytes into %p, first bytes %016llx (thread %lu)\n",
+                fd,(long long)n,(unsigned long long)size,data,(unsigned long long)first,(unsigned long)GetCurrentThreadId());
+    }
     if (n<0) return socket_host_fail();
     if (from && from_size && *from_size>=sizeof(GuestAddr)) {
         memset(from,0,sizeof(*from));
@@ -752,7 +809,7 @@ static const RuntimeExport exports[]={
     {"sceNpCommerceHidePsStoreIcon",ok_void},
     {"sceNpInGameMessageInitialize",np_new_id}, {"sceNpInGameMessageTerminate",ok_void},
     {"sceNpInGameMessageCreateHandle",np_new_id}, {"sceNpInGameMessageDeleteHandle",ok_void},
-    {"sceNpInGameMessagePrepare",np_offline}, {"sceNpInGameMessageSendData",np_offline},
+    {"sceNpInGameMessagePrepare",np_message_local}, {"sceNpInGameMessageSendData",np_message_local},
     {"sceCoredumpWriteUserData",coredump_write},
     {"sceGameCustomDataDialogInitialize",ok_void}, {"sceGameCustomDataDialogTerminate",ok_void},
     {"sceGameCustomDataDialogOpen",custom_dialog_open}, {"sceGameCustomDataDialogClose",ok_void},

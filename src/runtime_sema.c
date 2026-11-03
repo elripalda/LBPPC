@@ -21,15 +21,16 @@ typedef struct Sema {
     unsigned active;
     int deleted;
     Waiter *first;
-    struct Sema *next;
 } Sema;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
-static Sema *registry;
+/* Indexed by id (ids are never reused). LBP3 creates about 60 semaphores a second: a list
+ * searched on every wait and signal slowed the game to 15 FPS within minutes. */
+static Sema **registry;
+static size_t registry_size;
 static uint32_t next_id=1;
 static size_t created, deleted, acquired, signaled, timed_out;
 static Sema *find(uint32_t id) {
-    for (Sema *s=registry;s;s=s->next) if (s->id==id) return s;
-    return NULL;
+    return id<registry_size ? registry[id] : NULL;
 }
 static void host_check(int e) {
     if (e) { fprintf(stderr,"STOP: semaphore host error %d\n",e); exit(21); }
@@ -54,9 +55,20 @@ static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
     if (!s) return ERR(12);
     pthread_mutex_lock(&lock);
     if (next_id==UINT32_MAX) { pthread_mutex_unlock(&lock); free(s); return ERR(28); }
+    if (next_id>=registry_size) {
+        size_t size=registry_size ? registry_size*2 : 1024;
+        Sema **grown=realloc(registry,size*sizeof(*grown));
+        if (!grown) { pthread_mutex_unlock(&lock); free(s); return ERR(12); }
+        memset(grown+registry_size,0,(size-registry_size)*sizeof(*grown));
+        registry=grown; registry_size=size;
+    }
     s->id=next_id++; s->attr=attr; s->count=s->initial=initial; s->maximum=maximum;
-    s->next=registry; registry=s; *out=s->id; ++created;
-    printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
+    registry[s->id]=s; *out=s->id; ++created;
+    /* LBPPC_SEMA_LOG=1: every creation; otherwise the counts every 4096. */
+    static int log_all=-1;
+    if (log_all<0) log_all=getenv("LBPPC_SEMA_LOG")!=NULL;
+    if (log_all) printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
+    else if (!(created&4095)) printf("Runtime: %zu semaphores created, %zu live\n",created,created-deleted);
     pthread_mutex_unlock(&lock);
     return 0;
 }
@@ -150,10 +162,9 @@ static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
 }
 static ABI int32_t sem_delete(uint32_t id) {
     pthread_mutex_lock(&lock);
-    Sema **p=&registry;
-    while (*p && (*p)->id!=id) p=&(*p)->next;
-    if (!*p) { pthread_mutex_unlock(&lock); return ERR(3); }
-    Sema *s=*p; *p=s->next; s->deleted=1; ++deleted;
+    Sema *s=find(id);
+    if (!s) { pthread_mutex_unlock(&lock); return ERR(3); }
+    registry[id]=NULL; s->deleted=1; ++deleted;
     wake_all(s,ERR(13));
     if (!s->active) free(s);
     pthread_mutex_unlock(&lock);

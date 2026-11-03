@@ -54,6 +54,7 @@ typedef struct GuestThread {
     jmp_buf exit_jump;
 #endif
     struct GuestThread *next;
+    unsigned long host_tid; /* lbppc: for lbppc_running_report */
 } GuestThread;
 
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
@@ -278,12 +279,44 @@ static void set_host_affinity(uint64_t mask) {
     (void)mask;
 #endif
 }
+/* BB_WATCH_ADDR (diagnostics): every guest thread puts the write watchpoints on itself at start, so a thread
+   too short-lived for probe.c's periodic pass is watched too. */
+static void watch_self(void) {
+#ifdef _WIN32
+    const char *spec=getenv("BB_WATCH_ADDR");
+    if (!spec) return;
+    uint64_t at=strtoull(spec,NULL,0);
+    CONTEXT c={.ContextFlags=CONTEXT_DEBUG_REGISTERS};
+    c.Dr0=at; c.Dr1=at+8; c.Dr2=at+16; c.Dr3=at+24;
+    c.Dr7=0x55 | (0x9u<<16) | (0x9u<<20) | (0x9u<<24) | (0x9u<<28);
+    SetThreadContext(GetCurrentThread(),&c);
+#endif
+}
+/* LBPPC_BOOST=prefix[,prefix...] (test): guest threads whose name starts with one run at time-critical host priority. */
+static void boost_named(const char *name) {
+#ifdef _WIN32
+    const char *spec=getenv("LBPPC_BOOST");
+    if (!spec || !name) return;
+    for (const char *s=spec; *s;) {
+        const char *end=strchr(s,','); size_t n=end ? (size_t)(end-s) : strlen(s);
+        if (n && !strncmp(name,s,n)) { SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_TIME_CRITICAL); return; }
+        s+=n+(end!=NULL);
+    }
+#else
+    (void)name;
+#endif
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
+#ifdef _WIN32
+    t->host_tid=GetCurrentThreadId();
+#endif
     attach(t);
     set_host_name(t->name);
     set_host_priority(t->attr.prio);
     set_host_affinity(t->attr.affinity);
+    boost_named(t->name);
+    watch_self();
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
@@ -320,7 +353,11 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }
     if (t->detached) pthread_detach(t->host);
     pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
-    printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
+    {
+        extern uintptr_t lbppc_image_base;
+        printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d, entry g%llx)\n",t->name,(unsigned long long)stack,
+               t->attr.prio,(unsigned long long)((uintptr_t)entry-lbppc_image_base));
+    }
     return 0;
 }
 static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry entry,void *argument,const char *name) {
@@ -464,3 +501,41 @@ void runtime_thread_report(void) {
     pthread_mutex_unlock(&lock);
 }
 
+
+#ifdef _WIN32
+/* lbppc diagnostics: LBPPC_RUNNING_LOG=1: at each call (each flip), every guest thread but the caller is sampled;
+ * those executing game code (not blocked in the runtime or the OS) are counted by name, printed every 300 calls. */
+void lbppc_running_report(void) {
+    static int on=-1;
+    if (on<0) on=getenv("LBPPC_RUNNING_LOG")!=NULL;
+    if (!on) return;
+    extern uintptr_t lbppc_image_base;
+    static char names[64][32]; static unsigned counts[64]; static int nnames; static unsigned calls;
+    const unsigned long self=GetCurrentThreadId();
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t;t=t->next) {
+        if (!t->host_tid || t->host_tid==self || t->finished) continue;
+        HANDLE h=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,t->host_tid);
+        if (!h) continue;
+        if (SuspendThread(h)!=(DWORD)-1) {
+            CONTEXT c={.ContextFlags=CONTEXT_CONTROL};
+            if (GetThreadContext(h,&c) && c.Rip-lbppc_image_base<0x2000000) {
+                int i=0;
+                while (i<nnames && strcmp(names[i],t->name)) ++i;
+                if (i==nnames && nnames<64) { snprintf(names[i],32,"%s",t->name); counts[i]=0; ++nnames; }
+                if (i<64) ++counts[i];
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+    pthread_mutex_unlock(&lock);
+    if (++calls%300==0) {
+        fprintf(stderr,"RUNNING at flips (%u):",calls);
+        for (int i=0;i<nnames;++i) { if (counts[i]) fprintf(stderr," %s=%u",names[i],counts[i]); counts[i]=0; }
+        fputc('\n',stderr);
+    }
+}
+#else
+void lbppc_running_report(void) {}
+#endif
