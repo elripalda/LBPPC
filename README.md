@@ -2,7 +2,18 @@
 
 LittleBigPlanet 3 running natively on PC, with community servers so creating and sharing levels can live on.
 
-**Status:** early research. Nothing runs yet.
+**Status:** 0.0.1 beta. LittleBigPlanet 3 (US, CUSA00473 version 1.28) boots, plays and goes online on community servers:
+
+- 1080p to 4K and ultrawide (the menus lay themselves out for it; movies and loading screens stay 16:9).
+- 60 FPS with frame generation (DLSS or FSR 3.1); the game itself steps 30 times a second, as on PS4.
+- NVIDIA Reflex / AMD Anti-Lag 2.
+- Online on [Refresh](https://github.com/LittleBigRefresh/Refresh) (levels, profiles) with [shadNet](https://github.com/shadps4-emu/shadNet) for sign-in and multiplayer, with a join protection against the exploit that closed LittleBigPlanet's community servers: see [docs/online.md](docs/online.md).
+
+Multiplayer between players is new in this release and only lightly tested.
+
+## Playing
+
+Unzip a release, start `LBPPC.exe`, choose the folder of your game dump and press Play. For online play, see [docs/online.md](docs/online.md).
 
 ## How it will work
 
