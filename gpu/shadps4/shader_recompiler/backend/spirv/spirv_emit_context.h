@@ -290,6 +290,15 @@ public:
     Id local_invocation_id{};
     Id local_invocation_index{};
     Id invocation_id{};
+    // lbppc: a geometry shader over maxGeometryTotalOutputComponents runs as gs_invocations
+    // invocations, each emitting a window of gs_window vertices (gs_stride apart) of the output.
+    u32 gs_output_vertices{};
+    u32 gs_invocations{};
+    u32 gs_window{};
+    u32 gs_stride{};
+    bool gs_triangle_strips{};
+    Id gs_vertex_index{};
+    Id gs_strip_index{};
     Id subgroup_local_invocation_id{};
     Id subgroup_lt_mask{};
     Id image_u32{};

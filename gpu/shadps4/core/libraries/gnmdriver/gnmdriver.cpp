@@ -2247,10 +2247,16 @@ static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_
     return ORBIS_OK;
 }
 
+extern "C" void lbppc_spu_barrier(void);
+extern "C" void lbppc_running_report(void);
+
 s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs[],
                                                    u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
                                                    u32* ccb_sizes_in_bytes, u32 vo_handle,
                                                    u32 buf_idx, u32 flip_mode, s64 flip_arg) {
+    // lbppc: LBPPC_SPU_BARRIER: the frame's SPU jobs are done before it is shown.
+    lbppc_spu_barrier();
+    lbppc_running_report();
     return sceGnmSubmitAndFlipCommandBuffersForWorkload(
         count, count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_gpu_addrs, ccb_sizes_in_bytes,
         vo_handle, buf_idx, flip_mode, flip_arg);
@@ -2313,6 +2319,11 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     // bbport: Reflex / Anti-Lag 2 wait here, between the game's frames (vk_low_latency.h).
     if (result == ORBIS_OK) {
         Vulkan::LowLatency::FrameSubmitted();
+    }
+    // lbppc diagnostics: LBPPC_GPU_SYNC_FLIP=1: the game continues only once the GPU processed the frame.
+    static const bool gpu_sync = std::getenv("LBPPC_GPU_SYNC_FLIP") != nullptr;
+    if (gpu_sync) {
+        liverpool->WaitGpuIdle();
     }
     return result;
 }

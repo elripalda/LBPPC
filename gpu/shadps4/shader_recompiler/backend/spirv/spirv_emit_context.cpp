@@ -541,6 +541,38 @@ void EmitContext::DefineInputs() {
             input_params[param_id] =
                 GetAttributeInfo(AmdGpu::NumberFormat::Float, id, 4, false, false, true);
         }
+
+        // lbppc: maxGeometryTotalOutputComponents is 1024 on NVIDIA (the least Vulkan guarantees);
+        // AMD's GS writes its ring in memory, so a PS4 shader may declare 64 vertices of 9
+        // attributes (LBP3). Declared as such, the GPU was lost; capped, the vertices past the cap
+        // were undefined (long stray triangles across LBP3's levels). Such a shader runs as several
+        // invocations instead, each emitting one window of the output: windows overlap by the
+        // vertices a strip carries over, and one starting on an odd triangle of a strip also emits
+        // the vertex before it, so the winding stays (that triangle is drawn twice).
+        const u32 per_vertex = info.gs_copy_data.num_attrs * 4 + 4 + 1 +
+                               (info.stores.GetAny(IR::Attribute::ClipDistance) ? 8 : 0) +
+                               (info.stores.GetAny(IR::Attribute::CullDistance) ? 8 : 0);
+        const u32 declared = runtime_info.hw.gs.output_vertices;
+        const u32 cap = std::max(1u, std::min(declared, 1024u / per_vertex));
+        gs_output_vertices = cap;
+        gs_invocations = runtime_info.hw.gs.num_invocations;
+        const auto out_primitive = runtime_info.hw.gs.out_primitive[0];
+        if (cap < declared && gs_invocations == 1 && cap >= 4) {
+            gs_triangle_strips = out_primitive == AmdGpu::GsOutputPrimitiveType::TriangleStrip;
+            const u32 overlap = gs_triangle_strips ? 2
+                                : out_primitive == AmdGpu::GsOutputPrimitiveType::LineStrip ? 1
+                                                                                            : 0;
+            gs_window = gs_triangle_strips ? cap - 1 : cap;
+            gs_stride = gs_window - overlap;
+            gs_invocations =
+                std::min(32u, std::max(1u, (declared - overlap + gs_stride - 1) / gs_stride));
+            invocation_id = DefineVariable(U32[1], spv::BuiltIn::InvocationId, spv::StorageClass::Input);
+            interfaces.push_back(invocation_id);
+            gs_vertex_index = DefineVar(U32[1], spv::StorageClass::Private, ConstU32(0u));
+            gs_strip_index = DefineVar(U32[1], spv::StorageClass::Private, ConstU32(0u));
+            interfaces.push_back(gs_vertex_index);
+            interfaces.push_back(gs_strip_index);
+        }
         break;
     }
     case SwStage::TessellationControl: {

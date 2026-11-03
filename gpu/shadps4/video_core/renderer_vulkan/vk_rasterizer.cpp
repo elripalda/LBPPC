@@ -5,6 +5,7 @@
 #include <cmath>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -981,9 +982,36 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scheduler.PopPendingOperations();
     }
     const auto& regs = Regs();
+    // lbppc: LBP3 draws into the display buffer several times a frame: the copy of the finished
+    // frame, then the UI on top. The copy (the first after scene draws) ends the frame: its
+    // camera and the frame generation inputs are taken; the next one is the first UI draw,
+    // before which the display buffer holds the picture without UI.
+    bool frame_start = true;
+    lbp_draw_matrix = false;
+    if (LbpCamera::Enabled() && regs.color_buffers[0] &&
+        FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+        if (lbp_camera.HasScene()) {
+            LbpCamera::Result camera;
+            if (lbp_camera.EndFrame(camera)) {
+                const auto& depth = texture_cache.GetImage(camera.depth);
+                camera_motion->SetCamera(camera.view, camera.inv_view, camera.proj,
+                                         {depth.info.size.width, depth.info.size.height},
+                                         camera.continuous);
+                camera_motion->OnGBufferPass(camera.depth);
+                upscaler->CaptureFrameGenNow();
+            }
+            lbp_hudless_pending = true;
+        } else {
+            frame_start = false;
+            if (lbp_hudless_pending) {
+                lbp_hudless_pending = false;
+                upscaler->CaptureHudlessNow(cb_descs[0].first);
+            }
+        }
+    }
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
-    if (camera_motion->Enabled() && regs.color_buffers[0] &&
+    if (frame_start && camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
         camera_motion->OnDisplayPass(cb_descs[0].first);
@@ -2100,6 +2128,90 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+// lbppc diagnostics (LBPPC_CAMERA_SCAN): a 4x4 perspective projection, in rows (row 3 is
+// 0 0 +-1 0) or transposed, at any 16-byte offset of a constant buffer.
+static void ScanForProjection(u64 pgm_hash, u32 slot, VAddr address, u32 size) {
+    static std::mutex mutex;
+    static std::set<std::tuple<u64, u32, u32, u32>> seen;
+    static u32 printed = 0;
+    const auto* f = reinterpret_cast<const float*>(address);
+    const auto is_projection = [](const float* m) {
+        const auto zero = [&](int i) { return std::fabs(m[i]) < 1e-4f; };
+        for (int i : {1, 3, 4, 7, 8, 9, 12, 13, 15}) {
+            if (!zero(i)) {
+                return false;
+            }
+        }
+        return std::fabs(std::fabs(m[14]) - 1.0f) < 1e-3f && std::fabs(m[0]) > 0.1f &&
+               std::fabs(m[0]) < 20.0f && std::fabs(m[5]) > 0.1f && std::fabs(m[5]) < 20.0f &&
+               std::fabs(m[2]) < 0.2f && std::fabs(m[6]) < 0.2f && !zero(10);
+    };
+    for (u32 offset = 0; offset + 64 <= size; offset += 16) {
+        const float* m = f + offset / 4;
+        float t[16];
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                t[r * 4 + c] = m[c * 4 + r];
+            }
+        }
+        // A view-projection: row 3 is the camera's forward direction (unit) and a distance.
+        const auto is_view_projection = [](const float* m) {
+            const float forward = std::sqrt(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
+            const float x = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+            const float y = std::sqrt(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+            return std::fabs(forward - 1.0f) < 1e-3f && x > 0.1f && x < 20.0f && y > 0.1f &&
+                   y < 20.0f && std::isfinite(m[15]);
+        };
+        bool rows = is_projection(m), columns = !rows && is_projection(t);
+        const char* kind = "projection";
+        if (!rows && !columns) {
+            rows = is_view_projection(m);
+            columns = !rows && is_view_projection(t);
+            kind = "view-projection";
+        }
+        if (!rows && !columns) {
+            continue;
+        }
+        std::scoped_lock lk{mutex};
+        if (!seen.emplace(pgm_hash, slot, size, offset).second || printed >= 300) {
+            continue;
+        }
+        ++printed;
+        const float* p = rows ? m : t;
+        std::printf("lbppc: %s in vs %016llx slot %u size %u offset %u (%s): %g %g %g %g | "
+                    "%g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+                    kind, (unsigned long long)pgm_hash, slot, size, offset, rows ? "rows" : "columns",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
+                    p[12], p[13], p[14], p[15]);
+    }
+}
+
+void Rasterizer::LbpRecordMatrix(const Shader::Info& stage, const float* wvp) {
+    // The first vertex shader buffer of a draw into a color and a full-size depth target that
+    // starts with a world-view-projection (shadow maps, without color, have the light's).
+    if (lbp_draw_matrix || !cb_descs[0].first || !db_desc.first) {
+        return;
+    }
+    LbpCamera::Affine vw;
+    LbpCamera::Proj proj;
+    if (!LbpCamera::Decompose(wvp, vw, proj)) {
+        return;
+    }
+    const auto& depth = texture_cache.GetImage(db_desc.first);
+    if (depth.info.size.width < 1280) {
+        return;
+    }
+    lbp_draw_matrix = true;
+    const auto& regs = Regs();
+    const u64 index_address =
+        draw_inputs.is_indexed ? regs.index_base_address.Address<VAddr>() +
+                                     u64(draw_inputs.index_offset) * 4
+                               : 0;
+    const u64 key = stage.pgm_hash ^ (index_address * 0x9e3779b97f4a7c15ull) ^
+                    (u64(regs.num_indices) << 40);
+    lbp_camera.OnSceneDraw(key, wvp, db_desc.first);
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
@@ -2113,6 +2225,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 if (ring->size == 864 && gbuffer_draw &&
                     memory->IsValidGpuMapping(ring->address, 0)) {
                     camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
+                }
+                if (LbpCamera::Enabled() && stage.sw_stage == Shader::SwStage::Vertex &&
+                    ring->size >= 64 && memory->IsValidGpuMapping(ring->address, 0)) {
+                    LbpRecordMatrix(stage, reinterpret_cast<const float*>(ring->address));
+                }
+                static const bool camera_scan = std::getenv("LBPPC_CAMERA_SCAN") != nullptr;
+                if (camera_scan && stage.sw_stage == Shader::SwStage::Vertex && ring->size >= 64 &&
+                    ring->size <= 65536 && memory->IsValidGpuMapping(ring->address, 0)) {
+                    ScanForProjection(stage.pgm_hash, binding.buffer, ring->address, ring->size);
                 }
                 push_data.AddOffset(binding.buffer, 0);
             }
@@ -2175,6 +2296,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
             }
+            // lbppc diagnostics: LBPPC_CAMERA_SCAN=1 logs vertex shader constant buffers holding a
+            // perspective projection (either layout), once per shader, slot, size and offset.
+            if (LbpCamera::Enabled() && stage.sw_stage == Shader::SwStage::Vertex &&
+                vsharp.base_address && vsharp.GetSize() >= 64 &&
+                memory->IsValidGpuMapping(vsharp.base_address, 0)) {
+                LbpRecordMatrix(stage, reinterpret_cast<const float*>(vsharp.base_address));
+            }
+            static const bool camera_scan = std::getenv("LBPPC_CAMERA_SCAN") != nullptr;
+            if (camera_scan && stage.sw_stage == Shader::SwStage::Vertex && vsharp.base_address &&
+                vsharp.GetSize() >= 64 && vsharp.GetSize() <= 65536 &&
+                memory->IsValidGpuMapping(vsharp.base_address, 0)) {
+                ScanForProjection(stage.pgm_hash, binding.buffer, vsharp.base_address,
+                                  u32(vsharp.GetSize()));
+            }
             // Object motion research: the vertex shader buffers of G-buffer draws.
             if (FrameCapture::Active() && gbuffer_draw && stage.sw_stage == Shader::SwStage::Vertex &&
                 vsharp.base_address != 0 && memory->IsValidGpuMapping(vsharp.base_address, 0)) {
@@ -2212,7 +2347,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
-                if (desc.is_written) {
+                static const bool keep_images = std::getenv("LBPPC_NO_BUFFER_IMAGE_INVALIDATE") != nullptr;
+                if (desc.is_written && !keep_images) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
@@ -2967,6 +3103,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
             attachment.has_depth = true;
             attachment.depth_clear = is_depth_clear;
+            scene_drawn = true;
         }
         if (regs.depth_buffer.StencilValid()) {
             attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;

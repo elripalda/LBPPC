@@ -24,7 +24,7 @@ namespace Serialization {
 // GPU rollback to 1.8.2's code took them back to 7, 7, 5, and a cache another build wrote into
 // the same folder then passed as this build's.
 // Projection jitter needs recompiled vertex shaders, including for existing caches.
-static constexpr u32 ShaderBinaryVersion = 13u;
+static constexpr u32 ShaderBinaryVersion = 14u; // lbppc: 14, geometry shaders split over invocations
 static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 7u;
 
@@ -140,7 +140,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
 
-    fetch_shader_data = spec.fetch_shader_data;
+    // lbppc: the stages of a pipeline are loaded in turn into one fetch shader slot, and the
+    // geometry stage comes after the vertex stage: it replaced the vertex shader's fetch shader
+    // with none. Preloaded geometry shader pipelines then bound no vertex buffers, and drew
+    // their vertices from garbage (LBP3: dark lines across every level, only with a warm cache).
+    if (spec.fetch_shader_data) {
+        fetch_shader_data = spec.fetch_shader_data;
+    }
     return true;
 }
 

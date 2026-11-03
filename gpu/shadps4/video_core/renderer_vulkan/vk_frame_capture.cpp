@@ -183,7 +183,22 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
     // Frame boundaries in the command stream: the pass that writes a display buffer.
     const bool new_pass = !(pass_open && !entries.empty() && !entries.back().compute &&
                             entries.back().colors == targets);
+    // lbppc: LBPPC_CAPTURE_SPAN=n records across n display buffer passes (LBP3 draws into the
+    // display buffer more than once a frame).
+    static const int span = [] {
+        const char* env = std::getenv("LBPPC_CAPTURE_SPAN");
+        return env ? std::max(1, std::atoi(env)) : 1;
+    }();
+    static int boundaries = 0;
+    if (display && new_pass && state.load(std::memory_order_relaxed) == Recording &&
+        ++boundaries < span) {
+        entries.push_back({.compute = false, .colors = targets, .depth = {}});
+        entries.back().note = "display buffer pass (LBPPC_CAPTURE_SPAN)";
+        pass_open = true;
+        return;
+    }
     if (display && new_pass) {
+        boundaries = 0;
         if (state.load(std::memory_order_relaxed) == Recording) {
             Write(last_presented.load(std::memory_order_relaxed));
             entries.clear();

@@ -145,6 +145,12 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
+    // lbppc: LBPPC_FLIP_RATE overrides the game's flip rate (0 = every vblank, 1 = every other).
+    static const char* forced = std::getenv("LBPPC_FLIP_RATE");
+    std::printf("VideoOut: game set flip rate %d%s\n", rate, forced ? " (overridden)" : "");
+    if (forced) {
+        rate = std::atoi(forced);
+    }
     driver->GetPort(handle)->flip_rate = rate;
     return ORBIS_OK;
 }
@@ -535,3 +541,12 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 }
 
 } // namespace Libraries::VideoOut
+
+// lbppc: the main port's flip rate set by the loader (LBPPC_UNCAP_TRIGGER: 60 FPS after a level loaded).
+extern "C" void bbgpu_set_flip_rate(int rate) {
+    if (Libraries::VideoOut::driver) {
+        if (auto* port = Libraries::VideoOut::driver->GetPort(1)) {
+            port->flip_rate = rate;
+        }
+    }
+}

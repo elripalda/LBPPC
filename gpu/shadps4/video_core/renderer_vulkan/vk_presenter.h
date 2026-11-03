@@ -54,6 +54,7 @@ struct Frame {
     u32 generated_count{};
     bool detached_output{};
     u64 latency_id{}; ///< bbport: the submitted game frame shown (LowLatency), 0 for others
+    bool pillarbox{}; ///< lbppc: a wide frame without a 3D scene (a movie, a loading screen), shown 16:9
 };
 
 enum SchedulerType {

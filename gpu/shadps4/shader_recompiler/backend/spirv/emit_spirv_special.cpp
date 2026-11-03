@@ -236,11 +236,48 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
 }
 
 void EmitEmitVertex(EmitContext& ctx) {
+    if (!ctx.gs_vertex_index.value) {
+        ctx.OpEmitVertex();
+        return;
+    }
+    // lbppc: a geometry shader split over invocations (EmitContext::DefineInputs): this invocation
+    // emits the vertices [start, start + window), and on triangle strips also the one before start
+    // when start is an odd vertex of its strip, so its triangles keep their winding.
+    const Id index{ctx.OpLoad(ctx.U32[1], ctx.gs_vertex_index)};
+    const Id strip{ctx.OpLoad(ctx.U32[1], ctx.gs_strip_index)};
+    const Id invocation{ctx.OpLoad(ctx.U32[1], ctx.invocation_id)};
+    const Id start{ctx.OpIMul(ctx.U32[1], invocation, ctx.ConstU32(ctx.gs_stride))};
+    const Id end{ctx.OpIAdd(ctx.U32[1], start, ctx.ConstU32(ctx.gs_window))};
+    Id emit{ctx.OpLogicalAnd(ctx.U1[1], ctx.OpUGreaterThanEqual(ctx.U1[1], index, start),
+                             ctx.OpULessThan(ctx.U1[1], index, end))};
+    if (ctx.gs_triangle_strips) {
+        const Id before_start{
+            ctx.OpIEqual(ctx.U1[1], ctx.OpIAdd(ctx.U32[1], index, ctx.ConstU32(1u)), start)};
+        const Id even{ctx.OpIEqual(ctx.U1[1],
+                                   ctx.OpBitwiseAnd(ctx.U32[1], strip, ctx.ConstU32(1u)),
+                                   ctx.ConstU32(0u))};
+        const Id later{ctx.OpINotEqual(ctx.U1[1], invocation, ctx.ConstU32(0u))};
+        emit = ctx.OpLogicalOr(ctx.U1[1], emit,
+                               ctx.OpLogicalAnd(ctx.U1[1], later,
+                                                ctx.OpLogicalAnd(ctx.U1[1], before_start, even)));
+    }
+    const Id emit_label{ctx.OpLabel()};
+    const Id merge_label{ctx.OpLabel()};
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(emit, emit_label, merge_label);
+    ctx.AddLabel(emit_label);
     ctx.OpEmitVertex();
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    ctx.OpStore(ctx.gs_vertex_index, ctx.OpIAdd(ctx.U32[1], index, ctx.ConstU32(1u)));
+    ctx.OpStore(ctx.gs_strip_index, ctx.OpIAdd(ctx.U32[1], strip, ctx.ConstU32(1u)));
 }
 
 void EmitEmitPrimitive(EmitContext& ctx) {
     ctx.OpEndPrimitive();
+    if (ctx.gs_strip_index.value) {
+        ctx.OpStore(ctx.gs_strip_index, ctx.ConstU32(0u));
+    }
 }
 
 void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream) {

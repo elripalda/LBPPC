@@ -10,6 +10,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
+#include "video_core/renderer_vulkan/lbp_camera.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
@@ -163,6 +164,12 @@ public:
         }
     }
 
+    /// lbppc: whether a pass with a depth buffer (a 3D scene) was drawn since the last call. LBP3's movies,
+    /// loading and boot screens draw none: laid out for 16:9, they are shown pillarboxed on wider screens.
+    bool TakeSceneDrawn() {
+        return std::exchange(scene_drawn, false);
+    }
+
     std::thread::id GetGpuCommandProcessorThread();
 #if defined(__linux__) || defined(_WIN32)
     u32 GetGpuCommandProcessorThreadId();
@@ -253,6 +260,7 @@ private:
     AmdGpu::CbDbExtent CbExtent(u32 index) const;
     AmdGpu::CbDbExtent DbExtent() const;
 
+    void LbpRecordMatrix(const Shader::Info& stage, const float* wvp);
     void BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                      Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data, u32& write_index);
@@ -343,6 +351,10 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
+    LbpCamera lbp_camera;              // lbppc: LBP3's camera (lbp_camera.h)
+    bool lbp_draw_matrix = false;      ///< this draw's WVP was recorded
+    bool lbp_hudless_pending = false;  ///< the next display pass draw starts the UI
+    bool scene_drawn = false;          ///< lbppc: a depth-buffered pass since TakeSceneDrawn
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     struct UiPass {

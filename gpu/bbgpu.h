@@ -30,6 +30,8 @@ uintptr_t bbgpu_resolve(const char *scoped_nid);
 int bbgpu_handle_fault(void *ucontext, void *address);
 /* BB_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void bbgpu_dump_guest_writes(void *ucontext);
+/* lbppc: the main video port's flip rate (0: every vblank, 1: every other). */
+void bbgpu_set_flip_rate(int rate);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);

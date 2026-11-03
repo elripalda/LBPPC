@@ -316,6 +316,28 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {depth_image_id, -1, -1};
         }
 
+        // lbppc: a 2D colour target at a volume's address renders into its depth slices (LBP3's
+        // lighting volumes): the volume is used through a 2D array view of those slices. Replacing it
+        // each time lost what was drawn and cost every frame a new image and a copy.
+        if (cache_image.info.type == AmdGpu::ImageType::Color3D &&
+            image_info.type != AmdGpu::ImageType::Color3D &&
+            image_info.size.width == cache_image.info.size.width &&
+            image_info.size.height == cache_image.info.size.height &&
+            image_info.resources.levels <= cache_image.info.resources.levels &&
+            image_info.resources.layers <= cache_image.info.size.depth &&
+            IsVulkanFormatCompatible(cache_image.info.pixel_format, image_info.pixel_format)) {
+            return {cache_image_id, -1, -1};
+        }
+        // ...and a volume requested where its slices were drawn as a 2D target first grows from it.
+        if (image_info.type == AmdGpu::ImageType::Color3D &&
+            cache_image.info.type != AmdGpu::ImageType::Color3D &&
+            image_info.size.width == cache_image.info.size.width &&
+            image_info.size.height == cache_image.info.size.height &&
+            cache_image.info.resources.layers <= image_info.size.depth &&
+            image_info.guest_size >= cache_image.info.guest_size) {
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
@@ -680,7 +702,26 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (image_resolved.info.resources < info.resources &&
+                   !(image_resolved.info.type == AmdGpu::ImageType::Color3D &&
+                     info.type != AmdGpu::ImageType::Color3D &&
+                     info.resources.layers <= image_resolved.info.size.depth &&
+                     info.resources.levels <= image_resolved.info.resources.levels)) {
+            static int logged;
+            if (logged++ < 40) {
+                std::printf("lbppc: overlap resolve failed: requested %#llx %ux%ux%u fmt %d type %d layers %u mips %u "
+                            "size %#llx tile %u; resolved %#llx %ux%ux%u fmt %d type %d layers %u mips %u size %#llx "
+                            "tile %u (%zu candidates, binding %d)\n",
+                            (unsigned long long)info.guest_address, info.size.width, info.size.height,
+                            info.size.depth, int(info.pixel_format), int(info.type), info.resources.layers,
+                            info.resources.levels, (unsigned long long)info.guest_size, u32(info.tile_mode),
+                            (unsigned long long)image_resolved.info.guest_address, image_resolved.info.size.width,
+                            image_resolved.info.size.height, image_resolved.info.size.depth,
+                            int(image_resolved.info.pixel_format), int(image_resolved.info.type),
+                            image_resolved.info.resources.layers, image_resolved.info.resources.levels,
+                            (unsigned long long)image_resolved.info.guest_size, u32(image_resolved.info.tile_mode),
+                            image_ids.size(), int(desc.type));
+            }
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
@@ -770,6 +811,13 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         }
     }
     if (desc.type == BindingType::Storage) {
+        static const bool st_log = std::getenv("LBPPC_TEX_LOG") != nullptr;
+        if (st_log && !image.usage.storage) {
+            std::printf("lbppc: storage image %#llx %ux%u fmt %d tiled %d size %#llx\n",
+                        (unsigned long long)image.info.guest_address, image.info.size.width,
+                        image.info.size.height, int(image.info.pixel_format), int(image.info.props.is_tiled),
+                        (unsigned long long)image.info.guest_size);
+        }
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -798,6 +846,14 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    // lbppc test: LBPPC_TEX_LOG: each render target the first time it is bound.
+    static const bool rt_log = std::getenv("LBPPC_TEX_LOG") != nullptr;
+    if (rt_log && !image.usage.render_target) {
+        std::printf("lbppc: render target %#llx %ux%u fmt %d tiled %d size %#llx (view fmt %d)\n",
+                    (unsigned long long)image.info.guest_address, image.info.size.width,
+                    image.info.size.height, int(image.info.pixel_format), int(image.info.props.is_tiled),
+                    (unsigned long long)image.info.guest_size, int(desc.info.pixel_format));
+    }
     if (image.info.props.is_depth) {
         static int logged;
         if (logged++ < 6) {
@@ -849,11 +905,15 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         // lbppc: only an 8-bit image at a stencil address of its own is a stencil plane. LBP3's
         // stencil address is its depth buffer's, where its R8G8B8A8 copy of the depth bits lives:
         // linked as "stencil", reads of that copy went back to the depth image (and lost the GPU).
+        // The plane made below has no format (num_bits 0): it is the one to find again, or a new
+        // one was made at every depth target bind (40 a frame: 270000 images in five minutes,
+        // and the frame rate halved as the cache's lookups slowed).
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
                                  if (image.info.guest_address == desc.info.stencil_addr &&
                                      desc.info.stencil_addr != desc.info.guest_address &&
-                                     image.info.num_bits == 8) {
+                                     (image.info.num_bits == 8 ||
+                                      image.info.pixel_format == vk::Format::eUndefined)) {
                                      stencil_id = image_id;
                                  }
                              });
@@ -959,6 +1019,23 @@ void TextureCache::RefreshImage(Image& image) {
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
+    }
+
+    // lbppc test: LBPPC_TEX_LOG: each texture upload (not targets), and whether its guest memory is all zeros.
+    static const bool tex_log = std::getenv("LBPPC_TEX_LOG") != nullptr;
+    if (tex_log && !image.usage.render_target && !image.usage.depth_target &&
+        Core::Memory::Instance()->ClampRangeSize(VAddr(image.info.guest_address), image.info.guest_size) ==
+            image.info.guest_size) {
+        const u8* p = std::bit_cast<u8*>(image.info.guest_address);
+        u64 nonzero = 0;
+        for (u64 i = 0; i < image.info.guest_size; i += 64) {
+            nonzero += p[i] != 0;
+        }
+        std::printf("lbppc: upload %#llx %ux%u mips %u fmt %d tiled %d size %#llx nonzero-samples %llu/%llu flags %#x\n",
+                    (unsigned long long)image.info.guest_address, image.info.size.width, image.info.size.height,
+                    num_mips, int(image.info.pixel_format), int(image.info.props.is_tiled),
+                    (unsigned long long)image.info.guest_size, (unsigned long long)nonzero,
+                    (unsigned long long)((image.info.guest_size + 63) / 64), unsigned(image.flags));
     }
 
     scheduler.EndRendering();
@@ -1505,6 +1582,18 @@ void TextureCache::TouchImage(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+    // lbppc diagnostics: LBPPC_IMAGE_LOG=1 logs created images (every 500th after the first 50), =2 all of them.
+    static const bool image_log = std::getenv("LBPPC_IMAGE_LOG") != nullptr;
+    static u64 inserted = 0;
+    static const bool image_log_all = image_log && std::getenv("LBPPC_IMAGE_LOG")[0] == '2';
+    if (image_log && (++inserted <= 50 || inserted % 500 == 0 || image_log_all)) {
+        std::printf("lbppc: image #%llu %#llx %ux%ux%u layers %u mips %u fmt %d type %d size %#x "
+                    "from %p\n",
+                    (unsigned long long)inserted, (unsigned long long)info.guest_address,
+                    info.size.width, info.size.height, info.size.depth, info.resources.layers,
+                    info.resources.levels, int(info.pixel_format), int(info.type),
+                    u32(info.guest_size), __builtin_return_address(0));
+    }
     const ImageId image_id = slot_images.insert(instance, runtime, slot_image_views, info);
     if (!slot_images[image_id].allocation_failed) [[likely]] {
         return image_id;

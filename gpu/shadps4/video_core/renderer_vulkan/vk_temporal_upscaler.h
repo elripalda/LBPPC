@@ -72,6 +72,11 @@ public:
 
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
+
+    /// lbppc: frame generation's inputs for a game without the upscaler's trigger (LBP3): the
+    /// scene depth and motion vectors now, and the picture before the UI from `color`.
+    void CaptureFrameGenNow();
+    void CaptureHudlessNow(VideoCore::ImageId color);
     bool RasterScaling() const;
     /// bbport: LOD bias for scene materials, log2(render / output) while a reduced scene is
     /// upscaled (0 at native size, for TAA and without an upscaler).

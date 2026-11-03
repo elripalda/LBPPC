@@ -1343,6 +1343,16 @@ void TemporalUpscaler::Run() {
     }
 }
 
+void TemporalUpscaler::CaptureFrameGenNow() {
+    if (frame_generator && frame_generator->Wanted()) {
+        CaptureFrameGen();
+    }
+}
+
+void TemporalUpscaler::CaptureHudlessNow(VideoCore::ImageId color) {
+    CaptureHudless(color);
+}
+
 void TemporalUpscaler::CaptureFrameGen() {
     if (!camera_motion.Depth()) {
         return;

@@ -304,7 +304,9 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     // shimmering edges). WindowSDL fits it to the screen.
     const auto& settings = BbSettings::Get();
     const int output = settings.output_res.load();
-    const bool known = output >= 0 && output < int(std::size(BbSettings::OutputWidths));
+    // lbppc: a size of its own from the host (LBPPC_RENDER_RES, the game rendering at it) comes first.
+    const bool host_size = config->width != 1920 || config->height != 1080;
+    const bool known = !host_size && output >= 0 && output < int(std::size(BbSettings::OutputWidths));
     const s32 width = known ? BbSettings::OutputWidths[output] : config->width;
     const s32 height = known ? BbSettings::OutputHeights[output] : config->height;
     g_window_thread = std::thread([title, width, height] {

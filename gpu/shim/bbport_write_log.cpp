@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #ifdef _WIN32
 #include <windows.h>
 #undef near
@@ -55,6 +56,28 @@ void NoteIntent(std::uint64_t address, const void* data, std::uint64_t size, Sou
 }
 
 void Note(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
+    // lbppc test: LBPPC_IO_WATCH=address: GPU-side writes (fences, labels, backing writes) covering it.
+    static std::uint64_t watch = 0, watch_end = 0;
+    static const bool watch_read = [] {
+        if (const char* env = std::getenv("LBPPC_IO_WATCH")) {
+            char* end;
+            watch = std::strtoull(env, &end, 0);
+            watch_end = *end == ':' ? std::strtoull(end + 1, nullptr, 0) : watch + 1;
+        }
+        return true;
+    }();
+    (void)watch_read;
+    if (watch && address < watch_end && watch < address + size) {
+        std::uint64_t first = 0;
+        std::memcpy(&first, data, size < 8 ? size : 8);
+        timespec now{};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        std::printf("lbppc: [t=%lld.%06ld] GPU-side write (source %d) of %llu bytes at %#llx covers the watched "
+                    "address, first bytes %016llx\n",
+                    (long long)now.tv_sec, now.tv_nsec / 1000, int(source), (unsigned long long)size,
+                    (unsigned long long)address, (unsigned long long)first);
+        std::fflush(stdout);
+    }
     if (Enabled()) {
         Record(address, data, size, source);
     }

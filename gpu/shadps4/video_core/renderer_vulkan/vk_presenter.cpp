@@ -127,6 +127,14 @@ static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_widt
                          dst_rect.offset.x, dst_rect.offset.y);
 }
 
+// lbppc: the whole frame into the 16:9 area its picture was laid out for, centred in the swapchain.
+[[nodiscard]] vk::ImageBlit MakeImageBlitPillarbox(s32 frame_width, s32 frame_height, s32 swapchain_width,
+                                                   s32 swapchain_height) {
+    const auto& dst_rect = FitImage(frame_height * 16 / 9, frame_height, swapchain_width, swapchain_height);
+    return MakeImageBlit(frame_width, frame_height, dst_rect.extent.width, dst_rect.extent.height,
+                         dst_rect.offset.x, dst_rect.offset.y);
+}
+
 // bbport: screenshot capture and ImGui overlays removed; the port presents directly.
 
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
@@ -682,6 +690,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             }
         }
     }
+    // lbppc: LBP3 draws its movies, loading and boot screens for 16:9 over the whole display buffer: on a
+    // wider one (LBPPC_RENDER_RES ultrawide) a frame without a 3D scene is shown in a centred 16:9 area
+    // instead of stretched. LBPPC_PILLARBOX=0 keeps them stretched.
+    static const bool pillarbox = [] {
+        const char* env = std::getenv("LBPPC_PILLARBOX");
+        return !env || env[0] != '0';
+    }();
+    const bool scene = rasterizer->TakeSceneDrawn();
+    frame->pillarbox = pillarbox && !scene && frame->width * 9 > frame->height * 16 + 9;
+    static bool was_pillarbox = false;
+    if (frame->pillarbox != was_pillarbox && std::getenv("LBPPC_PILLARBOX_LOG")) {
+        std::printf("Presenter: %s\n", frame->pillarbox ? "16:9 (no 3D scene)" : "full width");
+    }
+    was_pillarbox = frame->pillarbox;
     return frame;
 }
 
@@ -690,6 +712,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     Frame* frame = GetRenderFrame();
     frame->generated_count = 0;
     frame->detached_output = false;
+    frame->pillarbox = false;
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -1059,7 +1082,10 @@ bool Presenter::PresentImage(Frame* frame, vk::Image image, bool last) {
                                vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
         cmdbuf.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
-                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
+                         frame->pillarbox
+                             ? MakeImageBlitPillarbox(frame->width, frame->height, extent.width,
+                                                      extent.height)
+                             : MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
                          vk::Filter::eLinear);
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         BbOverlay::NotePresent();

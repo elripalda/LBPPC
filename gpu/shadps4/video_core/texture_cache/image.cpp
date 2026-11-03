@@ -362,6 +362,11 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
+    // lbppc: a volume has one array layer; a range from a 2D array view of its depth slices would
+    // name layers it does not have, so a volume always changes layout as a whole.
+    if (info.props.is_volume) {
+        subres_range.reset();
+    }
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 

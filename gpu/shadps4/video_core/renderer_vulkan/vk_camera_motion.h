@@ -80,6 +80,12 @@ public:
     /// A bound constant buffer of 864 bytes: checks the scene constant signature.
     void OnConstants(const float* data);
 
+    /// lbppc: a camera found another way (LbpCamera): world to view and back (3x4 rows), the
+    /// projection (x scale, y scale, z scale, z offset), and whether it continues the previous
+    /// frame's camera (false: a cut, no motion this frame).
+    void SetCamera(const std::array<float, 12>& view, const std::array<float, 12>& inv_view,
+                   const std::array<float, 4>& proj, std::array<u32, 2> size, bool continuous);
+
     /// The G-buffer pass (5+ color targets): its depth is the scene depth.
     void OnGBufferPass(VideoCore::ImageId depth);
 

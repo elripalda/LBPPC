@@ -224,7 +224,8 @@ bool CameraMotion::ClipTransforms(std::array<float, 16>& view_to_clip,
 float CameraMotion::FarPlane(float fallback) const noexcept {
     // depth = zs + zo / z is 1 at the far plane; zs = 1 is an infinite one.
     const float zs = current.proj[2], zo = current.proj[3];
-    const float far_z = zs < 1.0f ? zo / (1.0f - zs) : 0.0f;
+    // lbppc: LBP3's zs is slightly above 1 (near 20, far 100000); zo / (1 - zs) holds as well.
+    const float far_z = zs != 1.0f ? zo / (1.0f - zs) : 0.0f;
     return far_z > Near() && far_z < 1e7f ? far_z : fallback;
 }
 
@@ -313,6 +314,25 @@ void CameraMotion::OnConstants(const float* data) {
     current.proj = {data[52], data[57], data[62], data[63]};
     current.valid = current.proj[0] != 0.0f && current.proj[1] != 0.0f;
     const std::array<u32, 2> size{u32(data[4]), u32(data[5])};
+    if (size != render_size) {
+        std::printf("Camera motion: scene render size %ux%u\n", size[0], size[1]);
+        render_size = size;
+    }
+    frame_has_camera = true;
+}
+
+void CameraMotion::SetCamera(const std::array<float, 12>& view,
+                             const std::array<float, 12>& inv_view,
+                             const std::array<float, 4>& proj, std::array<u32, 2> size,
+                             bool continuous) {
+    previous = current;
+    if (!continuous) {
+        previous.valid = false;
+    }
+    current.view = view;
+    current.inv_view = inv_view;
+    current.proj = proj;
+    current.valid = proj[0] != 0.0f && proj[1] != 0.0f;
     if (size != render_size) {
         std::printf("Camera motion: scene render size %ux%u\n", size[0], size[1]);
         render_size = size;
