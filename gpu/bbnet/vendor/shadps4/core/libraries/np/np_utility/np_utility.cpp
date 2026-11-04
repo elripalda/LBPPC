@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -455,49 +456,68 @@ s32 PS4_SYSV_ABI sceNpAppLaunchLinkIntInitialize() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestAbort() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
+// lbppc: there is no PSN bandwidth test server, so a test finishes as soon as it starts and reports a
+// broadband line. Left unfinished, the game polls sceNpBandwidthTestGetStatus about 30 times a second.
+constexpr s32 BandwidthTestCtxId = 1;
+constexpr s32 BandwidthTestStatusFinished = 2;
+constexpr double BandwidthTestBps = 100'000'000.0;
+
+static s32 BandwidthTestStart() {
+    std::printf("Online: connection bandwidth test answered at once (no PSN test server)\n");
+    return BandwidthTestCtxId;
+}
+
+static s32 BandwidthTestResult(s32 ctx_id, OrbisNpBandwidthTestResult* result) {
+    if (ctx_id != BandwidthTestCtxId) {
+        return ORBIS_NP_UTIL_ERROR_INVALID_ARGUMENT;
+    }
+    if (result) {
+        result->upload_bps = BandwidthTestBps;
+        result->download_bps = BandwidthTestBps;
+        result->result = ORBIS_OK;
+    }
     return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpBandwidthTestAbort(s32 ctx_id) {
+    return ctx_id == BandwidthTestCtxId ? ORBIS_OK : ORBIS_NP_UTIL_ERROR_INVALID_ARGUMENT;
 }
 
 s32 PS4_SYSV_ABI sceNpBandwidthTestDownloadOnlyInitStart() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+    return BandwidthTestStart();
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus(s32 ctx_id, s32* status) {
+    if (ctx_id != BandwidthTestCtxId || !status) {
+        return ORBIS_NP_UTIL_ERROR_INVALID_ARGUMENT;
+    }
+    *status = BandwidthTestStatusFinished;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpBandwidthTestInitStart() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+    return BandwidthTestStart();
 }
 
 s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartDownload() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+    return BandwidthTestStart();
 }
 
 s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartUpload() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+    return BandwidthTestStart();
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown(s32 ctx_id, OrbisNpBandwidthTestResult* result) {
+    return BandwidthTestResult(ctx_id, result);
 }
 
-s32 PS4_SYSV_ABI sceNpBandwidthTestShutdownWithDetailedInfo() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceNpBandwidthTestShutdownWithDetailedInfo(s32 ctx_id,
+                                                            OrbisNpBandwidthTestResult* result) {
+    return BandwidthTestResult(ctx_id, result);
 }
 
 s32 PS4_SYSV_ABI sceNpBandwidthTestUploadOnlyInitStart() {
-    LOG_ERROR(Lib_NpUtility, "(STUBBED) called");
-    return ORBIS_OK;
+    return BandwidthTestStart();
 }
 
 s32 PS4_SYSV_ABI sceNpLookupNetAbortRequest() {

@@ -1,0 +1,50 @@
+{
+  "Sha1DigestKeys": [
+    "CustomServerDigest"
+  ],
+  "HmacDigestKeys": [
+    "CustomServerDigest"
+  ],
+  "Version": 26,
+  "LicenseText": "Welcome to Refresh!",
+  "BlockedAssetFlags": {
+    "Dangerous": true,
+    "Media": false,
+    "Modded": true
+  },
+  "BlockedAssetFlagsForTrustedUsers": {
+    "Dangerous": true,
+    "Media": false,
+    "Modded": true
+  },
+  "AllowUsersToUseIpAuthentication": false,
+  "PermitPsnLogin": true,
+  "PermitRpcnLogin": true,
+  "PermitWebLogin": true,
+  "PermitAllLogins": true,
+  "EnforcePatchwork": false,
+  "RequiredPatchworkMajorVersion": 1,
+  "RequiredPatchworkMinorVersion": 0,
+  "UseTicketVerification": false,
+  "RegistrationEnabled": true,
+  "InstanceName": "LBPPC",
+  "InstanceDescription": "Community server for LBPPC, LittleBigPlanet 3 on PC",
+  "MaintenanceMode": false,
+  "RequireGameLoginToRegister": false,
+  "UseDeflateCompression": true,
+  "WebExternalUrl": "https://play.lbppc.com",
+  "GameConfigStorageUrl": "https://play.lbppc.com/lbp",
+  "AllowInvalidTextureGuids": false,
+  "ReadOnlyMode": false,
+  "ReadonlyModeForTrustedUsers": false,
+  "UserFilesizeQuota": 104857600,
+  "TimedLevelUploadLimits": {
+    "Enabled": false,
+    "TimeSpanHours": 24,
+    "LevelQuota": 10
+  },
+  "PrintRoomStateWhenNoFoundRooms": false,
+  "PrintAuthenticationData": false,
+  "PermitShowingOnlineUsers": true,
+  "EnableDiveIn": true
+}

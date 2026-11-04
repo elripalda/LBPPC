@@ -91,75 +91,47 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     }
     return 0;
 }
+/* System events for the game (SceSystemServiceEvent: an s32 type and 8192 bytes of parameters): the online
+ * code's (bbnet_glue.cpp: an accepted invitation), taken in order by sceSystemServiceReceiveEvent. */
+enum { SYSTEM_EVENT_SIZE=4+8192, SYSTEM_EVENT_MAX=8 };
+static unsigned char system_events[SYSTEM_EVENT_MAX][SYSTEM_EVENT_SIZE];
+static int system_event_count;
+static pthread_mutex_t system_event_lock=PTHREAD_MUTEX_INITIALIZER;
+void runtime_system_event_push(const void *event, uint64_t size) {
+    pthread_mutex_lock(&system_event_lock);
+    if (system_event_count<SYSTEM_EVENT_MAX) {
+        unsigned char *slot=system_events[system_event_count++];
+        memset(slot,0,SYSTEM_EVENT_SIZE);
+        memcpy(slot,event,size<SYSTEM_EVENT_SIZE ? size : SYSTEM_EVENT_SIZE);
+        int32_t type; memcpy(&type,slot,4);
+        printf("SystemService: event %#x for the game\n",(unsigned)type);
+    }
+    pthread_mutex_unlock(&system_event_lock);
+}
 static ABI int32_t system_status(unsigned char *status) {
     if (!status) return SYSTEM_PARAMETER;
-    memset(status,0,12); /* event_num=0, no overlay, foreground, normal CPU mode */
+    memset(status,0,12); /* no overlay, foreground, normal CPU mode */
+    pthread_mutex_lock(&system_event_lock);
+    int32_t pending=system_event_count;
+    pthread_mutex_unlock(&system_event_lock);
+    memcpy(status,&pending,4); /* event_num */
     return 0;
 }
-static ABI int32_t system_event(void *event) { (void)event; return SYSTEM_NO_EVENT; }
+static ABI int32_t system_event(void *event) {
+    if (!event) return SYSTEM_PARAMETER;
+    pthread_mutex_lock(&system_event_lock);
+    const int had=system_event_count;
+    if (had) {
+        memcpy(event,system_events[0],SYSTEM_EVENT_SIZE);
+        memmove(system_events[0],system_events[1],(size_t)(system_event_count-1)*SYSTEM_EVENT_SIZE);
+        --system_event_count;
+    }
+    pthread_mutex_unlock(&system_event_lock);
+    return had ? 0 : SYSTEM_NO_EVENT;
+}
 static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
-/* Quit to Desktop (scripts/quit_menu.py): the patched menus call the browser with these
- * addresses. "bb:q" (title menu) closes the game; "bb:p" (System menu, in the world) marks the
- * Exit Game that follows, and "bb:d" (its confirmation dialog) answers 1 to show the Quit to
- * Desktop text and arms the quit. The game then saves and leaves the world, and closes as soon
- * as it starts the intro logos (a menu/logo_ file opens) with no save data mounted, or when the
- * title screen is built ("bb:t", with the intro skipped). An unanswered dialog disarms it after
- * two minutes. */
-static int quit_pending, quit_waiting;
-static time_t quit_armed;
-static pthread_mutex_t quit_lock=PTHREAD_MUTEX_INITIALIZER;
-static void quit_game(void) {
-    note("Quit to Desktop");
-    SDL_Event quit={.type=SDL_EVENT_QUIT};
-    SDL_PushEvent(&quit);
-}
-static int quit_ready(void) { return quit_armed && time(NULL)-quit_armed<120; }
-void runtime_quit_on_open(const char *guest) {
-    if (!quit_armed || !guest || !strstr(guest,"/menu/logo_")) return;
-    pthread_mutex_lock(&quit_lock);
-    if (quit_ready()) {
-        quit_armed=0;
-        /* A save still writing finishes first (runtime_quit_on_save_done). */
-        if (runtime_savedata_mounted()) quit_waiting=1; else quit_game();
-    }
-    pthread_mutex_unlock(&quit_lock);
-}
-void runtime_quit_on_save_done(void) {
-    pthread_mutex_lock(&quit_lock);
-    if (quit_waiting && !runtime_savedata_mounted()) { quit_waiting=0; quit_game(); }
-    pthread_mutex_unlock(&quit_lock);
-}
-/* `arg`: the browser's second argument, a number for the port's own messages. */
-static ABI int32_t launch_browser(const char *url, intptr_t arg) {
-    /* Rebirth at the Doll (runtime_rebirth.c, scripts/rebirth.py). */
-    if (url && !strcmp(url,"bb:b")) return runtime_rebirth();
-    if (url && !strcmp(url,"bb:f")) return runtime_rebirth_free_level((int)arg);
-    if (url && !strcmp(url,"bb:e")) { runtime_rebirth_closed(); return 0; }
-    /* PC Settings (bbport_pc_menu.cpp, scripts/pc_menu.py): the System menu asks for its line;
-     * `arg` points at the menu's line list. */
-    if (url && !strcmp(url,"bb:o")) return bbgpu_pc_menu_add_line((void *)arg);
-    if (url && !strcmp(url,"bb:h")) return bbgpu_pc_menu_hide((void *)arg);
-    if (url && !strcmp(url,"bb:l")) return bbgpu_pc_menu_button_text((void *)arg);
-    if (url && !strcmp(url,"bb:r")) return bbgpu_pc_menu_question((void *)arg);
-    if (url && !strcmp(url,"bb:y")) return bbgpu_pc_menu_yes((void *)arg);
-    if (url && !strcmp(url,"bb:q")) { quit_game(); return 0; }
-    if (url && !strcmp(url,"bb:p")) { quit_pending=1; return 0; }
-    if (url && !strcmp(url,"bb:d")) {
-        pthread_mutex_lock(&quit_lock);
-        const int armed=quit_pending;
-        quit_pending=0;
-        quit_armed=armed ? time(NULL) : 0;
-        pthread_mutex_unlock(&quit_lock);
-        return armed;
-    }
-    if (url && !strcmp(url,"bb:t")) {
-        pthread_mutex_lock(&quit_lock);
-        if (quit_ready() || quit_waiting) quit_game();
-        quit_armed=0;
-        quit_waiting=0;
-        pthread_mutex_unlock(&quit_lock);
-        return 0;
-    }
+static ABI int32_t launch_browser(const char *url, intptr_t options) {
+    (void)url; (void)options;
     note("SystemService: web browser request ignored (offline)");
     return 0;
 }
@@ -296,7 +268,26 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
+DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
+/* MsgDialog: what the game wanted to tell the player, in the log (no dialog is drawn yet). OrbisMsgDialogParam:
+ * a 48-byte base, size, mode (1 a message, 2 a progress bar, 3 a system message), and pointers to the
+ * message's, the bar's and the system message's parameters (their text at +8; the system message's type at 0). */
+static ABI int32_t msg_init(void) { return dialog_init(1); }
+static ABI int32_t msg_status(void) { return dialog_status(1); }
+static ABI int32_t msg_term(void) { return dialog_term(1); }
+static ABI int32_t msg_open(const unsigned char *param) {
+    if (param) {
+        uint32_t mode; memcpy(&mode,param+56,4);
+        const unsigned char *user, *bar, *sys;
+        memcpy(&user,param+64,8); memcpy(&bar,param+72,8); memcpy(&sys,param+80,8);
+        const char *text=NULL;
+        if (mode==1 && user) memcpy(&text,user+8,8);
+        if (mode==2 && bar) memcpy(&text,bar+8,8);
+        if (mode==3 && sys) { int32_t type; memcpy(&type,sys,4); printf("Runtime: MsgDialog: system message %d\n",type); }
+        else printf("Runtime: MsgDialog: \"%.300s\"\n",text ? text : "");
+    }
+    return dialog_open(1);
+}
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,

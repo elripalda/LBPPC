@@ -1,0 +1,17 @@
+[Unit]
+Description=shadNet (sign-in, friends and multiplayer signaling for LBPPC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=lbppc
+WorkingDirectory=/opt/lbppc/shadnet
+# Qt 6.10 from aqtinstall (the distribution's Qt is older than this build needs).
+Environment=LD_LIBRARY_PATH=/opt/lbppc/qt/6.10.0/gcc_64/lib
+Environment=QT_PLUGIN_PATH=/opt/lbppc/qt/6.10.0/gcc_64/plugins
+ExecStart=/opt/lbppc/shadnet/shadnet
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

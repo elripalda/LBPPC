@@ -29,6 +29,13 @@ constexpr u32 ORBIS_NP_LOOKUP_TIMEOUT_NO_EFFECT = 0;
 using OrbisNpLookupTitleCtxId = s32;
 using OrbisNpLookupRequestId = s32;
 
+struct OrbisNpBandwidthTestResult {
+    double upload_bps;
+    double download_bps;
+    s32 result;
+    char padding[4];
+};
+
 struct OrbisNpLookupCreateAsyncRequestParameter {
     u64 size;
     u64 cpuAffinityMask;
@@ -81,14 +88,15 @@ s32 PS4_SYSV_ABI sceNpAppLaunchLinkIntFinalize();
 s32 PS4_SYSV_ABI sceNpAppLaunchLinkIntGetCompatibleTitleIdList();
 s32 PS4_SYSV_ABI sceNpAppLaunchLinkIntGetCompatibleTitleIdNum();
 s32 PS4_SYSV_ABI sceNpAppLaunchLinkIntInitialize();
-s32 PS4_SYSV_ABI sceNpBandwidthTestAbort();
+s32 PS4_SYSV_ABI sceNpBandwidthTestAbort(s32 ctx_id);
 s32 PS4_SYSV_ABI sceNpBandwidthTestDownloadOnlyInitStart();
-s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus();
+s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus(s32 ctx_id, s32* status);
 s32 PS4_SYSV_ABI sceNpBandwidthTestInitStart();
 s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartDownload();
 s32 PS4_SYSV_ABI sceNpBandwidthTestInitStartUpload();
-s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown();
-s32 PS4_SYSV_ABI sceNpBandwidthTestShutdownWithDetailedInfo();
+s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown(s32 ctx_id, OrbisNpBandwidthTestResult* result);
+s32 PS4_SYSV_ABI sceNpBandwidthTestShutdownWithDetailedInfo(s32 ctx_id,
+                                                         OrbisNpBandwidthTestResult* result);
 s32 PS4_SYSV_ABI sceNpBandwidthTestUploadOnlyInitStart();
 s32 PS4_SYSV_ABI sceNpLookupAbortRequest(OrbisNpLookupRequestId reqId);
 s32 PS4_SYSV_ABI sceNpLookupCreateAsyncRequest(

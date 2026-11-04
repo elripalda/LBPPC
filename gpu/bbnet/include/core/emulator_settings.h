@@ -36,6 +36,16 @@ public:
         const std::string server = Text("BB_SHADNET_WEBAPI");
         return server.empty() && !Text("LBPPC_NP_USER").empty() ? "http://lbppc.local" : server;
     }
+    /// lbppc: a Web API request's URL. A path's trailing slash before its query is dropped: LBP3 reads an
+    /// invitation at /v1/users/<id>/invitations/<id>/?fields=..., which shadNet routes only without it.
+    std::string GetShadNetWebApiUrl(std::string path) const {
+        const auto query = path.find('?');
+        const auto end = query == std::string::npos ? path.size() : query;
+        if (end > 1 && path[end - 1] == '/') {
+            path.erase(end - 1, 1);
+        }
+        return GetShadNetWebApiServer() + path;
+    }
     bool IsUPnPEnabled() const { return Flag("BB_UPNP", false); }
     /// shadPS4's disable_https: HTTPS requests the game makes go out as plain HTTP.
     bool IsForcedHttpsDisabled() const { return Flag("BB_DISABLE_HTTPS", false); }

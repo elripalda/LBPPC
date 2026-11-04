@@ -23,7 +23,7 @@ Refresh needs PostgreSQL. After its first start it writes its settings next to i
   - `EnforcePatchwork` `false`: Patchwork is the PS3 game's security plugin; LBPPC has its own join protection (below).
   - `WebExternalUrl` and `GameConfigStorageUrl`: the address players use, such as `http://<host>:10061` and `http://<host>:10061/lbp`.
 
-Accounts: `python tools/refresh_account.py <online name> --server http://<host>:10061` (once per player; the name must match their shadNet account).
+Accounts: players make their own with the launcher's **Create account**; from a shell, `python tools/refresh_account.py <online name> --server http://<host>:10061` (the name must match their shadNet account).
 
 ### shadNet
 
@@ -34,25 +34,28 @@ After its first start, in `shadnet.cfg`:
 
 Copy `worlds.cfg` and `scoreboards.cfg` from the shadNet repository next to `shadnet.exe`.
 
-Accounts: `python tools/shadnet_account.py <online name> --server <host>:31313` (prints the password).
+Accounts: the launcher's **Create account**, or `python tools/shadnet_account.py <online name> --server <host>:31313` (prints the password).
 
 ## Playing
 
 In the launcher, tick **Play online** and fill in:
 
-- **Online name**: the player's account name.
-- **Server**: Refresh's address, `http://<host>:10061`.
-- **shadNet password** and **shadNet server** (`<host>:31313`) for multiplayer.
-- **Who may join you**: see below.
+- **Online name** and **Password**: one account, the same on the server's shadNet and Refresh. New players choose
+  them and press **Create account**, which makes both.
+- **Server**: the server's address, such as `play.lbppc.com`. Refresh is reached at `https://<server>` (a server on
+  this PC: `http://127.0.0.1:10061`) and shadNet on the same host, port 31313.
 
-Or from a shell: `LBPPC_SERVER=http://<host>:10061 BB_SHADNET_SERVER=<host>:31313 BB_SHADNET_NPID=<name> BB_SHADNET_PASSWORD=<password> python run.py <game folder>`.
+**Friends...** opens the player's friends list: send a request by online name, accept or decline the ones they got,
+remove friends. Friends are who may join the player's game.
+
+Or from a shell: `LBPPC_SERVER=https://<server> BB_SHADNET_SERVER=<server>:31313 BB_SHADNET_NPID=<name> BB_SHADNET_PASSWORD=<password> python run.py <game folder>`.
 
 ## Join protection
 
 LittleBigPlanet's community servers were closed by a "force join" exploit: a forged invite made the game accept a stranger into the player's session. LBPPC accepts a connection from another player only if:
 
-- they are your shadNet friend,
-- they are named in **Who may join you** (`LBPPC_JOIN_ALLOW`, comma separated), or
+- they are your shadNet friend (the launcher's **Friends...**),
+- they are named in `LBPPC_JOIN_ALLOW` (comma separated; for tests started from a shell), or
 - your game connected to them first (you joined them).
 
 Anyone else's connection is dropped before it reaches the game, and the log says `Online: refused a connection from <name>`.

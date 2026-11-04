@@ -676,7 +676,7 @@ s32 sendRequest(s64 request_id, s32 part_index, void* data, u64 data_size,
         s32 template_id = user_ctx->GetHttpTemplateId();
         // Technically this should be base_url + api_group + path,
         // but shadNet doesn't seem to use the api_group for endpoints?
-        std::string full_url = base_url + request->GetPath();
+        std::string full_url = EmulatorSettings.GetShadNetWebApiUrl(request->GetPath());
         result = request->CreateHttpRequest(template_id, full_url.data());
         if (result < 0) {
             // Underlying request creation failed, return.

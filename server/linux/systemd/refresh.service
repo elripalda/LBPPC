@@ -1,0 +1,17 @@
+[Unit]
+Description=Refresh (LittleBigPlanet levels, profiles and matchmaking for LBPPC)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+User=lbppc
+WorkingDirectory=/opt/lbppc/refresh
+# Refresh keeps its configuration (the .json files) and data here.
+Environment=BUNKUM_DATA_FOLDER=/opt/lbppc/refresh
+ExecStart=/opt/lbppc/refresh/Refresh.GameServer
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

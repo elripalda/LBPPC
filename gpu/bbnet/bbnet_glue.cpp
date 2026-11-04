@@ -36,6 +36,8 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/systemservice.h"
+#include "core/libraries/np/np_handler/np_handler.h"
+#include "bbport_invite.h"
 #include "core/libraries/system/userservice.h"
 #include "core/user_manager.h"
 #include "imgui/invitation_prompt_layer.h"
@@ -58,27 +60,13 @@
 #include "core/libraries/np/np_utility/np_utility.h"
 #include "core/libraries/np/np_web_api/np_web_api.h"
 #include "core/libraries/np/np_web_api2/np_web_api2.h"
-#include "thd/thd.h"
 
 extern "C" {
 int32_t runtime_thread_spawn(void** out, void* PS4_SYSV_ABI (*entry)(void*), void* argument,
                              uint64_t stack, const char* name);
 int32_t runtime_thread_join_spawned(void* thread, void** result);
 [[noreturn]] void runtime_thread_exit(void* value);
-int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 }
-
-// The Hunter's Dream backend reads game structures (the player's position for the live map):
-// only from mapped guest memory (bbport).
-namespace BbEngine {
-bool host_read_safe(const void* p, void* out, std::size_t n) {
-    if (!runtime_memory_is_mapped(reinterpret_cast<uintptr_t>(p), n)) {
-        return false;
-    }
-    std::memcpy(out, p, n);
-    return true;
-}
-} // namespace BbEngine
 
 // ---- Kernel ---------------------------------------------------------------------------------
 
@@ -316,10 +304,11 @@ s32 PS4_SYSV_ABI sceUserServiceGetInitialUser(int* user_id) {
 }
 } // namespace Libraries::UserService
 
+extern "C" void runtime_system_event_push(const void* event, uint64_t size);
 namespace Libraries::SystemService {
+// The game takes it with sceSystemServiceReceiveEvent (runtime_services.c), as from the PS4's system.
 void PushSystemServiceEvent(const OrbisSystemServiceEvent& event) {
-    std::printf("Co-op: system service event %#x not delivered (invitations are not ported)\n",
-                unsigned(event.event_type));
+    runtime_system_event_push(&event, sizeof(event));
 }
 } // namespace Libraries::SystemService
 
@@ -384,12 +373,21 @@ void Register() {}
 void Unregister() {}
 } // namespace ImGui::ShadNetNotify
 
+// The PS4 system's invitation notification (bbport_invite.h): joining raises SESSION_INVITATION.
 namespace ImGui::InvitationPrompt {
-void Push(s32, std::string invitation_id, std::string, std::string from_npid) {
-    std::printf("Co-op: invitation %s from %s (invitations are not supported yet)\n",
-                invitation_id.c_str(), from_npid.c_str());
+void Push(s32 user_id, std::string invitation_id, std::string, std::string from_npid) {
+    BbInvite::Show(invitation_id, from_npid, [user_id, invitation_id](bool join) {
+        auto& handler = Libraries::Np::NpHandler::GetInstance();
+        if (join) {
+            handler.AcceptSessionInvitation(user_id, invitation_id);
+        } else {
+            handler.DeclineSessionInvitation(user_id, invitation_id);
+        }
+    });
 }
-void Dismiss(const std::string&) {}
+void Dismiss(const std::string& invitation_id) {
+    BbInvite::Dismiss(invitation_id);
+}
 void Register() {}
 void Unregister() {}
 } // namespace ImGui::InvitationPrompt
@@ -451,28 +449,12 @@ extern "C" void bbnet_configure(const char* app0, const char* serial, const char
 
 namespace Libraries::Np::NpManager { void InitializeRuntime(); }
 extern "C" void bbnet_initialize(void) {
-    if (BbThd::Enabled()) {
-        BbThd::Initialize();
-        return;
-    }
     Libraries::Np::NpManager::InitializeRuntime();
-}
-
-extern "C" void bbnet_set_image(unsigned char* image, uint64_t size) {
-    BbThd::SetImage(image, size);
 }
 
 extern "C" void bbnet_register(void) {
     Core::Loader::SymbolsResolver resolver;
     Core::Loader::SymbolsResolver* sym = &resolver;
-    if (BbThd::Enabled()) {
-        // The Hunter's Dream: its NP and sceNet imports; the game's HTTP stays sceHttp's.
-        BbThd::Register(sym);
-        Libraries::Http::RegisterLib(sym);
-        Libraries::Http2::RegisterLib(sym);
-        Libraries::Ssl2::RegisterLib(sym);
-        return;
-    }
     // The P2P transport's hooks: without them its UDP port was never forwarded by UPnP (a guest
     // could not connect to a host behind a router) and the router's public address went unused.
     Libraries::Net::InstallSystemHooks();

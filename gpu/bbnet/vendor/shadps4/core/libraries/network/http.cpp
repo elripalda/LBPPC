@@ -368,10 +368,6 @@ static const HostOverrideState& GetHostOverrideState() {
     return s;
 }
 
-// bbport: The Hunter's Dream backend (gpu/bbnet/thd).
-extern "C" bool bbthd_enabled();
-extern "C" void bbthd_add_game_headers(std::vector<std::pair<std::string, std::string>>* headers);
-
 bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure) {
     const auto& state = GetHostOverrideState();
     if (state.entries.empty()) {
@@ -425,12 +421,10 @@ bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& 
 
     if (target.port != 0) {
         port = target.port;
-    } else if (!target.scheme.empty() && target.scheme != orig_scheme) {
-        if (orig_scheme == "https" && port == 443) {
-            port = 80;
-        } else if (orig_scheme == "http" && port == 80) {
-            port = 443;
-        }
+    } else if (!target.scheme.empty()) {
+        // lbppc: "https://host" is that scheme's own port, as documented above. Keeping the game's (LBP3's server
+        // is ...scee.com:10061) sent https://play.lbppc.com:10061, where a server behind a proxy does not listen.
+        port = target.scheme == "https" ? 443 : 80;
     }
 
     LOG_INFO(Lib_Http, "host override active: {}://{}:{} -> {}://{}:{} (matched key '{}')",
@@ -996,6 +990,12 @@ static s32 RunRealHttpRequest(const SendRequestPlan& plan_in, HttpResponse& out_
 
         httplib::Headers headers;
         for (const auto& [k, v] : plan.headers) {
+            // lbppc: cpp-httplib sends the Host of the server it connects to. The game's own is its original server's
+            // (littlebigplanetps3.online.scee.com:10061), and a reverse proxy that picks the site by Host dropped the
+            // connection with no reply.
+            if (HeaderNameMatches(k, "Host")) {
+                continue;
+            }
             headers.emplace(k, v);
         }
         if (plan.settings.accept_encoding_gzip && !game_set_accept_encoding) {
@@ -1904,10 +1904,6 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             plan.headers.emplace_back("User-Agent", !tmpl_user_agent.empty()
                                                         ? tmpl_user_agent
                                                         : BuildLibhttpUserAgent(""));
-        }
-        // bbport: The Hunter's Dream binds the game's requests to the account and its ruleset.
-        if (bbthd_enabled()) {
-            bbthd_add_game_headers(&plan.headers);
         }
         // Pull Content-Type out of headers
         for (const auto& [k, v] : plan.headers) {

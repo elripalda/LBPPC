@@ -1,0 +1,5 @@
+{
+  "Version": 1,
+  "ConnectionString": "Database=refresh;Username=refresh;Password=CHANGE_ME;Host=127.0.0.1;Port=5432",
+  "PreferConnectionStringEnvironmentVariable": true
+}
