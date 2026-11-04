@@ -19,6 +19,9 @@ typedef enum {
     OUT_AXIS_LEFT_X, OUT_AXIS_LEFT_Y, OUT_AXIS_RIGHT_X, OUT_AXIS_RIGHT_Y,
     OUT_LEFTJOYSTICK_HALFMODE, OUT_RIGHTJOYSTICK_HALFMODE,
     OUT_HOTKEY_MOUSE_TOGGLE, OUT_HOTKEY_RELOAD,
+    /* Virtual tilt (runtime_motion.h), for pads without motion sensors: keys give a full tilt,
+     * half sticks a proportional one. Forward lowers the pad's front edge, back raises it. */
+    OUT_TILT_LEFT, OUT_TILT_RIGHT, OUT_TILT_FORWARD, OUT_TILT_BACK,
     OUT_COUNT,
 } InputOutput;
 
@@ -70,17 +73,10 @@ typedef struct {
 
 typedef struct {
     float deadzone_offset, speed, speed_offset; /* mouse_movement_params; shadPS4 defaults 0.5,1,0.125 */
-    int stick; /* 0=none, 1=left, 2=right; mouse_to_joystick */
-    int camera_direct;        /* mouse_camera = direct (1) | stick (0, default) */
-    float camera_sensitivity; /* mouse_camera_sensitivity; 1.0 default */
-    /* Both camera modes, applied to the mouse motion itself: */
+    int stick; /* 0=none, 1=left, 2=right, 3=touchpad (runtime_mouse_touch.h); mouse_to_joystick */
+    /* Applied to the mouse motion itself: */
     int invert_x, invert_y;   /* mouse_invert_x / mouse_invert_y = on | off (default) */
     float sensitivity_y;      /* mouse_sensitivity_y: vertical as a multiple of horizontal, 1.0 */
-    int camera_sync;          /* mouse_camera_sync = on (default) | off: the direct camera turns
-                               * its drawn position too, so a turn is not eased in by a spring */
-    int lock_switch;          /* mouse_lock_switch = mouse counts that switch the lock-on target
-                               * (direct camera, runtime_pad.c lock_switch_flick); 0 = the
-                               * mouse drives the stick while locked on, as in stick mode */
 } MouseParams;
 
 /* The mouse motion's multipliers from MouseParams: -1 for an inverted axis, the vertical one
@@ -130,11 +126,5 @@ const char *input_config_default_text(void);
  * and fills *out on a match (case-insensitive), 0 otherwise. */
 int input_output_from_name(const char *name, InputOutput *out);
 const char *input_output_name(InputOutput out);
-/* A keyboard or mouse binding as input.ini names it, a combination joined with '+'
- * ("lshift+leftbutton"); 0 for a controller binding or a name that does not fit `size`. */
-int input_binding_keyboard_text(const InputBinding *b, char *out, size_t size);
-/* The input.ini name of a single controller button or trigger binding ("circle", "l2"), else
- * NULL (a key, a stick, a combination). */
-const char *input_binding_controller_name(const InputBinding *b);
 
 #endif

@@ -10,11 +10,15 @@
  *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
  *   E Square, V Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, Q/C R3,
  *   Enter Options, Tab left touchpad, Backspace right touchpad,
- *   IJKL d-pad (I up, K down, J left, L right). */
+ *   IJKL d-pad (I up, K down, J left, L right), numpad 4/6/8/2 tilt the pad (runtime_motion.h).
+ * Motion comes from the controller's gyro and accelerometer where it has them (PC-03); the mouse
+ * can be the touchpad for touch Create Mode (mouse_to_joystick = touchpad, runtime_mouse_touch.h). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #include "runtime_input_config.h"
+#include "runtime_motion.h"
+#include "runtime_mouse_touch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,13 +69,14 @@ _Static_assert(sizeof(ControllerInfo)==28,"OrbisPadControllerInformation layout"
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
+static MotionState motion;     /* the pad data's orientation, acceleration and angular velocity */
+static int motion_sensors;     /* the current gamepad's gyro and accelerometer are on */
+static uint64_t motion_last_us;
+static float injected_tilt[2]; /* BB_PAD_FILE tilt=roll,pitch */
 static size_t reads;
 static uint8_t connected_count;
 static uint64_t last_mouse_sample_us; /* CNV-003: dt since the previous mouse-to-stick sample */
 static double smoothed_mouse_stick_x, smoothed_mouse_stick_y; /* mouse_to_axis's EMA state */
-static double lock_switch_x, lock_switch_y;  /* lock_switch_flick: motion gathered while locked on */
-static int lock_flick_x, lock_flick_y;       /* the flick being sent */
-static uint64_t lock_flick_until_us, lock_flick_ready_us;
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
@@ -94,7 +99,18 @@ static SDL_Gamepad *current_gamepad(void) {
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
         if (ids && count>0) {
             gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+            if (gamepad) {
+                ++connected_count;
+                /* PC-03: the gyro and accelerometer, where the pad has them (DualShock 4, DualSense,
+                 * Switch Pro, ...), feed the pad data's motion fields (runtime_motion.c). */
+                motion_sensors=SDL_GamepadHasSensor(gamepad,SDL_SENSOR_ACCEL) &&
+                               SDL_GamepadHasSensor(gamepad,SDL_SENSOR_GYRO) &&
+                               SDL_SetGamepadSensorEnabled(gamepad,SDL_SENSOR_ACCEL,true) &&
+                               SDL_SetGamepadSensorEnabled(gamepad,SDL_SENSOR_GYRO,true);
+                motion_reset(&motion);
+                printf("Runtime: gamepad connected: %s (motion sensors: %s)\n",SDL_GetGamepadName(gamepad),
+                       motion_sensors ? "yes" : "none; tilt_* bindings in input.ini tilt it instead");
+            }
         }
         SDL_free(ids);
     }
@@ -473,33 +489,6 @@ static void mouse_to_axis(float dx, float dy, double dt_ms, const MouseParams *m
     *out_y=y<-127?-127:y>127?127:y;
 }
 
-/* Lock-on target switching with the direct mouse camera, as in Dark Souls III on PC: while
- * locked on, the game turns the camera and the right stick only switches targets, with a flick.
- * Mouse motion through mouse_to_axis gave a flick only for very fast swipes (a normal move stays
- * well inside the game's threshold, and the output lerp softens it further), so moving the mouse
- * did not switch. Here motion is gathered (fading over ~150 ms, so slow drift does not add up),
- * and once it passes mouse_lock_switch counts the stick is pushed fully that way for 100 ms, then
- * left neutral for 250 ms so the game sees each flick on its own. Returns 1 while it sends one. */
-static int lock_switch_flick(float dx, float dy, double dt_ms, int threshold, int *out_x, int *out_y) {
-    const uint64_t now=now_us();
-    const double fade=exp(-dt_ms/150.0);
-    lock_switch_x=lock_switch_x*fade+dx;
-    lock_switch_y=lock_switch_y*fade+dy;
-    if (now>=lock_flick_ready_us && (fabs(lock_switch_x)>=threshold || fabs(lock_switch_y)>=threshold)) {
-        const int horizontal=fabs(lock_switch_x)>=fabs(lock_switch_y);
-        lock_flick_x=horizontal ? (lock_switch_x<0 ? -127 : 127) : 0;
-        lock_flick_y=horizontal ? 0 : (lock_switch_y<0 ? -127 : 127);
-        printf("Mouse: lock-on switch %s\n",lock_flick_x<0 ? "left" : lock_flick_x>0 ? "right" : lock_flick_y<0 ? "up" : "down");
-        lock_flick_until_us=now+100000;
-        lock_flick_ready_us=now+350000;
-        lock_switch_x=lock_switch_y=0.0;
-    }
-    if (now<lock_flick_until_us) { *out_x=lock_flick_x; *out_y=lock_flick_y; return 1; }
-    if (now<lock_flick_ready_us) lock_switch_x=lock_switch_y=0.0; /* no motion saved up meanwhile */
-    *out_x=*out_y=0;
-    return 0;
-}
-
 /* GUD-002: the loaded config is immutable once published; a reload (F8) builds a whole new one
  * off the pad lock (I/O stays off the hot path) and only the pointer swap happens under `lock`,
  * which already serializes every call into this file through pad_read_state. */
@@ -507,57 +496,6 @@ static InputConfig default_config;
 static InputConfig *loaded_config; /* NULL until pad_open's first load; falls back to defaults */
 static int config_initialized;
 
-/* Button prompts (gpu/shim/bbport_prompts.cpp): the actions each of the game's key-guide icons
- * stands for, in bbport_prompt_icons.h's order. Each icon is named after its role and shows a
- * button (KG_OK shows Circle): the keyboard icon is that button's key. */
-#define PROMPT_ICONS 20
-static const InputOutput prompt_outputs[PROMPT_ICONS][4]={
-    {OUT_CROSS}, {OUT_L1}, {OUT_L2}, {OUT_L3},
-    {OUT_AXIS_LEFT_Y_MINUS,OUT_AXIS_LEFT_X_MINUS,OUT_AXIS_LEFT_Y_PLUS,OUT_AXIS_LEFT_X_PLUS}, /* LS: WASD */
-    {OUT_PAD_DOWN}, {OUT_PAD_LEFT,OUT_PAD_RIGHT}, {OUT_PAD_UP}, {OUT_PAD_UP,OUT_PAD_DOWN},
-    {OUT_PAD_UP,OUT_PAD_DOWN,OUT_PAD_LEFT,OUT_PAD_RIGHT},
-    {OUT_CIRCLE}, {OUT_R1}, {OUT_R2}, {OUT_R3},
-    {OUT_AXIS_RIGHT_Y_MINUS,OUT_AXIS_RIGHT_X_MINUS,OUT_AXIS_RIGHT_Y_PLUS,OUT_AXIS_RIGHT_X_PLUS}, /* RS */
-    {OUT_SQUARE}, {OUT_TRIANGLE}, {OUT_OPTIONS}, {OUT_TOUCHPAD_LEFT}, {OUT_TOUCHPAD_RIGHT},
-};
-static const int prompt_output_count[PROMPT_ICONS]={1,1,1,1,4,1,2,1,2,4,1,1,1,1,4,1,1,1,1,1};
-/* What the icons show on keyboard and mouse: each action's first keyboard or mouse binding, and
- * "mouse" for a stick the mouse drives. */
-static void configure_prompts(const InputConfig *cfg) {
-    static char text[PROMPT_ICONS][128];
-    const char *list[PROMPT_ICONS];
-    for (int icon=0;icon<PROMPT_ICONS;++icon) {
-        size_t used=0;
-        text[icon][0]=0;
-        const int stick=icon==4 ? 1 : icon==14 ? 2 : 0;
-        if (stick && cfg->mouse.stick==stick) snprintf(text[icon],sizeof(text[icon]),"mouse");
-        else for (int k=0;k<prompt_output_count[icon];++k) {
-            const InputOutput out=prompt_outputs[icon][k];
-            for (int i=0;i<cfg->table.binding_count[out];++i) {
-                char one[64];
-                if (!input_binding_keyboard_text(&cfg->table.bindings[out][i],one,sizeof(one))) continue;
-                int n=snprintf(text[icon]+used,sizeof(text[icon])-used,"%s%s",used ? " " : "",one);
-                if (n>0 && (size_t)n<sizeof(text[icon])-used) used+=(size_t)n;
-                break;
-            }
-        }
-        list[icon]=text[icon];
-    }
-    bbgpu_prompts_configure(list,PROMPT_ICONS);
-    /* On a controller: the button each one-action icon's action is bound to ("" for none), so
-     * a rebound action shows its new button. */
-    const char *pad[PROMPT_ICONS];
-    for (int icon=0;icon<PROMPT_ICONS;++icon) {
-        pad[icon]="";
-        if (prompt_output_count[icon]!=1) continue;
-        const InputOutput out=prompt_outputs[icon][0];
-        for (int i=0;i<cfg->table.binding_count[out];++i) {
-            const char *name=input_binding_controller_name(&cfg->table.bindings[out][i]);
-            if (name) { pad[icon]=name; break; }
-        }
-    }
-    bbgpu_prompts_configure_pad(pad,PROMPT_ICONS);
-}
 static void ensure_config_loaded(void) {
     if (config_initialized) return;
     config_initialized=1;
@@ -575,10 +513,6 @@ static void ensure_config_loaded(void) {
     bbgpu_input_configure(loaded_config ? loaded_config->mouse.stick!=0 : 0,
                           loaded_config ? loaded_config->toggle_scancode : default_config.toggle_scancode,
                           loaded_config ? loaded_config->reload_scancode : default_config.reload_scancode);
-    const MouseParams *mouse=loaded_config ? &loaded_config->mouse : &default_config.mouse;
-    configure_prompts(loaded_config ? loaded_config : &default_config);
-    bbgpu_mouse_camera_configure(loaded_config ? mouse->camera_direct : 0,mouse->camera_sensitivity,
-                                 input_mouse_scale_x(mouse),input_mouse_scale_y(mouse),mouse->camera_sync);
 }
 /* CFG-008: called once per sample() (under `lock`), reloads if the window thread set the F8
  * flag. The read of the new file (input_config_load, I/O) happens before the critical section
@@ -597,10 +531,6 @@ static void reload_config_if_requested(void) {
         if (fresh->warnings) printf("Input config: %s reloaded, %u line(s) ignored (see above)\n",path,fresh->warnings);
         else printf("Input config: %s reloaded\n",path);
         bbgpu_input_configure(loaded_config->mouse.stick!=0,loaded_config->toggle_scancode,loaded_config->reload_scancode);
-        const MouseParams *mouse=&loaded_config->mouse;
-        configure_prompts(loaded_config);
-        bbgpu_mouse_camera_configure(mouse->camera_direct,mouse->camera_sensitivity,
-                                     input_mouse_scale_x(mouse),input_mouse_scale_y(mouse),mouse->camera_sync);
     } else {
         free(fresh);
     }
@@ -617,6 +547,7 @@ static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
     d->orientation[3]=1.0f;
+    d->acceleration[1]=1.0f; /* held level and still: 1 G up */
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
@@ -627,8 +558,11 @@ static void sample_host(PadData *d) {
     const InputConfig *cfg=active_config();
     BbMouseInput mouse; bbgpu_mouse_take(&mouse); /* MOU-008: drains dx/dy; buttons/wheel persist */
     static HostState host; /* ~1 KB with the held-combo list: kept off the game thread's stack */
+    /* Mouse as the touchpad: its left button and wheel are the touchpad's, not their bindings'. */
+    const int touch_mouse=mouse.captured && cfg->mouse.stick==3;
     host=(HostState){SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL, g,
-        mouse.captured ? mouse.buttons : 0, mouse.captured ? mouse.wheel : 0, 0, 0, {0}, 0};
+        mouse.captured ? mouse.buttons & (touch_mouse ? ~SDL_BUTTON_LMASK : ~0u) : 0,
+        mouse.captured && !touch_mouse ? mouse.wheel : 0, 0, 0, {0}, 0};
     host.back_combo=back_combo_wanted(g,cfg);
     host.back_down=host.back_combo && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK);
     find_held_combos(&host,cfg);
@@ -682,7 +616,7 @@ static void sample_host(PadData *d) {
      * before it -- mouse_to_axis's own output-value lerp already keeps small/slow motion from
      * producing a jumpy or oversized contribution (see its doc comment), so running the result
      * through apply_deadzone too would just chop off the small end of an already-smooth curve. */
-    if (mouse.captured && cfg->mouse.stick) {
+    if (mouse.captured && (cfg->mouse.stick==1 || cfg->mouse.stick==2)) {
         uint64_t now=now_us();
         double dt_ms=last_mouse_sample_us ? (double)(now-last_mouse_sample_us)/1000.0 : 33.0;
         if (dt_ms<1.0) dt_ms=1.0;
@@ -690,32 +624,15 @@ static void sample_host(PadData *d) {
         last_mouse_sample_us=now;
         const float sx=mouse.dx*input_mouse_scale_x(&cfg->mouse), sy=mouse.dy*input_mouse_scale_y(&cfg->mouse);
         int mx=0, my=0;
-        static int was_locked=-1;
-        static double locked_motion;
-        if (mouse.locked_on!=was_locked) {
-            if (was_locked>=0 && mouse.locked_on) printf("Mouse: lock-on seen: mouse motion switches targets\n");
-            else if (was_locked>=0) printf("Mouse: lock-on ended (%.0f counts of mouse motion meanwhile)\n",locked_motion);
-            was_locked=mouse.locked_on;
-            locked_motion=0.0;
-        }
-        if (mouse.locked_on) locked_motion+=fabs(mouse.dx)+fabs(mouse.dy);
-        if (mouse.locked_on && cfg->mouse.lock_switch>0) {
-            /* The right stick switches targets; the stick's smoothing starts fresh afterwards. */
-            smoothed_mouse_stick_x=smoothed_mouse_stick_y=0.0;
-            if (lock_switch_flick(sx,sy,dt_ms,cfg->mouse.lock_switch,&mx,&my)) { rx=mx; ry=my; }
-        } else {
-            lock_switch_x=lock_switch_y=0.0;
-            mouse_to_axis(sx,sy,dt_ms,&cfg->mouse,&mx,&my);
-            int *tx=cfg->mouse.stick==1 ? &lx : &rx, *ty=cfg->mouse.stick==1 ? &ly : &ry;
-            *tx+=mx; *ty+=my;
-            *tx=*tx<-127?-127:*tx>127?127:*tx; *ty=*ty<-127?-127:*ty>127?127:*ty;
-        }
+        mouse_to_axis(sx,sy,dt_ms,&cfg->mouse,&mx,&my);
+        int *tx=cfg->mouse.stick==1 ? &lx : &rx, *ty=cfg->mouse.stick==1 ? &ly : &ry;
+        *tx+=mx; *ty+=my;
+        *tx=*tx<-127?-127:*tx>127?127:*tx; *ty=*ty<-127?-127:*ty>127?127:*ty;
     } else {
         /* MOU-005/CNV-002: no stale dt or velocity-filter memory survives a capture gap -- the
          * next capture must start the EMA fresh, not carry over speed from before the gap. */
         last_mouse_sample_us=0;
         smoothed_mouse_stick_x=smoothed_mouse_stick_y=0.0;
-        lock_switch_x=lock_switch_y=0.0;
     }
 
     if (button_output_held(&host,cfg,OUT_LEFTJOYSTICK_HALFMODE)) { lx/=2; ly/=2; }
@@ -747,14 +664,55 @@ static void sample_host(PadData *d) {
     if (button_output_held(&host,cfg,OUT_TOUCHPAD_LEFT)) touch_click(d,0);
     if (button_output_held(&host,cfg,OUT_TOUCHPAD_RIGHT)) touch_click(d,1);
     if (button_output_held(&host,cfg,OUT_TOUCHPAD_CENTER)) { d->buttons|=BTN_TOUCHPAD; d->touch_count=1; d->touches[0]=(PadTouch){.x=960,.y=471,.id=0}; }
+
+    /* PC-02A: the mouse as a finger on the touchpad (runtime_mouse_touch.h), when no real finger is. */
+    static MouseTouch mouse_touch;
+    static uint32_t last_wheel;
+    if (touch_mouse) {
+        /* The wheel bits are pulses: a step is a pulse starting. */
+        const uint32_t started=mouse.wheel & ~last_wheel;
+        const int steps=((started & 1u) ? 1 : 0)-((started & 2u) ? 1 : 0);
+        last_wheel=mouse.wheel;
+        const int ctrl=host.keys && (host.keys[SDL_SCANCODE_LCTRL] || host.keys[SDL_SCANCODE_RCTRL]);
+        MouseTouchOut touch;
+        mouse_touch_update(&mouse_touch,mouse.dx*input_mouse_scale_x(&cfg->mouse),mouse.dy*input_mouse_scale_y(&cfg->mouse),
+                           MOUSE_TOUCH_SCALE*cfg->mouse.speed,(mouse.buttons & SDL_BUTTON_LMASK)!=0,steps,ctrl,
+                           d->timestamp,&touch);
+        if (!d->touch_count) {
+            d->touch_count=(uint8_t)touch.count;
+            for (int i=0;i<touch.count;++i) d->touches[i]=(PadTouch){.x=touch.x[i],.y=touch.y[i],.id=0};
+        }
+        if (touch.click) d->buttons|=BTN_TOUCHPAD;
+    } else {
+        mouse_touch_reset(&mouse_touch);
+        last_wheel=0;
+    }
+
+    /* PC-03: motion. The sensors, then the virtual tilt (tilt_* bindings, or BB_PAD_FILE's
+     * tilt=), which replaces their roll and pitch while away from level. */
+    const float dt=motion_last_us ? (float)(d->timestamp-motion_last_us)*1e-6f : 0.0f;
+    motion_last_us=d->timestamp;
+    if (g && motion_sensors) {
+        float accel[3], gyro[3];
+        if (SDL_GetGamepadSensorData(g,SDL_SENSOR_ACCEL,accel,3) && SDL_GetGamepadSensorData(g,SDL_SENSOR_GYRO,gyro,3))
+            motion_sensor_sample(&motion,accel,gyro,dt);
+    }
+    const float roll=(axis_output_value(&host,cfg,OUT_TILT_RIGHT,1)-axis_output_value(&host,cfg,OUT_TILT_LEFT,1))/127.0f
+                     +injected_tilt[0];
+    const float pitch=(axis_output_value(&host,cfg,OUT_TILT_BACK,1)-axis_output_value(&host,cfg,OUT_TILT_FORWARD,1))/127.0f
+                      +injected_tilt[1];
+    motion_virtual_tilt(&motion,roll,pitch,dt);
+    motion_fill(&motion,d->orientation,d->acceleration,d->angular_velocity);
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
  * tokens, re-read when it changes: button names (cross circle square triangle l1 r1 l2 r2 l3 r3
  * options touchpad touchpad_left touchpad_right up down left right) are held while listed;
  * touchpad defaults to a left-side click; lx= ly= rx= ry= (0..255) override
- * the sticks. An empty file releases everything. */
-static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-1,-1,-1,-1},-1};
+ * the sticks; tilt=roll,pitch (each -1..1) tilts the pad like the tilt_* bindings; finger=x,y
+ * holds a finger on the touchpad there (0..1919, 0..942; with touchpad, pushed in there). An
+ * empty file releases everything. */
+static struct { uint32_t buttons; int stick[4]; int touch_side; int finger[2]; } injected={0,{-1,-1,-1,-1},-1,{-1,-1}};
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
@@ -786,6 +744,8 @@ static void read_inject(void) {
     injected.buttons=0;
     injected.touch_side=-1;
     for (int i=0;i<4;++i) injected.stick[i]=-1;
+    injected_tilt[0]=injected_tilt[1]=0.0f;
+    injected.finger[0]=injected.finger[1]=-1;
     char token[64];
     while (fscanf(f,"%63s",token)==1) {
         if (!strcmp(token,"replay") && replay_armed!=1) { replay_armed=1; replay_start=0; } /* BB_PAD_REPLAY */
@@ -795,10 +755,12 @@ static void read_inject(void) {
         }
         for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) if (!strcmp(token,names[i].name)) injected.buttons|=names[i].ps;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
+        if (!strncmp(token,"tilt=",5)) sscanf(token+5,"%f,%f",&injected_tilt[0],&injected_tilt[1]);
+        if (!strncmp(token,"finger=",7)) sscanf(token+7,"%d,%d",&injected.finger[0],&injected.finger[1]);
     }
     fclose(f);
-    printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
-           injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
+    printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d tilt %.2f %.2f\n",injected.buttons,
+           injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3],injected_tilt[0],injected_tilt[1]);
 }
 /* BB_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
  * the time since F9; BB_PAD_REPLAY=<file> plays such a recording back, started by the token
@@ -900,7 +862,11 @@ static void sample(PadData *d) {
     read_inject();
     replay_sample(d);
     d->buttons|=injected.buttons;
-    if (injected.touch_side>=0) touch_click(d,injected.touch_side);
+    if (injected.finger[0]>=0) {
+        d->touch_count=1;
+        d->touches[0]=(PadTouch){.x=(uint16_t)(injected.finger[0]>1919 ? 1919 : injected.finger[0]),
+                                 .y=(uint16_t)(injected.finger[1]<0 ? 0 : injected.finger[1]>942 ? 942 : injected.finger[1])};
+    } else if (injected.touch_side>=0) touch_click(d,injected.touch_side);
     else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
     if (injected.buttons & BTN_L2) d->l2=255;
     if (injected.buttons & BTN_R2) d->r2=255;

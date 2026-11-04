@@ -120,6 +120,7 @@ static const NameValue kOutputNames[] = {
     {"axis_right_x",OUT_AXIS_RIGHT_X},{"axis_right_y",OUT_AXIS_RIGHT_Y},
     {"leftjoystick_halfmode",OUT_LEFTJOYSTICK_HALFMODE},{"rightjoystick_halfmode",OUT_RIGHTJOYSTICK_HALFMODE},
     {"hotkey_toggle_mouse_to_joystick",OUT_HOTKEY_MOUSE_TOGGLE},{"hotkey_reload_inputs",OUT_HOTKEY_RELOAD},
+    {"tilt_left",OUT_TILT_LEFT},{"tilt_right",OUT_TILT_RIGHT},{"tilt_forward",OUT_TILT_FORWARD},{"tilt_back",OUT_TILT_BACK},
 };
 
 /* ---- Small string helpers ------------------------------------------------------------ */
@@ -159,46 +160,6 @@ const char *input_output_name(InputOutput out) {
     for (size_t i = 0; i < sizeof(kOutputNames)/sizeof(*kOutputNames); ++i)
         if ((InputOutput)kOutputNames[i].value == out) return kOutputNames[i].name;
     return "?";
-}
-
-/* The input.ini name of one keyboard or mouse input, or NULL for anything else. */
-static const char *KeyboardInputName(InputKind kind, int32_t value) {
-    if (kind == IN_KEY) {
-        for (size_t i = 0; i < sizeof(kKeyNames)/sizeof(*kKeyNames); ++i)
-            if ((int32_t)SDL_GetScancodeFromKey((SDL_Keycode)kKeyNames[i].value, NULL) == value) return kKeyNames[i].name;
-        return NULL;
-    }
-    const NameValue *table = kind == IN_MOUSE_BUTTON ? kMouseButtonNames : kind == IN_MOUSE_WHEEL ? kMouseWheelNames : NULL;
-    size_t count = kind == IN_MOUSE_BUTTON ? sizeof(kMouseButtonNames)/sizeof(*kMouseButtonNames)
-                                           : sizeof(kMouseWheelNames)/sizeof(*kMouseWheelNames);
-    for (size_t i = 0; table && i < count; ++i)
-        if (table[i].value == value) return table[i].name;
-    return NULL;
-}
-
-int input_binding_keyboard_text(const InputBinding *b, char *out, size_t size) {
-    const char *names[INPUT_MAX_COMBO];
-    if (!(names[0] = KeyboardInputName(b->kind, b->value))) return 0;
-    for (uint8_t i = 0; i < b->extra_count; ++i)
-        if (!(names[i + 1] = KeyboardInputName(b->extra[i].kind, b->extra[i].value))) return 0;
-    size_t used = 0;
-    for (int i = 0; i <= b->extra_count; ++i) {
-        int n = snprintf(out + used, size - used, "%s%s", i ? "+" : "", names[i]);
-        if (n < 0 || (size_t)n >= size - used) return 0;
-        used += (size_t)n;
-    }
-    return 1;
-}
-
-const char *input_binding_controller_name(const InputBinding *b) {
-    if (b->extra_count) return NULL;
-    if (b->kind == IN_CBUTTON) {
-        for (size_t i = 0; i < sizeof(kCButtonNames) / sizeof(kCButtonNames[0]); ++i)
-            if (kCButtonNames[i].value == b->value) return kCButtonNames[i].name;
-    }
-    if (b->kind == IN_AXIS && b->value == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) return "l2";
-    if (b->kind == IN_AXIS && b->value == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) return "r2";
-    return NULL;
 }
 
 /* ---- Binding resolution for one input token ------------------------------------------ */
@@ -315,31 +276,16 @@ static void ParseMouseMovementParams(InputConfig *cfg, char *value) {
     cfg->mouse.speed_offset = offset;
 }
 
-/* mouse_to_joystick = left|right (section 4.2, MOU-001). */
+/* mouse_to_joystick = left|right (section 4.2, MOU-001), or touchpad: the mouse as a finger on
+ * the touchpad, for LBP3's touch Create Mode (runtime_mouse_touch.h). */
 static void ParseMouseToJoystick(InputConfig *cfg, const char *value) {
     if (EqualsCaseInsensitive(value, "left")) cfg->mouse.stick = 1;
     else if (EqualsCaseInsensitive(value, "right")) cfg->mouse.stick = 2;
+    else if (EqualsCaseInsensitive(value, "touchpad")) cfg->mouse.stick = 3;
     else ++cfg->warnings;
 }
 
-/* mouse_camera = direct|stick: direct writes the game's camera angles from mouse motion
- * (gpu/shim/bloodborne_cam.cpp, game 1.09), stick keeps the mouse-to-joystick emulation.
- * Direct still needs mouse_to_joystick (it is the stick used while locked on). */
-static void ParseMouseCamera(InputConfig *cfg, const char *value) {
-    if (EqualsCaseInsensitive(value, "direct")) cfg->mouse.camera_direct = 1;
-    else if (EqualsCaseInsensitive(value, "stick")) cfg->mouse.camera_direct = 0;
-    else ++cfg->warnings;
-}
-
-/* mouse_camera_sensitivity = multiplier for the direct camera (1.0 = 900 counts per radian). */
-static void ParseMouseCameraSensitivity(InputConfig *cfg, const char *value) {
-    int ok;
-    float v = ParseFloatStrict(value, &ok);
-    if (!ok || v < 0.05f || v > 20.0f) { ++cfg->warnings; return; }
-    cfg->mouse.camera_sensitivity = v;
-}
-
-/* on|off for the yes/no settings (mouse_invert_x, mouse_invert_y, mouse_camera_sync). */
+/* on|off for the yes/no settings (mouse_invert_x, mouse_invert_y). */
 static void ParseOnOff(InputConfig *cfg, const char *value, int *out) {
     if (EqualsCaseInsensitive(value, "on")) *out = 1;
     else if (EqualsCaseInsensitive(value, "off")) *out = 0;
@@ -352,14 +298,6 @@ static void ParseMouseSensitivityY(InputConfig *cfg, const char *value) {
     float v = ParseFloatStrict(value, &ok);
     if (!ok || v < 0.1f || v > 10.0f) { ++cfg->warnings; return; }
     cfg->mouse.sensitivity_y = v;
-}
-
-/* mouse_lock_switch = 0..2000: mouse counts that switch the lock-on target (0 = off). */
-static void ParseMouseLockSwitch(InputConfig *cfg, const char *value) {
-    int ok;
-    float v = ParseFloatStrict(value, &ok);
-    if (!ok || v < 0.0f || v > 2000.0f) { ++cfg->warnings; return; }
-    cfg->mouse.lock_switch = (int)v;
 }
 
 /* stick_socd = last|neutral: what two opposite directions held together give (runtime_pad.c,
@@ -458,34 +396,14 @@ static void ParseLine(ParseState *state, char *line) {
         ParseAnalogDeadzone(cfg, input_raw);
         return;
     }
-    if (EqualsCaseInsensitive(output_raw, "mouse_camera")) {
-        if (!state->hotkeys_pass) return;
-        ParseMouseCamera(cfg, input_raw);
-        return;
-    }
-    if (EqualsCaseInsensitive(output_raw, "mouse_camera_sensitivity")) {
-        if (!state->hotkeys_pass) return;
-        ParseMouseCameraSensitivity(cfg, input_raw);
-        return;
-    }
     if (EqualsCaseInsensitive(output_raw, "mouse_invert_x") || EqualsCaseInsensitive(output_raw, "mouse_invert_y")) {
         if (!state->hotkeys_pass) return;
         ParseOnOff(cfg, input_raw, EqualsCaseInsensitive(output_raw, "mouse_invert_x") ? &cfg->mouse.invert_x : &cfg->mouse.invert_y);
         return;
     }
-    if (EqualsCaseInsensitive(output_raw, "mouse_camera_sync")) {
-        if (!state->hotkeys_pass) return;
-        ParseOnOff(cfg, input_raw, &cfg->mouse.camera_sync);
-        return;
-    }
     if (EqualsCaseInsensitive(output_raw, "mouse_sensitivity_y")) {
         if (!state->hotkeys_pass) return;
         ParseMouseSensitivityY(cfg, input_raw);
-        return;
-    }
-    if (EqualsCaseInsensitive(output_raw, "mouse_lock_switch")) {
-        if (!state->hotkeys_pass) return;
-        ParseMouseLockSwitch(cfg, input_raw);
         return;
     }
     if (EqualsCaseInsensitive(output_raw, "stick_socd")) {
@@ -601,11 +519,7 @@ void input_config_parse(InputConfig *out, const char *text) {
     out->mouse.speed = 1.0f;
     out->mouse.speed_offset = 0.125f;
     out->mouse.stick = 0;
-    out->mouse.camera_direct = 0;
-    out->mouse.camera_sensitivity = 1.0f;
     out->mouse.sensitivity_y = 1.0f;
-    out->mouse.camera_sync = 1;
-    out->mouse.lock_switch = 60;
     for (int i = 0; i < DEADZONE_COUNT; ++i) { out->deadzone[i].inner = 1; out->deadzone[i].outer = 127; }
     out->stick_socd_last = 1;
     /* Defaults that keep a keyboard sprint through direction changes (cassioKenji, PR #74). */
@@ -665,6 +579,12 @@ void input_config_defaults(InputConfig *out) {
 "axis_right_x_plus = right\n" \
 "axis_right_y_minus = up\n" \
 "axis_right_y_plus = down\n" \
+"\n" \
+"# Tilt the pad (Sackboy's head, tilt sensors) without a motion-sensing controller\n" \
+"tilt_left = kp4\n" \
+"tilt_right = kp6\n" \
+"tilt_forward = kp8\n" \
+"tilt_back = kp2\n" \
 "\n"
 
 #define DEFAULT_HALFMODE \
@@ -675,6 +595,9 @@ void input_config_defaults(InputConfig *out) {
 #define DEFAULT_MOUSE \
 "# Mouse (uncomment mouse_to_joystick to turn it on; buttons work only while captured)\n" \
 "# mouse_to_joystick = right\n" \
+"# Or the mouse as the touchpad, for touch Create Mode: move = finger, left button = press,\n" \
+"# wheel = spread/pinch (size), ctrl + wheel = twist (rotate)\n" \
+"# mouse_to_joystick = touchpad\n" \
 "mouse_movement_params = 0.5, 1, 0.125\n"
 
 #define DEFAULT_MOUSE_BUTTONS \
