@@ -1,13 +1,11 @@
-# bbport on Windows
+# LBPPC on Windows
 
-The port builds and runs natively on 64-bit Windows 10 (1903+) / 11 with the same sources as
-on Linux. Players: see `README-Windows.txt` (it ships in the package).
+The port builds and runs natively on 64-bit Windows 10 (1903+) / 11.
 
 ## Build
 
 Install [MSYS2](https://www.msys2.org) (`winget install MSYS2.MSYS2`), open the
-**MSYS2 CLANG64** shell and install the toolchain and libraries (the counterpart of
-`shell.nix`):
+**MSYS2 CLANG64** shell and install the toolchain and libraries:
 
 ```bash
 pacman -S --needed git patch \
@@ -24,60 +22,20 @@ Then, in the repository:
 ```bash
 git submodule update --init --recursive
 bash build.sh                      # out/bb-probe.exe, out/bb-gpu-capabilities.exe
-BB_GAME_DIR=F:/path/to/CUSA03173 python run.py
-python launcher/bbport_launcher_win.py
-bash packaging/windows/package.sh  # dist/bbport-windows/ and .zip: Bloodborne.exe + DLLs
+python run.py F:/path/to/CUSA00473 # the game, without the launcher
+python launcher/lbppc_launcher.py  # the launcher
+bash packaging/windows/package.sh  # dist/LBPPC-<version>-windows.zip
 ```
 
-For build/CI checks, `bash packaging/windows/package.sh --zip-only` creates the
-ZIP from fresh staging files and leaves an existing playable
-`dist/bbport-windows/` copy untouched.
-Both modes also write `dist/fsr4vk-v0.4.3-amdfix-src.zip`. Publish this
-corresponding-source archive alongside `dist/bbport-windows.zip`.
+From a source tree `run.py` adds `C:\msys64\clang64\bin` to `PATH` for the DLLs. The package
+freezes the launcher with PyInstaller (a private venv in `out/pyenv`, from a python.org Python)
+into `LBPPC.exe`, which also runs `run.py` and the preparation scripts (`--script`): players need
+no Python.
 
-`run.py` is the Windows `run.sh` (same variables; works from a plain Windows Python too).
-The FSR 4.1 integration initializes installed-driver discovery for the GUI,
-`--run` and direct `run.py` starts; see [FSR 4.1 on Windows](../../docs/FSR41_WINDOWS.md).
-The package freezes the launcher with PyInstaller (a private venv in `out/pyenv`, from a
-python.org Python) into `Bloodborne.exe`, which also runs `run.py` (`--run`), the preparation
-scripts (`--script`) and the game without the window (`--play`): players need no Python.
-`Play Bloodborne.exe` (`packaging/windows/play.c`) is a small native program that runs
-`Bloodborne.exe --play` from its folder and waits for it, for players who want to start the
-game directly with the saved settings.
-`patches.py` applies the 1.09 patches only to a 1.09 game (`BB_FORCE_PATCHES=1` overrides);
-`run.py` then runs other versions at 30 FPS with live resolution changes.
-From a source tree it adds `C:\msys64\clang64\bin` (or `$MSYS2_ROOT`) to `PATH` for the DLLs.
-`bash tools/fetch_fsr4_assets.sh` works in the CLANG64 shell as on Linux.
-
-FSR 4.1.1 (experimental): choose **AMD DX12** or **Vulkan (fsr4vk)** in Graphics
-or Play's quick settings. `package.sh` prepares AMD's original 4.1.1 runtime from
-the pinned official SDK archive (about 127 MB on the first build), verifies its
-hash, and includes the DLL with AMD's license/notices. The cached runtime is in
-`out/fsr411-dx12/`. The fsr4vk provider with the AMD Windows fix is also included,
-with its licenses and patch/source notice. `prepare_fsr4vk.py` verifies and caches
-the provider and corresponding source under `out/fsr4vk/`; the first build
-downloads about 14 MB of runtime files and 61 MB of source. Later builds reuse
-the verified cache. Graphics -> **Download fsr4vk** repairs missing or changed
-files, and the updater preserves the provider folder. Both use
-the normal PLAY path. See [FSR411_WINDOWS.md](../../docs/FSR411_WINDOWS.md) for
-source setup, requirements, synchronization and the uncapped Hunter's Dream
-comparison. The package also ships that document under `docs/`.
-
-DLSS (optional): `DLSS_SDK_ROOT=<checkout of github.com/NVIDIA/DLSS> bash
-packaging/windows/build_dlss.sh` builds `bbport_dlss.dll` (`gpu/dlss_bridge`, the only code that
-uses the NVIDIA SDK, compiled with MSVC 2022) and copies it with `nvngx_dlss.dll` next to
-`out/bb-probe.exe`; `package.sh` ships both when present. The renderer loads the bridge at run
-time (`vk_dlss.cpp`), adds the Vulkan extensions NGX asks for, and DLSS gets the same inputs as
-FSR 3 (scene color, depth, render-pixel motion vectors, jitter). `BB_DLSS=0` turns it off.
-
-The launcher texts are written in English with the Russian beside them; the other languages
-are in `launcher/bbport_lang.py` (one list per language in the order of `KEYS`; a missing or
-empty text falls back to English). The FSR 4.1.1 controls/status texts are merged from
-`launcher/bbport_lang_fsr411.py`, with complete entries for all 13 languages.
-The icon (`launcher/bloodborne.ico`/`.png`: the launcher's emblem on a dark tile) is made from
-`launcher/assets/emblem.png` by `packaging/windows/make_icon.py` and built into
-`Bloodborne.exe`, `Play Bloodborne.exe`, `bb-probe.exe` (the game window) and
-`bb-gpu-capabilities.exe`.
+DLSS (optional): `packaging/windows/import_dlss.py` puts `bbport_dlss.dll` (the bridge in
+`gpu/dlss_bridge`, the only code that uses the NVIDIA SDK) and NVIDIA's `nvngx_dlss.dll` /
+`nvngx_dlssg.dll` next to `out/bb-probe.exe`; `build_dlss.sh` builds the bridge with MSVC 2022
+instead. `package.sh` ships them when present. `BB_DLSS=0` turns DLSS off.
 
 ## What is different from Linux
 
@@ -90,13 +48,6 @@ The icon (`launcher/bloodborne.ico`/`.png`: the launcher's emblem on a dark tile
 | Guest thread stacks from `runtime_low_map` | Windows allocates them, fully committed (`pthread_attr_setstacksize`): guest code has no stack probes and would skip the guard page. The main thread stack is 16 MiB committed. |
 | glibc `nanosleep`, monotonic condition variables | High-resolution waitable timers (`compat_sleep_ns`; winpthreads' sleep rounds to 15.6 ms); semaphore deadlines use `CLOCK_REALTIME` (winpthreads rejects monotonic condition variables). |
 | `libbbgpu.so` | `libbbgpu.a`, linked into `bb-probe.exe` by CMake (`gpu/CMakeLists.txt`), with a manifest for UTF-8 paths and long paths. |
-| `execlp bash run.sh` (in-game restart) | `run.py` puts its command line in `BB_RESTART_COMMAND`; the new launch waits for the old process (`--after PID`). The launcher keeps the game in a job object. |
-| Mod overlay with symlinks | Symlinks when allowed (Developer Mode), else junctions for folders and hard links for files. |
 
-Diagnostics added on the way: `BB_FRAME_DUMP_TRIGGER=<file>` writes the guest display buffer
-and the presented image of the next frame to `BB_DUMP_DIR` (raw 32-bit pixels), which also
-works for menus and movies.
-
-Not ported: the watchdog/`--timeout` thread dumps (Linux signals), userfaultfd tracking
-(`BB_UFFD`), MangoHud, PGO (GCC flags), the GTK launcher (`launcher/bbport_launcher_win.py`, Tkinter, replaces it), and
-the `tests/` programs (several use Linux-only APIs).
+Not ported: userfaultfd tracking (`BB_UFFD`), PGO (GCC flags) and the `tests/` programs (several
+use Linux-only APIs).

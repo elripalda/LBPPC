@@ -33,7 +33,8 @@ for module in argparse base64 bisect collections contextlib ctypes ctypes.wintyp
 done
 out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name LBPPC \
     --distpath out/pyi-dist --workpath out/pyi-work --specpath out/pyi-work \
-    --paths "$(cygpath -w "$PWD/scripts")" "${hidden[@]}" "$(cygpath -w "$PWD/launcher/lbppc_launcher.py")"
+    --paths "$(cygpath -w "$PWD/scripts")" "${hidden[@]}" \
+    --add-data "$(cygpath -w "$PWD/launcher/fonts");fonts" "$(cygpath -w "$PWD/launcher/lbppc_launcher.py")"
 
 dest=out/stage/LBPPC
 rm -rf -- out/stage
@@ -58,10 +59,11 @@ fi
 cp -r scripts "$dest/"
 cp tools/shadnet_account.py tools/refresh_account.py "$dest/tools/"
 cp run.py input.ini LICENSE LICENSE-GPL-2.0 README.md "$dest/"
-cp docs/online.md "$dest/docs/"
+cp docs/online.md docs/troubleshooting.md "$dest/docs/"
 cp gpu/third_party/wepoll/LICENSE "$dest/licenses/wepoll-LICENSE.txt"
 cp gpu/third_party/httplib/LICENSE "$dest/licenses/cpp-httplib-LICENSE.txt"
 cp packaging/windows/licenses/*.txt "$dest/licenses/" 2>/dev/null || true
+cp launcher/fonts/Fredoka-OFL.txt "$dest/licenses/"
 cp gpu/bbnet/SHADNET-PORT.md "$dest/licenses/online-code-NOTICE.md"
 for package in protobuf abseil-cpp openssl miniupnpc zlib SDL3 ffmpeg; do
     license=/clang64/share/licenses/$package/LICENSE

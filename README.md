@@ -15,9 +15,18 @@ Multiplayer between players is new in this release and only lightly tested.
 
 Unzip a release, start `LBPPC.exe`, choose the folder of your game dump and press Play. For online play, see [docs/online.md](docs/online.md).
 
-## How it will work
+If something goes wrong, click **Make a report** in the launcher and attach the zip to your bug report; [docs/troubleshooting.md](docs/troubleshooting.md) explains what the log says.
 
-The plan follows the Bloodborne PC port: the game's own PS4 code runs natively on the PC's CPU, a runtime stands in for the PS4 system libraries, and a GPU layer derived from shadPS4 translates its graphics to Vulkan. Online play goes to community servers instead of the original ones, which are gone.
+### Controls
+
+A controller works out of the box. The launcher's **Controls** page sets the keys, mouse buttons and controller buttons, the mouse mode and its sensitivity; it writes `input.ini` (next to `LBPPC.exe`), which F8 reloads in game. Lines the page does not edit (combos, dead zones) are kept.
+
+- **Motion:** a controller with motion sensors (DualShock 4, DualSense, Switch Pro) tilts Sackboy's head as on a PS4. Without one, the number pad tilts it (4 left, 6 right, 8 forward, 2 back), or bind `tilt_left`, `tilt_right`, `tilt_forward` and `tilt_back` to anything.
+- **Mouse as the touchpad**, for LBP3's touch Create Mode: choose **Touchpad (Create Mode)** under Controls, Mouse, and press F7 in the game to capture the mouse. Moving is a finger on the pad, the left button pushes the pad in (it opens the Popit and selects), the wheel spreads or pinches (resizes) and Ctrl + wheel twists (rotates).
+
+## How it works
+
+As in the Bloodborne PC port, the game's own PS4 code runs natively on the PC's CPU, a runtime stands in for the PS4 system libraries, and a GPU layer derived from shadPS4 translates its graphics to Vulkan. Online play goes to community servers instead of the original ones, which are gone.
 
 ## You need your own copy of the game
 
@@ -34,7 +43,7 @@ This repository contains no game files and never will. To play, you dump LittleB
 | `tests/` | Tests of the GPU layer |
 | `docs/` | Research notes and design documents |
 
-The runtime and graphics layer come from the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) 1.9.5, merged with its history (remote `bloodborne`) so its fixes can be merged in later. Build on Windows with MSYS2 CLANG64: `./build.sh` (packages in `packaging/windows/README.md`).
+The runtime and graphics layer come from the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) 1.9.5, merged with its history (remote `bloodborne`); the Bloodborne-only features (its patches, menus, mouse camera, Discord status and online backend) have been removed. Build on Windows with MSYS2 CLANG64: `./build.sh` (packages in `packaging/windows/README.md`).
 
 ## Licence
 

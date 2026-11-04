@@ -3,12 +3,13 @@
 frame generation, and play. Settings are kept in user/launcher.json; frame generation also goes to
 bbport.ini, which the renderer reads. The game runs through run.py with the same Python.
 
-The banner shows the dump's own artwork (sce_sys/pic1.png) when Pillow is installed; nothing of the game ships
-with the launcher.
+Its look follows LittleBigPlanet 3's menus (lbppc_theme.py draws it); the banner is the dump's own artwork
+(sce_sys/pic1.png). Nothing of the game ships with the launcher.
 
 usage: python launcher/lbppc_launcher.py
 """
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -20,19 +21,23 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, ttk
 
-try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageTk
-except ImportError:  # the banner is drawn without the game's artwork
-    Image = None
+from PIL import Image, ImageTk
 
 VERSION = '0.0.1'
 # Packaged (frozen with PyInstaller): LBPPC.exe sits in the package folder and runs run.py itself (--script).
 FROZEN = getattr(sys, 'frozen', False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 BIN = ROOT / 'bin' if (ROOT / 'bin' / 'bb-probe.exe').is_file() else ROOT / 'out'
+if not FROZEN:
+    sys.path.insert(0, str(ROOT / 'scripts'))  # frozen, PyInstaller bundles the module
+import online_accounts  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lbppc_theme as theme  # noqa: E402
+import input_settings  # noqa: E402
 USER = ROOT / 'user'
 SETTINGS = USER / 'launcher.json'
 INI = ROOT / 'bbport.ini'
+INPUT_INI = ROOT / 'input.ini'  # the game's controls (runtime_input_config.c), the Controls page's
 LOG = ROOT / 'out' / 'last_run.log'
 
 # The game renders at these sizes natively (LBPPC_RENDER_RES: its render targets are made that large).
@@ -49,18 +54,24 @@ FRAME_GENS = [('Off (30 FPS)', 'off'), ('FSR 3.1 (any GPU)', 'fsr3'), ('DLSS (Ge
 # BB_LOW_LATENCY: NVIDIA Reflex (AMD Anti-Lag 2 on AMD), with the 30 FPS limit kept before each game frame.
 LATENCY = [('On (NVIDIA Reflex / AMD Anti-Lag 2)', 'on'), ('On + Boost (NVIDIA)', 'boost'), ('Off', 'off')]
 OPTIONS = [('resolution', 'Resolution', RESOLUTIONS, 'Wider than 16:9 shows more of the level.'),
-           ('display', 'Display', DISPLAY_MODES, 'Borderless suits most screens.'),
+           ('display', 'Display', DISPLAY_MODES, 'Borderless suits most screens; a full-size window is shrunk.'),
            ('frame_gen', 'Frame generation', FRAME_GENS, 'The game runs 30 steps a second; this shows 60.'),
            ('latency', 'Low latency', LATENCY, 'Less delay between your input and the screen.')]
-DEFAULTS = {'game': '', 'resolution': '1920x1080', 'display': 'windowed', 'frame_gen': 'dlss', 'latency': 'on',
-            'online': False, 'server': 'http://127.0.0.1:10061', 'online_name': '', 'shadnet_password': '',
-            'shadnet_server': '127.0.0.1:31313', 'join_allow': ''}
+DEFAULTS = {'game': '', 'resolution': '1920x1080', 'display': 'borderless', 'frame_gen': 'dlss', 'latency': 'on',
+            'online': False, 'online_name': '', 'password': '',
+            # Not shown: the LBPPC server unless launcher.json names another (a test server on this PC).
+            'server': online_accounts.OFFICIAL_SERVER}
 DLSS_FILES = ('bbport_dlss.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll')
 
-# Warm, craft-paper colours.
-BG, PANEL, EDGE, FIELD = '#17130f', '#221d17', '#3a3127', '#2c251d'
-TEXT, MUTED, ACCENT, ACCENT_HOT, GOOD, ERROR = '#f4ead8', '#b5a78f', '#f2a33a', '#ffb957', '#9ccc65', '#ff7b6b'
-WIDTH, BANNER_HEIGHT = 860, 230
+TEXT, MUTED, GOOD, ERROR, WARN = theme.TEXT, theme.MUTED, theme.GOOD, theme.ERROR, theme.WARN
+BG = theme.hex_colour(theme.NIGHT)
+# Windows: the launcher draws its own title bar (CUSTOM_FRAME); elsewhere the window manager's stays.
+CUSTOM_FRAME = os.name == 'nt'
+# The window: the settings in a column on the left, the friends list on the right.
+WIDTH, MAIN_WIDTH, TITLE_HEIGHT, BANNER_HEIGHT = 1180, 860, 38 if os.name == 'nt' else 0, 176
+LOG_HEIGHT = 220
+UI_FONT = ('Segoe UI', 10)
+HINT_FONT = ('Segoe UI', 9)
 
 
 def read_sfo(path):
@@ -96,12 +107,25 @@ def check_game(folder):
     return True, f'{title_id} version {version}, ready to play'
 
 
+def ini_frame_gen():
+    """bbport.ini's frame_gen when the launcher offers it: the in-game menu (Insert) changes it there too."""
+    try:
+        lines = INI.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return None
+    value = next((line.split('=', 1)[1].strip() for line in lines if line.startswith('frame_gen=')), None)
+    return value if value in {v for _name, v in FRAME_GENS} else None
+
+
 def load_settings():
     try:
         values = json.loads(SETTINGS.read_text(encoding='utf-8'))
-        return {**DEFAULTS, **{k: v for k, v in values.items() if k in DEFAULTS}}
+        values.setdefault('password', values.get('shadnet_password', ''))  # 0.0.1 betas' name for it
+        settings = {**DEFAULTS, **{k: v for k, v in values.items() if k in DEFAULTS}}
     except (OSError, ValueError):
-        return dict(DEFAULTS)
+        settings = dict(DEFAULTS)
+    settings['frame_gen'] = ini_frame_gen() or settings['frame_gen']
+    return settings
 
 
 def save_settings(values):
@@ -123,243 +147,431 @@ def open_path(path):
         subprocess.Popen(['xdg-open', str(path)])
 
 
-def banner_image(game):
-    """The banner: the dump's pic1.png faded into the background (a plain warm gradient without it)."""
-    width, height = WIDTH, BANNER_HEIGHT
-    art = Path(game) / 'sce_sys' / 'pic1.png' if game else None
-    try:
-        picture = Image.open(art).convert('RGB') if art and art.is_file() else None
-    except OSError:
-        picture = None
-    if picture:
-        scale = width / picture.width
-        picture = picture.resize((width, round(picture.height * scale)), Image.LANCZOS)
-        top = max(0, (picture.height - height) // 3)
-        base = picture.crop((0, top, width, top + height))
-    else:
-        base = Image.new('RGB', (width, height), PANEL)
-        glow = Image.new('RGB', (width, height), ACCENT)
-        mask = Image.new('L', (width, height))
-        ImageDraw.Draw(mask).ellipse((width * 0.55, -height, width * 1.4, height * 1.2), fill=90)
-        base = Image.composite(glow, base, mask.filter(ImageFilter.GaussianBlur(60)))
-    # Darkened towards the bottom and the left, where the title sits.
-    shade = Image.new('L', (width, height))
-    pixels = shade.load()
-    for y in range(height):
-        for x in range(0, width, 4):
-            v = int(255 * min(1.0, 0.25 + 0.75 * (y / height) ** 1.6 + 0.45 * max(0.0, 1 - x / (width * 0.6))))
-            for dx in range(4):
-                if x + dx < width:
-                    pixels[x + dx, y] = v
-    dark = Image.new('RGB', (width, height), BG)
-    return Image.composite(dark, base, shade)
+def make_report():
+    """A zip for a bug report: the last game logs, the settings and input files. The Windows user name is
+    replaced in every file and the shadNet password left out; no game files. Returns its path."""
+    import time
+    import zipfile
+    reports = ROOT / 'out' / 'reports'
+    reports.mkdir(parents=True, exist_ok=True)
+    path = reports / time.strftime('LBPPC-report-%Y%m%d-%H%M%S.zip')
+    home = str(Path.home())
+    names = {home: '<home>', home.replace('\\', '/'): '<home>', os.environ.get('USERNAME', '') or '<none>': '<user>'}
+
+    def scrub(text):
+        for name, replacement in names.items():
+            if len(name) > 2:
+                text = re.sub(re.escape(name), replacement, text, flags=re.IGNORECASE)
+        return text
+
+    logs = sorted((ROOT / 'out' / 'logs').glob('run-*.log'))[-3:]
+    files = [(log, f'logs/{log.name}') for log in logs] + [(LOG, 'last_run.log'), (INI, 'bbport.ini'),
+                                                           (ROOT / 'input.ini', 'input.ini')]
+    settings = {k: v for k, v in load_settings().items() if k != 'password'}
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for source, name in files:
+            if source.is_file():
+                archive.writestr(name, scrub(source.read_text(encoding='utf-8', errors='replace')))
+        archive.writestr('launcher.json', scrub(json.dumps(settings, indent=2)))
+    return path
 
 
-class PillButton(tk.Canvas):
-    """A rounded button drawn on a canvas (ttk buttons are square)."""
+class Scene(tk.Canvas):
+    """A canvas the launcher's look is drawn on: images placed at fixed spots (Tk keeps a reference to each),
+    tabs that act as buttons, text, and real widgets (fields, dropdowns) on top."""
 
-    def __init__(self, parent, text, command, fill, hot, fg='#1b140c', width=150, height=44, size=12):
-        super().__init__(parent, width=width, height=height, bg=parent['bg'], highlightthickness=0, cursor='hand2')
-        self.command, self.fill, self.hot, self.fg, self.enabled = command, fill, hot, fg, True
-        self.w, self.h, self.text = width, height, text
-        self.font = tkfont.Font(family='Segoe UI Semibold', size=size)
-        self.bind('<Enter>', lambda _e: self.draw(hover=True))
-        self.bind('<Leave>', lambda _e: self.draw())
-        self.bind('<Button-1>', lambda _e: self.enabled and self.command())
-        self.draw()
+    def __init__(self, parent, width, height):
+        super().__init__(parent, width=width, height=height, bg=BG, highlightthickness=0, bd=0)
+        self.images = {}
 
-    def draw(self, hover=False):
-        self.delete('all')
-        fill = (self.hot if hover else self.fill) if self.enabled else EDGE
-        r, w, h = self.h // 2, self.w, self.h
-        if Image:
-            # Drawn four times larger and scaled down: smooth edges.
-            pill = Image.new('RGB', (w * 4, h * 4), self['bg'])
-            ImageDraw.Draw(pill).rounded_rectangle((0, 0, w * 4 - 1, h * 4 - 1), radius=r * 4, fill=fill)
-            self.pill = ImageTk.PhotoImage(pill.resize((w, h), Image.LANCZOS))
-            self.create_image(0, 0, image=self.pill, anchor='nw')
+    def image(self, key, pil, x, y, anchor='nw', tags=()):
+        """Places (or replaces) the image named `key`."""
+        photo = ImageTk.PhotoImage(pil)
+        old = self.images.get(key)
+        if old:
+            self.itemconfigure(old[0], image=photo)
+            self.coords(old[0], x, y)
+            self.images[key] = (old[0], photo)
         else:
-            self.create_oval(0, 0, 2 * r, h, fill=fill, outline=fill)
-            self.create_oval(w - 2 * r - 1, 0, w - 1, h, fill=fill, outline=fill)
-            self.create_rectangle(r, 0, w - r, h, fill=fill, outline=fill)
-        self.create_text(w / 2, h / 2, text=self.text, fill=self.fg if self.enabled else MUTED, font=self.font)
+            self.images[key] = (self.create_image(x, y, image=photo, anchor=anchor, tags=tags), photo)
+        return self.images[key][0]
+
+    def widget(self, widget, x, y, width, height):
+        return self.create_window(x, y, window=widget, anchor='nw', width=width, height=height)
+
+
+class Tab:
+    """A hand-cut LBP3 tab on a Scene used as a button. Blue; under the pointer it turns green and pops (grows past
+    its hover size, then settles); grey while disabled. Placed by one edge ('w' left, 'e' right) and its vertical
+    centre, and grows from its centre."""
+
+    count = 0
+    # The pop: (scale, colour) frames, 35 ms apart, into and out of the hover state.
+    POP_IN = ((1.06, 'green'), (1.14, 'green'), (1.10, 'green'))
+    POP_OUT = ((1.04, 'blue'), (1.0, 'blue'))
+    FRAME_MS = 35
+
+    def __init__(self, scene, text, command, x, y, anchor='w', size=15, pad=(18, 10), tilt=0.0, weight='SemiBold'):
+        self.scene, self.command, self.enabled, self.hovered = scene, command, True, False
+        Tab.count += 1
+        self.key = f'tab{Tab.count}'
+        colours = {'blue': theme.BLUE, 'green': theme.GREEN, 'grey': theme.GREY}
+
+        def frame(scale, colour):
+            return theme.tab(text, colours[colour], size, pad, tilt, weight, scale=scale)[0]
+
+        self.frames = {frame_key: frame(*frame_key) for frame_key in
+                       {(1.0, 'blue'), (1.0, 'grey'), *self.POP_IN, *self.POP_OUT}}
+        normal, margin = theme.tab(text, theme.BLUE, size, pad, tilt, weight)
+        self.width, self.height = normal.width - 2 * margin, normal.height - 2 * margin
+        self.pending = []
+        self.item = scene.image(self.key, normal, 0, 0, anchor='center')
+        self.move(x, y, anchor)
+        scene.tag_bind(self.item, '<Enter>', lambda _e: self.hover(True))
+        scene.tag_bind(self.item, '<Leave>', lambda _e: self.hover(False))
+        scene.tag_bind(self.item, '<Button-1>', lambda _e: self.enabled and self.command())
+
+    @property
+    def right(self):
+        return self.cx + self.width / 2
+
+    def move(self, x, y, anchor='w'):
+        self.cx = x + self.width / 2 if anchor == 'w' else x - self.width / 2
+        self.cy = y
+        self.show((1.0, 'blue' if self.enabled else 'grey'))
+
+    def show(self, frame_key):
+        self.scene.image(self.key, self.frames[frame_key], self.cx, self.cy, anchor='center')
+
+    def play_frames(self, frames):
+        for after_id in self.pending:
+            self.scene.after_cancel(after_id)
+        self.pending = [self.scene.after(i * self.FRAME_MS, self.show, frame_key)
+                        for i, frame_key in enumerate(frames)]
+
+    def hover(self, inside):
+        self.hovered = inside
+        if getattr(self, 'selected', False):
+            return
+        self.scene.configure(cursor='hand2' if inside and self.enabled else '')
+        if self.enabled:
+            self.play_frames(self.POP_IN if inside else self.POP_OUT)
 
     def set_enabled(self, enabled):
         self.enabled = enabled
-        self.configure(cursor='hand2' if enabled else 'arrow')
-        self.draw()
+        self.play_frames(((1.0, 'blue' if enabled else 'grey'),))
+
+    def select(self, selected):
+        """A page tab: the current page's stays green and popped (LBP3's highlighted item), the others behave as
+        buttons."""
+        self.selected = selected
+        self.play_frames(((1.10, 'green'),) if selected else ((1.0, 'blue'),))
+
+    def forget(self):
+        """Before its canvas is cleared: no animation frame may draw it again."""
+        for after_id in self.pending:
+            self.scene.after_cancel(after_id)
+        self.pending = []
+
+
+class TitleBar:
+    """Windows: the window's own title bar (drag to move, minimise, close), the system's taken away. The window keeps
+    its taskbar button (WS_EX_APPWINDOW)."""
+
+    def __init__(self, window, scene, subtitle, on_close, minimise=True):
+        self.window = window
+        width = int(scene['width'])
+        scene.image('titlebar', theme.title_bar(width, TITLE_HEIGHT, subtitle), 0, 0, tags=('titlebar',))
+        close, margin = theme.window_button('close', theme.RED)
+        x = width - 12 - (close.width - 2 * margin)
+        item = scene.image('title:close', close, x - margin, (TITLE_HEIGHT - close.height) // 2)
+        self.button(scene, item, on_close)
+        if minimise:
+            low, margin = theme.window_button('min', theme.BLUE)
+            x -= 8 + (low.width - 2 * margin)
+            item = scene.image('title:min', low, x - margin, (TITLE_HEIGHT - low.height) // 2)
+            self.button(scene, item, self.minimise)
+        scene.tag_bind('titlebar', '<ButtonPress-1>', self.grab)
+        scene.tag_bind('titlebar', '<B1-Motion>', self.drag)
+        window.overrideredirect(True)
+        window.after(50, self.show_in_taskbar)
+
+    @staticmethod
+    def button(scene, item, command):
+        scene.tag_bind(item, '<Button-1>', lambda _e: command())
+        scene.tag_bind(item, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
+        scene.tag_bind(item, '<Leave>', lambda _e: scene.configure(cursor=''))
+
+    def hwnd(self):
+        """The outer window Windows manages (Tk's frame around the toplevel)."""
+        return int(self.window.wm_frame(), 16)
+
+    def show_in_taskbar(self):
+        import ctypes
+        if not self.window.winfo_ismapped():  # Tk sets its own styles when it first shows the window
+            self.window.after(50, self.show_in_taskbar)
+            return
+        user32 = ctypes.windll.user32
+        style = user32.GetWindowLongW(self.hwnd(), -20)  # GWL_EXSTYLE
+        user32.SetWindowLongW(self.hwnd(), -20, (style & ~0x80) | 0x40000)  # not WS_EX_TOOLWINDOW, WS_EX_APPWINDOW
+        self.animate_minimise()
+        # Shown again, so the taskbar picks the changed style up.
+        self.window.withdraw()
+        self.window.after(10, self.window.deiconify)
+        self.window.after(20, self.round_corners)
+
+    def animate_minimise(self):
+        """Windows animates minimising and restoring only for a window with a caption (WS_CAPTION, WS_SYSMENU,
+        WS_MINIMIZEBOX), not a borderless popup. The window gets those styles, and its own window procedure
+        answers WM_NCCALCSIZE with \"no frame\", so the caption takes no room and nothing of it is drawn."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        result = ctypes.c_ssize_t
+        procedure = ctypes.WINFUNCTYPE(result, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                           wintypes.LPARAM]
+        user32.CallWindowProcW.restype = result
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        hwnd = self.hwnd()
+
+        def window_procedure(window, message, wparam, lparam):
+            if message == 0x83 and wparam:  # WM_NCCALCSIZE: all of the window is its client area
+                return 0
+            return user32.CallWindowProcW(self.tk_procedure, window, message, wparam, lparam)
+
+        self.procedure = procedure(window_procedure)  # kept: Windows calls it as long as the window lives
+        self.tk_procedure = user32.SetWindowLongPtrW(hwnd, -4, ctypes.cast(self.procedure, ctypes.c_void_p))
+        style = user32.GetWindowLongW(hwnd, -16) & 0xffffffff  # GWL_STYLE
+        style = (style & ~0x80000000) | 0xC00000 | 0x80000 | 0x20000  # not WS_POPUP; caption, menu, minimise box
+        user32.SetWindowLongW(hwnd, -16, ctypes.c_long(style - (1 << 32) if style >= 1 << 31 else style))
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x27)  # SWP_FRAMECHANGED, nothing moved
+
+    def round_corners(self):
+        """Rounded corners: Windows 11 draws them itself (smooth, with its border and shadow); on Windows 10 the
+        window is cut to a rounded shape, again each time its size changes (the log shown or hidden)."""
+        import ctypes
+        preference = ctypes.c_int(2)  # DWMWCP_ROUND
+        if ctypes.windll.dwmapi.DwmSetWindowAttribute(self.hwnd(), 33, ctypes.byref(preference),  # CORNER_PREFERENCE
+                                                      ctypes.sizeof(preference)) == 0:
+            return
+        def cut(_event=None):
+            w, h = self.window.winfo_width(), self.window.winfo_height()
+            region = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16)
+            ctypes.windll.user32.SetWindowRgn(self.hwnd(), region, True)
+        cut()
+        self.window.bind('<Configure>', lambda e: e.widget is self.window and cut(), add='+')
+
+    def minimise(self):
+        import ctypes
+        ctypes.windll.user32.ShowWindow(self.hwnd(), 6)  # SW_MINIMIZE
+
+    def grab(self, event):
+        self.offset = (event.x_root - self.window.winfo_x(), event.y_root - self.window.winfo_y())
+
+    def drag(self, event):
+        self.window.geometry(f'+{event.x_root - self.offset[0]}+{event.y_root - self.offset[1]}')
+
+
+def style_widgets(root):
+    """The fields and dropdowns: dark, light text, a lime edge on the focused one."""
+    style = ttk.Style(root)
+    style.theme_use('clam')
+    style.configure('Night.TCombobox', padding=4, arrowcolor=theme.hex_colour(theme.LIME), foreground=TEXT,
+                    background=theme.FIELD, fieldbackground=theme.FIELD, bordercolor=theme.FIELD_EDGE,
+                    lightcolor=theme.FIELD, darkcolor=theme.FIELD, selectbackground=theme.FIELD,
+                    selectforeground=TEXT, arrowsize=14)
+    style.map('Night.TCombobox', fieldbackground=[('readonly', theme.FIELD)], foreground=[('readonly', TEXT)],
+              background=[('active', theme.FIELD_EDGE)], bordercolor=[('focus', theme.hex_colour(theme.LIME))])
+    style.configure('Night.Vertical.TScrollbar', background=theme.FIELD, troughcolor=BG,
+                    arrowcolor=MUTED, borderwidth=0)
+    root.option_add('*TCombobox*Listbox.background', theme.FIELD)
+    root.option_add('*TCombobox*Listbox.foreground', TEXT)
+    root.option_add('*TCombobox*Listbox.selectBackground', theme.hex_colour(theme.BLUE))
+    root.option_add('*TCombobox*Listbox.selectForeground', '#ffffff')
+    root.option_add('*TCombobox*Listbox.font', UI_FONT)
+
+
+def field(parent, variable, hidden=False):
+    return tk.Entry(parent, textvariable=variable, show='*' if hidden else '', font=UI_FONT, bg=theme.FIELD,
+                    fg=TEXT, insertbackground=TEXT, relief='flat', highlightthickness=1,
+                    highlightbackground=theme.FIELD_EDGE, highlightcolor=theme.hex_colour(theme.LIME),
+                    disabledbackground=theme.FIELD)
 
 
 class Launcher(tk.Tk):
+    # Layout: the title bar, the banner, three panels and the friends list beside them, the bar with Play.
+    PANEL_X, PANEL_W = 28, MAIN_WIDTH - 56
+    SIDE_X = PANEL_X + PANEL_W + 20
+    SIDE_W = WIDTH - 28 - SIDE_X
+    GAME_Y = TITLE_HEIGHT + BANNER_HEIGHT + 12
+    GRAPHICS_Y = GAME_Y + 118
+    ONLINE_Y = GRAPHICS_Y + 228
+    BAR_Y = ONLINE_Y + 216
+    HEIGHT = BAR_Y + 92
+
     def __init__(self):
         super().__init__()
-        self.title(f'LBPPC {VERSION}')
+        self.title('LBPPC')
         self.configure(bg=BG)
-        self.resizable(False, True)
-        self.minsize(WIDTH, 560)
+        self.resizable(False, False)
         self.settings = load_settings()
         self.process = None
         self.lines = queue.Queue()
         self.log_shown = False
-        self.banner_art = None
-        self.style()
+        style_widgets(self)
+        self.scene = Scene(self, WIDTH, self.HEIGHT)
+        self.scene.pack(fill='both', expand=True)
+        self.scene.image('felt', theme.felt(WIDTH, self.HEIGHT + LOG_HEIGHT), 0, 0)
         self.build()
+        if CUSTOM_FRAME:
+            TitleBar(self, self.scene, f'{VERSION} beta', self.close)
+        self.friends = FriendsPanel(self, self.SIDE_X, self.GAME_Y, self.SIDE_W, self.ONLINE_Y + 202 - self.GAME_Y)
+        self.controls = ControlsPage(self, self.PANEL_X, self.GAME_Y, self.PANEL_W, self.ONLINE_Y + 202 - self.GAME_Y)
+        # The pages: Game (the panels built above) and Controls, switched by the tabs on the banner.
+        tab_y = TITLE_HEIGHT + BANNER_HEIGHT - 16
+        self.page_tabs = {'controls': Tab(self.scene, 'Controls', lambda: self.show_page('controls'),
+                                          self.PANEL_X + self.PANEL_W - 4, tab_y, 'e', size=14, tilt=2)}
+        self.page_tabs['game'] = Tab(self.scene, 'Game', lambda: self.show_page('game'),
+                                     self.page_tabs['controls'].cx - self.page_tabs['controls'].width / 2 - 14,
+                                     tab_y, 'e', size=14, tilt=-2)
+        self.show_page('game')
         self.refresh_game()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(100, self.pump)
 
-    def style(self):
-        style = ttk.Style(self)
-        style.theme_use('clam')
-        style.configure('.', background=BG, foreground=TEXT, fieldbackground=FIELD, bordercolor=EDGE,
-                        lightcolor=EDGE, darkcolor=EDGE, font=('Segoe UI', 10))
-        style.configure('Card.TFrame', background=PANEL)
-        style.configure('Card.TLabel', background=PANEL, foreground=TEXT, font=('Segoe UI Semibold', 10))
-        style.configure('Hint.TLabel', background=PANEL, foreground=MUTED, font=('Segoe UI', 9))
-        style.configure('Status.TLabel', background=BG, foreground=MUTED, font=('Segoe UI', 10))
-        style.configure('Link.TLabel', background=BG, foreground=MUTED, font=('Segoe UI', 10, 'underline'))
-        style.configure('TEntry', padding=6, insertcolor=TEXT)
-        style.configure('TCombobox', padding=5, arrowcolor=ACCENT, foreground=TEXT, background=FIELD,
-                        selectbackground=FIELD, selectforeground=TEXT)
-        style.map('TCombobox', fieldbackground=[('readonly', FIELD)], foreground=[('readonly', TEXT)],
-                  background=[('active', EDGE)])
-        style.configure('Browse.TButton', background=FIELD, foreground=TEXT, padding=(12, 5), borderwidth=0)
-        style.map('Browse.TButton', background=[('active', EDGE)])
-        style.configure('Vertical.TScrollbar', background=PANEL, troughcolor=BG, arrowcolor=MUTED, borderwidth=0)
-        self.option_add('*TCombobox*Listbox.background', FIELD)
-        self.option_add('*TCombobox*Listbox.foreground', TEXT)
-        self.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
-        self.option_add('*TCombobox*Listbox.selectForeground', '#1b140c')
-        self.option_add('*TCombobox*Listbox.font', ('Segoe UI', 10))
+    def text(self, x, y, text='', font=HINT_FONT, fill=MUTED, anchor='nw', width=0):
+        options = {'width': width} if width else {}
+        return self.scene.create_text(x, y, text=text, font=font, fill=fill, anchor=anchor, **options)
+
+    def label(self, key, x, y, text):
+        self.scene.image(key, theme.text_image(text, 13, TEXT, 'Medium'), x, y)
 
     def build(self):
-        # Banner: artwork, title and the stitched edge under it.
-        self.banner = tk.Canvas(self, width=WIDTH, height=BANNER_HEIGHT, bg=BG, highlightthickness=0)
-        self.banner.pack(fill='x')
+        scene, x, w = self.scene, self.PANEL_X, self.PANEL_W
+        half = (w - 40) // 2 - 10
+        right = x + 20 + half + 20
 
-        body = tk.Frame(self, bg=BG, padx=28)
-        body.pack(fill='both', expand=True)
-
-        game = ttk.Frame(body, style='Card.TFrame', padding=(18, 14))
-        game.pack(fill='x', pady=(14, 10))
-        ttk.Label(game, text='Game folder', style='Card.TLabel').grid(row=0, column=0, sticky='w')
+        before = set(scene.find_all())
+        # Game folder
+        y = self.GAME_Y
+        scene.image('panel:game', theme.panel(w, 104, 'Game folder'), x, y)
         self.game = tk.StringVar(value=self.settings['game'])
-        entry = ttk.Entry(game, textvariable=self.game, font=('Segoe UI', 10))
-        entry.grid(row=1, column=0, sticky='ew', pady=(6, 0))
+        entry = field(self, self.game)
         entry.bind('<FocusOut>', lambda _e: self.refresh_game())
         entry.bind('<Return>', lambda _e: self.refresh_game())
-        ttk.Button(game, text='Browse…', style='Browse.TButton', command=self.browse).grid(
-            row=1, column=1, padx=(10, 0), pady=(6, 0))
-        self.game_status = ttk.Label(game, style='Hint.TLabel')
-        self.game_status.grid(row=2, column=0, columnspan=2, sticky='w', pady=(8, 0))
-        game.columnconfigure(0, weight=1)
+        scene.widget(entry, x + 20, y + 46, w - 180, 30)
+        Tab(scene, 'Browse...', self.browse, x + w - 20, y + 61, 'e', size=14, tilt=2)
+        self.status_tag_y = y + 84
 
-        options = ttk.Frame(body, style='Card.TFrame', padding=(18, 14))
-        options.pack(fill='x')
+        # Graphics: the four choices in two columns
+        y = self.GRAPHICS_Y
+        scene.image('panel:graphics', theme.panel(w, 214, 'Graphics'), x, y)
         self.choices = {}
-        for index, (key, label, values, hint) in enumerate(OPTIONS):
-            cell = ttk.Frame(options, style='Card.TFrame')
-            cell.grid(row=index // 2, column=index % 2, sticky='nsew', padx=(0 if index % 2 == 0 else 14, 0),
-                      pady=(0 if index < 2 else 12, 0))
-            ttk.Label(cell, text=label, style='Card.TLabel').pack(anchor='w')
+        for index, (key, title, values, hint) in enumerate(OPTIONS):
+            cx, cy = (x + 20, right)[index % 2], y + 44 + (index // 2) * 76
+            self.label(f'label:{key}', cx, cy, title)
             names = [name for name, _value in values]
             current = next((name for name, value in values if value == self.settings[key]), names[0])
             var = tk.StringVar(value=current)
-            box = ttk.Combobox(cell, textvariable=var, values=names, state='readonly', font=('Segoe UI', 10))
-            box.pack(fill='x', pady=(6, 4))
+            box = ttk.Combobox(self, textvariable=var, values=names, state='readonly', font=UI_FONT,
+                               style='Night.TCombobox')
             box.bind('<<ComboboxSelected>>', lambda _e: (self.store(), self.selection_clear()))
-            ttk.Label(cell, text=hint, style='Hint.TLabel').pack(anchor='w')
+            scene.widget(box, cx, cy + 22, half, 28)
+            self.text(cx + 2, cy + 54, hint)
             self.choices[key] = (var, values)
-        options.columnconfigure(0, weight=1, uniform='col')
-        options.columnconfigure(1, weight=1, uniform='col')
 
-        # Online: a custom server (Refresh or Lighthouse), signed in locally under an online name.
-        online = ttk.Frame(body, style='Card.TFrame', padding=(18, 14))
-        online.pack(fill='x', pady=(10, 0))
+        # Online: one account (name and password) on the LBPPC server's shadNet (sign-in, friends, multiplayer)
+        # and Refresh (levels, profiles).
+        y = self.ONLINE_Y
+        scene.image('panel:online', theme.panel(w, 202, 'Online'), x, y)
         self.online = tk.BooleanVar(value=bool(self.settings['online']))
-        tk.Checkbutton(online, text='Play online', variable=self.online, command=self.store, bg=PANEL, fg=TEXT,
-                       selectcolor=FIELD, activebackground=PANEL, activeforeground=TEXT,
-                       font=('Segoe UI Semibold', 10), bd=0, highlightthickness=0).grid(row=0, column=0, sticky='w')
-        ttk.Label(online, text='Online name', style='Card.TLabel').grid(row=1, column=0, sticky='w', pady=(8, 0))
-        ttk.Label(online, text='Server', style='Card.TLabel').grid(row=1, column=1, sticky='w', padx=(14, 0), pady=(8, 0))
+        box = scene.image('online:box', theme.checkbox(self.online.get()), x + 20, y + 44)
+        scene.tag_bind(box, '<Button-1>', lambda _e: self.toggle_online())
+        self.label('label:online', x + 50, y + 45, 'Play online on the LBPPC server')
+        self.label('label:name', x + 20, y + 76, 'Online name')
+        self.label('label:password', right, y + 76, 'Password')
         self.online_name = tk.StringVar(value=self.settings['online_name'])
-        self.server = tk.StringVar(value=self.settings['server'])
-        for col, var in ((0, self.online_name), (1, self.server)):
-            entry = ttk.Entry(online, textvariable=var, font=('Segoe UI', 10))
-            entry.grid(row=2, column=col, sticky='ew', padx=(0 if col == 0 else 14, 0), pady=(6, 4))
-            entry.bind('<FocusOut>', lambda _e: self.store())
-        ttk.Label(online, text='Your account name on that server (up to 16 letters, digits, - or _).',
-                  style='Hint.TLabel').grid(row=3, column=0, columnspan=2, sticky='w')
-        ttk.Label(online, text='shadNet password', style='Card.TLabel').grid(row=4, column=0, sticky='w', pady=(10, 0))
-        ttk.Label(online, text='shadNet server', style='Card.TLabel').grid(row=4, column=1, sticky='w', padx=(14, 0),
-                                                                        pady=(10, 0))
-        self.shadnet_password = tk.StringVar(value=self.settings['shadnet_password'])
-        self.shadnet_server = tk.StringVar(value=self.settings['shadnet_server'])
-        for col, var, hidden in ((0, self.shadnet_password, True), (1, self.shadnet_server, False)):
-            entry = ttk.Entry(online, textvariable=var, font=('Segoe UI', 10), show='*' if hidden else '')
-            entry.grid(row=5, column=col, sticky='ew', padx=(0 if col == 0 else 14, 0), pady=(6, 4))
-            entry.bind('<FocusOut>', lambda _e: self.store())
-        ttk.Label(online, text='For multiplayer: your shadNet account (same name). Empty: playing alone online.',
-                  style='Hint.TLabel').grid(row=6, column=0, columnspan=2, sticky='w')
-        ttk.Label(online, text='Who may join you', style='Card.TLabel').grid(row=7, column=0, sticky='w', pady=(10, 0))
-        self.join_allow = tk.StringVar(value=self.settings['join_allow'])
-        entry = ttk.Entry(online, textvariable=self.join_allow, font=('Segoe UI', 10))
-        entry.grid(row=8, column=0, columnspan=2, sticky='ew', pady=(6, 4))
-        entry.bind('<FocusOut>', lambda _e: self.store())
-        ttk.Label(online, text='Your shadNet friends, and these online names (comma separated). Nobody else can '
-                               'connect to your game.', style='Hint.TLabel').grid(row=9, column=0, columnspan=2,
-                                                                               sticky='w')
-        online.columnconfigure(0, weight=1, uniform='col')
-        online.columnconfigure(1, weight=1, uniform='col')
+        self.password = tk.StringVar(value=self.settings['password'])
+        for cx, var, hidden in ((x + 20, self.online_name, False), (right, self.password, True)):
+            entry = field(self, var, hidden)
+            entry.bind('<FocusOut>', lambda _e: (self.store(), self.friends.account_changed()))
+            scene.widget(entry, cx, y + 98, half, 30)
+        self.text(x + 22, y + 134, '3 to 16 letters, digits, - or _, and a password of 8 or more characters. '
+                                   'Only your friends can join your game.')
+        self.account_button = Tab(scene, 'Create account', self.create_account, x + 20, y + 174, size=15, tilt=-2)
+        self.account_status = self.text(self.account_button.right + 22, y + 174, 'New here? Choose a name and '
+                                        'password, then Create account.', anchor='w', width=560)
 
-        bar = tk.Frame(body, bg=BG)
-        bar.pack(fill='x', pady=(16, 10))
-        self.play_button = PillButton(bar, 'Play', self.play, ACCENT, ACCENT_HOT, width=170, height=48, size=14)
-        self.play_button.pack(side='left')
-        self.stop_button = PillButton(bar, 'Stop', self.stop, FIELD, EDGE, fg=TEXT, width=100, height=48, size=11)
-        self.stop_button.pack(side='left', padx=(10, 0))
+        self.game_items = [item for item in scene.find_all() if item not in before]
+
+        # The bar: Play (the lime tab, as LBP3's selected item), Stop, the state, the links
+        y = self.BAR_Y
+        self.play_button = Tab(scene, 'Play', self.play, x + 6, y + 30, size=30, pad=(46, 16), tilt=-3,
+                               weight='Bold')
+        self.stop_button = Tab(scene, 'Stop', self.stop, self.play_button.right + 24, y + 30, size=17, pad=(22, 11),
+                               tilt=2)
         self.stop_button.set_enabled(False)
-        self.state_dot = tk.Canvas(bar, width=12, height=12, bg=BG, highlightthickness=0)
-        self.state_dot.pack(side='left', padx=(18, 6))
-        self.state_label = ttk.Label(bar, text='Ready', style='Status.TLabel')
-        self.state_label.pack(side='left')
-        self.set_state('Ready', MUTED)
-        for text, action in (('Saves', lambda: open_path(USER)), ('Log file', lambda: LOG.is_file() and open_path(LOG)),
-                             ('Show log', self.toggle_log)):
-            link = ttk.Label(bar, text=text, style='Link.TLabel', cursor='hand2')
-            link.pack(side='right', padx=(14, 0))
-            link.bind('<Button-1>', lambda _e, act=action: act())
+        dot = self.stop_button.right + 26
+        self.state_dot = scene.create_oval(dot, y + 24, dot + 12, y + 36, fill=MUTED, outline='')
+        self.state_label = self.text(dot + 20, y + 30, 'Ready', ('Segoe UI Semibold', 11), TEXT, 'w', width=200)
+        lx = WIDTH - 28
+        for text, action in reversed((('Show log', self.toggle_log), ('Make a report', self.report),
+                                      ('Log file', lambda: LOG.is_file() and open_path(LOG)),
+                                      ('Saves', lambda: open_path(USER)))):
+            item = self.text(lx, y + 28, text, ('Segoe UI Semibold', 10), theme.hex_colour((200, 225, 150)), 'e')
+            scene.tag_bind(item, '<Button-1>', lambda _e, act=action: act())
+            scene.tag_bind(item, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
+            scene.tag_bind(item, '<Leave>', lambda _e: scene.configure(cursor=''))
             if text == 'Show log':
-                self.log_link = link
+                self.log_link = item
+            box = scene.bbox(item)
+            lx = box[0] - 18
+        self.text(WIDTH // 2, self.HEIGHT - 16, 'Play your own copy. LBPPC includes no game files.', ('Segoe UI', 8),
+                  '#6c7690', 'center')
 
-        self.log_frame = tk.Frame(body, bg=BG)
-        self.log = tk.Text(self.log_frame, height=10, bg='#100d0a', fg=MUTED, insertbackground=TEXT, relief='flat',
-                           font=('Consolas', 9), wrap='none', state='disabled', padx=10, pady=8,
-                           highlightthickness=1, highlightbackground=EDGE, highlightcolor=EDGE)
-        scroll = ttk.Scrollbar(self.log_frame, command=self.log.yview)
-        self.log.configure(yscrollcommand=scroll.set)
-        self.log.pack(side='left', fill='both', expand=True)
-        scroll.pack(side='right', fill='y')
-        self.log.tag_configure('warn', foreground=ACCENT)
+        # The game's output, under the bar while shown
+        self.log = tk.Text(self, bg='#0e111c', fg=MUTED, insertbackground=TEXT, relief='flat', font=('Consolas', 9),
+                           wrap='none', state='disabled', padx=10, pady=8, highlightthickness=1,
+                           highlightbackground=theme.FIELD_EDGE)
+        self.log.tag_configure('warn', foreground=WARN)
         self.log.tag_configure('bad', foreground=ERROR)
+        self.log_window = None
 
-        tk.Label(self, text='Play your own copy. LBPPC includes no game files.', bg=BG, fg=EDGE,
-                 font=('Segoe UI', 8)).pack(side='bottom', pady=(0, 8))
+    def show_page(self, page):
+        self.page = page
+        tag = self.scene.images.get('game:tag')  # drawn later than the panels (refresh_game)
+        for item in self.game_items + ([tag[0]] if tag else []):
+            self.scene.itemconfigure(item, state='normal' if page == 'game' else 'hidden')
+        for item in self.controls.items:
+            self.scene.itemconfigure(item, state='normal' if page == 'controls' else 'hidden')
+        for name, tab in self.page_tabs.items():
+            tab.select(name == page)
+            self.scene.tag_raise(tab.item)
 
     def draw_banner(self):
-        canvas = self.banner
-        canvas.delete('all')
-        if Image:
-            self.banner_art = ImageTk.PhotoImage(banner_image(self.settings['game']))
-            canvas.create_image(0, 0, image=self.banner_art, anchor='nw')
-        sfo = read_sfo(Path(self.settings['game']) / 'sce_sys' / 'param.sfo') if self.settings['game'] else {}
-        canvas.create_text(30, BANNER_HEIGHT - 92, text='LBPPC', anchor='w', fill=TEXT,
-                           font=('Segoe UI Black', 34))
-        canvas.create_text(33, BANNER_HEIGHT - 52, anchor='w', fill=MUTED, font=('Segoe UI', 11),
-                           text=sfo.get('TITLE', 'Your PS4 game, on PC'))
-        # A stitched seam along the bottom edge.
-        y = BANNER_HEIGHT - 14
-        canvas.create_line(28, y, WIDTH - 28, y, fill=ACCENT, width=2, dash=(10, 7), capstyle='round')
+        game = self.settings['game']
+        art = Path(game) / 'sce_sys' / 'pic1.png' if game else None
+        self.scene.image('banner', theme.banner(WIDTH, BANNER_HEIGHT, art), 0, TITLE_HEIGHT)
+        # The game's own name (its param.sfo) as the banner's title; LBPPC is the title bar's.
+        sfo = read_sfo(Path(game) / 'sce_sys' / 'param.sfo') if game else {}
+        # The trademark sign is left out (it joins "LittleBigPlanet" and "3" in the game's own title).
+        name = ' '.join(re.sub('[\u2122\u00ae]', ' ', sfo.get('TITLE', '')).split()) or 'Choose your game'
+        title = theme.text_image(name, 32, theme.hex_colour(theme.ORANGE), 'Bold', outline=theme.CREAM)
+        title = title.rotate(2, resample=Image.BICUBIC, expand=True)
+        self.scene.image('banner:title', theme.shadowed(title, 5, (0, 3))[0], 14, TITLE_HEIGHT + BANNER_HEIGHT - 90)
+        self.scene.tag_raise('banner:title')
+        for tab in getattr(self, 'page_tabs', {}).values():  # the page tabs sit on the banner
+            self.scene.tag_raise(tab.item)
+
+    def toggle_online(self):
+        self.online.set(not self.online.get())
+        self.scene.image('online:box', theme.checkbox(self.online.get()), self.PANEL_X + 20, self.ONLINE_Y + 44)
+        self.store()
+
+    def set_account_status(self, text, colour):
+        self.scene.itemconfigure(self.account_status, text=text, fill=colour)
 
     def browse(self):
         folder = filedialog.askdirectory(title='Game folder (holding eboot.bin)', initialdir=self.game.get() or None)
@@ -369,11 +581,13 @@ class Launcher(tk.Tk):
 
     def refresh_game(self):
         ok, text = check_game(self.game.get().strip())
-        self.game_status.configure(text=('✓  ' if ok else '!  ') + text, foreground=GOOD if ok else ERROR)
+        image, margin = theme.tag(text, (70, 140, 40) if ok else (190, 60, 50))
+        item = self.scene.image('game:tag', image, self.PANEL_X + 16 - margin, self.status_tag_y - margin)
+        self.scene.itemconfigure(item, state='normal' if getattr(self, 'page', 'game') == 'game' else 'hidden')
         self.play_button.set_enabled(ok and not self.process)
         changed = self.settings['game'] != self.game.get().strip()
         self.store()
-        if changed or not self.banner.find_all():
+        if changed or 'banner' not in self.scene.images:
             self.draw_banner()
         return ok
 
@@ -381,31 +595,83 @@ class Launcher(tk.Tk):
         self.settings['game'] = self.game.get().strip()
         for key, (var, values) in self.choices.items() if hasattr(self, 'choices') else ():
             self.settings[key] = next(value for name, value in values if name == var.get())
-        if hasattr(self, 'online'):
+        if hasattr(self, 'password'):
             self.settings['online'] = bool(self.online.get())
             self.settings['online_name'] = self.online_name.get().strip()
-            self.settings['server'] = self.server.get().strip()
-            self.settings['shadnet_password'] = self.shadnet_password.get()
-            self.settings['shadnet_server'] = self.shadnet_server.get().strip()
-            self.settings['join_allow'] = self.join_allow.get().strip()
+            self.settings['password'] = self.password.get()
         save_settings(self.settings)
 
     def set_state(self, text, colour):
-        self.state_label.configure(text=text)
-        self.state_dot.delete('all')
-        self.state_dot.create_oval(1, 1, 11, 11, fill=colour, outline=colour)
+        self.scene.itemconfigure(self.state_label, text=text)
+        self.scene.itemconfigure(self.state_dot, fill=colour)
+
+    def report(self):
+        try:
+            path = make_report()
+        except OSError as error:
+            self.set_state(f'The report could not be made: {error}', ERROR)
+            return
+        self.set_state(f'Report saved: {path.name}', GOOD)
+        open_path(path.parent)
+
+    def create_account(self):
+        """Both accounts with the name and password above, off the window's thread (the servers may be slow)."""
+        self.store()
+        values = self.settings
+        try:
+            online_accounts.check_name_and_password(values['online_name'], values['password'])
+            servers = online_accounts.server_endpoints(values['server'])
+        except online_accounts.AccountError as error:
+            self.set_account_status(str(error), ERROR)
+            return
+        self.account_button.set_enabled(False)
+        self.set_account_status('Creating the account...', MUTED)
+        result = {}
+
+        def work():
+            try:
+                online_accounts.create_account(servers['shadnet'], servers['refresh'], values['online_name'],
+                                               values['password'])
+                result['ok'] = f'Account {values["online_name"]} created: press Play.'
+            except online_accounts.AccountError as error:
+                result['error'] = str(error)
+
+        def finished():
+            if thread.is_alive():
+                self.after(200, finished)
+                return
+            self.account_button.set_enabled(True)
+            ok = 'ok' in result
+            self.set_account_status(result.get('ok') or result.get('error'), GOOD if ok else ERROR)
+            if ok and not self.online.get():
+                self.toggle_online()
+            if ok:
+                self.friends.account_changed(force=True)
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        self.after(200, finished)
 
     def toggle_log(self):
         self.log_shown = not self.log_shown
+        height = self.HEIGHT + (LOG_HEIGHT if self.log_shown else 0)
+        self.scene.configure(height=height)
         if self.log_shown:
-            self.log_frame.pack(fill='both', expand=True, pady=(0, 6))
+            self.log_window = self.scene.widget(self.log, self.PANEL_X, self.HEIGHT - 4, WIDTH - 56, LOG_HEIGHT - 12)
             self.log.see('end')
-        else:
-            self.log_frame.pack_forget()
-        self.log_link.configure(text='Hide log' if self.log_shown else 'Show log')
+        elif self.log_window:
+            self.scene.delete(self.log_window)
+            self.log_window = None
+        self.scene.itemconfigure(self.log_link, text='Hide log' if self.log_shown else 'Show log')
+        self.geometry(f'{WIDTH}x{height}')
 
     def play(self):
         if self.process or not self.refresh_game():
+            return
+        if self.friends.busy:
+            # shadNet takes one sign-in per account: the game's would fail while the friends list is signed in.
+            self.set_state('Starting...', WARN)
+            self.after(150, self.play)
             return
         self.store()
         env = dict(os.environ)
@@ -418,21 +684,21 @@ class Launcher(tk.Tk):
             env.update(BB_LOW_LATENCY='off', BB_VBLANK_HZ='60', BB_FPS_LIMIT='-1')
         else:
             env.update(BB_LOW_LATENCY=self.settings['latency'], BB_VBLANK_HZ='0', BB_FPS_LIMIT='30')
-        for name in ('LBPPC_NP_USER', 'LBPPC_SERVER', 'BB_SHADNET_NPID', 'BB_SHADNET_PASSWORD', 'BB_SHADNET_SERVER'):
+        for name in ('LBPPC_NP_USER', 'LBPPC_SERVER', 'BB_SHADNET_NPID', 'BB_SHADNET_PASSWORD', 'BB_SHADNET_SERVER',
+                     'LBPPC_JOIN_ALLOW', 'BB_SHADNET_WEBAPI'):
             env.pop(name, None)
         if self.settings['online']:
-            name, server = self.settings['online_name'], self.settings['server']
-            if not re.fullmatch(r'[A-Za-z0-9_-]{3,16}', name) or not server.startswith(('http://', 'https://')):
-                self.set_state('Online needs a name (3 to 16 letters, digits, - or _) and a server address', ERROR)
+            name, password = self.settings['online_name'], self.settings['password']
+            try:
+                online_accounts.check_name_and_password(name, password)
+                servers = online_accounts.server_endpoints(self.settings['server'])
+            except online_accounts.AccountError as error:
+                self.set_state(f'Online: {error}', ERROR)
                 return
-            env.update(LBPPC_SERVER=server.rstrip('/'))
-            if self.settings['shadnet_password']:
-                env.update(BB_SHADNET_NPID=name, BB_SHADNET_PASSWORD=self.settings['shadnet_password'],
-                           BB_SHADNET_SERVER=self.settings['shadnet_server'] or '127.0.0.1:31313',
-                           LBPPC_JOIN_ALLOW=self.settings['join_allow'])
-            else:
-                env.update(LBPPC_NP_USER=name)
+            env.update(LBPPC_SERVER=servers['refresh'], BB_SHADNET_NPID=name, BB_SHADNET_PASSWORD=password,
+                       BB_SHADNET_SERVER=servers['shadnet'], BB_SHADNET_WEBAPI=servers['webapi'])
         env['PYTHONUNBUFFERED'] = '1'
+        env['LBPPC_VERSION'] = VERSION
         flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         self.clear_log()
         if self.settings['frame_gen'] == 'dlss' and not all((BIN / name).is_file() for name in DLSS_FILES):
@@ -445,7 +711,8 @@ class Launcher(tk.Tk):
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.set_enabled(False)
         self.stop_button.set_enabled(True)
-        self.set_state('Starting…', ACCENT)
+        self.set_state('Starting...', WARN)
+        self.friends.game_running(True)
 
     def read_output(self, process):
         for raw in process.stdout:
@@ -489,6 +756,7 @@ class Launcher(tk.Tk):
     def finished(self, code):
         self.process = None
         self.stop_button.set_enabled(False)
+        self.friends.game_running(False)
         if code == 0:
             self.set_state('Closed', MUTED)
         else:
@@ -508,6 +776,572 @@ class Launcher(tk.Tk):
     def close(self):
         self.stop()
         self.destroy()
+
+
+class Slider:
+    """A value dragged along a lime track on a Scene (log scale: equal steps double and halve), its value beside it.
+    `on_change(value)` runs when the knob is let go."""
+
+    def __init__(self, scene, x, y, w, lo, hi, value, on_change, tags=()):
+        self.scene, self.x, self.y, self.w, self.lo, self.hi = scene, x, y, w - 60, lo, hi
+        self.on_change, self.value = on_change, value
+        self.track = scene.create_line(x, y, x + self.w, y, width=8, capstyle='round', fill=theme.FIELD_EDGE, tags=tags)
+        self.fill = scene.create_line(x, y, x, y, width=8, capstyle='round', fill=theme.hex_colour(theme.LIME),
+                                      tags=tags)
+        self.knob = scene.create_oval(0, 0, 0, 0, fill='#ffffff', outline=theme.hex_colour(theme.LIME), width=3,
+                                      tags=tags)
+        self.label = scene.create_text(x + self.w + 18, y, anchor='w', font=('Segoe UI Semibold', 10), fill=TEXT,
+                                       tags=tags)
+        for item in (self.track, self.fill, self.knob):
+            scene.tag_bind(item, '<Button-1>', self.drag)
+            scene.tag_bind(item, '<B1-Motion>', self.drag)
+            scene.tag_bind(item, '<ButtonRelease-1>', lambda _e: self.on_change(self.value))
+            scene.tag_bind(item, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
+            scene.tag_bind(item, '<Leave>', lambda _e: scene.configure(cursor=''))
+        self.draw()
+
+    def items(self):
+        return [self.track, self.fill, self.knob, self.label]
+
+    def draw(self):
+        t = math.log(self.value / self.lo) / math.log(self.hi / self.lo)
+        kx = self.x + max(0.0, min(1.0, t)) * self.w
+        self.scene.coords(self.fill, self.x, self.y, kx, self.y)
+        self.scene.coords(self.knob, kx - 9, self.y - 9, kx + 9, self.y + 9)
+        self.scene.itemconfigure(self.label, text=f'{self.value:.2f}x')
+
+    def drag(self, event):
+        t = max(0.0, min(1.0, (event.x - self.x) / self.w))
+        self.value = round(self.lo * (self.hi / self.lo) ** t, 2)
+        self.draw()
+
+
+# Tk key names (event.keysym) to input.ini's; keypad digits come by Windows virtual key code instead (Tk gives
+# them the same keysym as the top row).
+TK_KEYS = {
+    'space': 'space', 'Tab': 'tab', 'Return': 'enter', 'BackSpace': 'backspace', 'Delete': 'delete',
+    'Insert': 'insert', 'Home': 'home', 'End': 'end', 'Prior': 'pgup', 'Next': 'pgdown', 'Caps_Lock': 'capslock',
+    'Shift_L': 'lshift', 'Shift_R': 'rshift', 'Control_L': 'lctrl', 'Control_R': 'rctrl', 'Alt_L': 'lalt',
+    'Alt_R': 'ralt', 'Win_L': 'lwin', 'Win_R': 'rwin', 'Up': 'up', 'Down': 'down', 'Left': 'left', 'Right': 'right',
+    'grave': 'grave', 'quoteleft': 'grave', 'minus': 'minus', 'equal': 'equals', 'bracketleft': 'lbracket',
+    'bracketright': 'rbracket', 'backslash': 'backslash', 'semicolon': 'semicolon', 'apostrophe': 'apostrophe',
+    'quoteright': 'apostrophe', 'comma': 'comma', 'period': 'period', 'slash': 'slash', 'Print': 'printscreen',
+    'Scroll_Lock': 'scrolllock', 'Pause': 'pausebreak', 'KP_Enter': 'kpenter', 'KP_Add': 'kpplus',
+    'KP_Subtract': 'kpminus', 'KP_Multiply': 'kpasterisk', 'KP_Divide': 'kpslash', 'KP_Decimal': 'kpperiod',
+}
+WINDOWS_KEYPAD = {**{96 + d: f'kp{d}' for d in range(10)}, 106: 'kpasterisk', 107: 'kpplus', 109: 'kpminus',
+                  110: 'kpperiod', 111: 'kpslash'}
+TK_MOUSE = {1: 'leftbutton', 2: 'middlebutton', 3: 'rightbutton', 4: 'sidebuttonback', 5: 'sidebuttonforward',
+            8: 'sidebuttonback', 9: 'sidebuttonforward'}
+
+
+def tk_key_name(event):
+    """input.ini's name for a Tk key press, or None."""
+    if os.name == 'nt' and event.keycode in WINDOWS_KEYPAD:
+        return WINDOWS_KEYPAD[event.keycode]
+    keysym = event.keysym
+    if keysym in TK_KEYS:
+        return TK_KEYS[keysym]
+    if keysym.startswith('KP_') and keysym[3:].isdigit():
+        return f'kp{keysym[3:]}'
+    if re.fullmatch(r'F([1-9]|1[0-2])', keysym):
+        return keysym.lower()
+    if len(keysym) == 1 and keysym.isascii() and keysym.isalnum():
+        return keysym.lower()
+    return None
+
+
+class ControlsPage:
+    """The Controls page (in place of the Game page's panels): how the game uses the mouse, and the keys, mouse
+    buttons and controller buttons of each game button. Every change is written to input.ini at once
+    (input_settings.py); F8 in the game reloads it."""
+
+    ROW = 36
+    COLUMNS = (250, 410, 580)  # second key, controller: x of each column in the list
+    CELL_W = 150
+
+    def __init__(self, launcher, x, y, w, h):
+        self.launcher, self.scene = launcher, launcher.scene
+        self.model = input_settings.InputSettings.load(INPUT_INI)
+        self.capturing = None   # (output, slot) while waiting for a key
+        self.confirm_reset = False
+        self.items = []         # the page's canvas items, hidden with the page
+        scene = self.scene
+        before = set(scene.find_all())
+        mouse_h = 176
+        half = (w - 40) // 2 - 10
+        right = x + 20 + half + 20
+
+        # Mouse
+        scene.image('panel:mouse', theme.panel(w, mouse_h, 'Mouse'), x, y)
+        launcher.label('label:mouse_mode', x + 20, y + 44, 'Mouse in the game')
+        names = [name for _value, name in input_settings.MOUSE_MODES]
+        self.mouse_mode = tk.StringVar(value=dict(input_settings.MOUSE_MODES)[self.model.mouse_mode])
+        box = ttk.Combobox(launcher, textvariable=self.mouse_mode, values=names, state='readonly', font=UI_FONT,
+                           style='Night.TCombobox')
+        box.bind('<<ComboboxSelected>>', lambda _e: (self.mouse_changed(), launcher.selection_clear()))
+        scene.widget(box, x + 20, y + 66, half, 28)
+        launcher.label('label:speed', right, y + 44, 'Sensitivity')
+        self.speed = Slider(scene, right + 8, y + 80, half - 8, *input_settings.SPEED_RANGE, self.model.speed,
+                            self.speed_changed)
+        launcher.label('label:vertical', x + 20, y + 106, 'Up and down, compared with sideways')
+        self.vertical = Slider(scene, x + 28, y + 142, half - 8, *input_settings.VERTICAL_RANGE, self.model.vertical,
+                               self.vertical_changed)
+        self.invert_at = (right, y + 130)
+        self.invert_box = scene.image('invert:box', theme.checkbox(self.model.invert_y), *self.invert_at)
+        scene.tag_bind(self.invert_box, '<Button-1>', lambda _e: self.toggle_invert())
+        launcher.label('label:invert', right + 30, y + 131, 'Invert up and down')
+        self.mouse_hint = launcher.text(right + 2, y + 156, '', HINT_FONT, MUTED, 'nw', width=half)
+
+        # Buttons
+        by = y + mouse_h + 12
+        bh = h - mouse_h - 12
+        scene.image('panel:buttons', theme.panel(w, bh, 'Buttons'), x, by)
+        self.reset_link = launcher.text(x + w - 20, by + 21, 'Reset to defaults', ('Segoe UI Semibold', 10),
+                                        theme.hex_colour((200, 225, 150)), 'e')
+        scene.tag_bind(self.reset_link, '<Button-1>', lambda _e: self.reset())
+        scene.tag_bind(self.reset_link, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
+        scene.tag_bind(self.reset_link, '<Leave>', lambda _e: scene.configure(cursor=''))
+        for column, title in zip((x + 14 + 12,) + tuple(x + 14 + c for c in self.COLUMNS),
+                                 ('Game button', 'Key or mouse', 'Second key', 'Controller')):
+            launcher.text(column, by + 46, title, ('Segoe UI Semibold', 9), MUTED)
+        self.status = launcher.text(x + 20, by + bh - 22, 'Click a key, then press the new key or mouse button. '
+                                    'Right-click a key to clear it.', HINT_FONT, MUTED, 'w', width=w - 40)
+        self.list = Scene(launcher, w - 28, bh - 104)
+        self.list.configure(bg=FriendsPanel.LIST_BG)
+        scene.widget(self.list, x + 14, by + 66, w - 28, bh - 104)
+        self.list.bind('<Enter>', lambda _e: self.list.bind_all('<MouseWheel>', self.wheel))
+        self.list.bind('<Leave>', lambda _e: self.list.unbind_all('<MouseWheel>'))
+        self.pad_boxes = {}
+        self.draw_list()
+        self.update_mouse_hint()
+        self.items = [item for item in scene.find_all() if item not in before]
+
+    # Mouse
+
+    def update_mouse_hint(self):
+        mode = self.model.mouse_mode
+        text = {'off': 'The game does not use the mouse.',
+                'touchpad': 'F7 captures it. Wheel resizes, Ctrl + wheel rotates.'}.get(
+                    mode, 'F7 in the game captures the mouse and frees it.')
+        self.scene.itemconfigure(self.mouse_hint, text=text)
+
+    def mouse_changed(self):
+        self.model.mouse_mode = next(value for value, name in input_settings.MOUSE_MODES
+                                     if name == self.mouse_mode.get())
+        self.update_mouse_hint()
+        self.save('Mouse: ' + self.mouse_mode.get() + '.')
+
+    def speed_changed(self, value):
+        self.model.speed = value
+        self.save(f'Sensitivity {self.model.speed:.2f}x.')
+
+    def vertical_changed(self, value):
+        self.model.vertical = value
+        self.save(f'Up and down sensitivity {value:.2f}x of sideways.')
+
+    def toggle_invert(self):
+        self.model.invert_y = not self.model.invert_y
+        self.scene.image('invert:box', theme.checkbox(self.model.invert_y), *self.invert_at)
+        self.save('Up and down inverted.' if self.model.invert_y else 'Up and down not inverted.')
+
+    # Saving
+
+    def set_status(self, text, colour=MUTED):
+        self.scene.itemconfigure(self.status, text=text, fill=colour)
+
+    def save(self, done):
+        try:
+            self.model.save(INPUT_INI)
+        except OSError as error:
+            self.set_status(f'input.ini could not be saved: {error}', ERROR)
+            return
+        if self.launcher.process:
+            done += ' Press F8 in the game to use it now.'
+        self.set_status(done, GOOD)
+
+    def reset(self):
+        if not self.confirm_reset:
+            self.confirm_reset = True
+            self.scene.itemconfigure(self.reset_link, text='Reset everything? Click again', fill=ERROR)
+            self.launcher.after(4000, self.cancel_reset)
+            return
+        self.cancel_reset()
+        self.model = input_settings.InputSettings()
+        self.mouse_mode.set(dict(input_settings.MOUSE_MODES)[self.model.mouse_mode])
+        self.speed.value, self.vertical.value = self.model.speed, self.model.vertical
+        self.speed.draw()
+        self.vertical.draw()
+        self.scene.image('invert:box', theme.checkbox(self.model.invert_y), *self.invert_at)
+        self.update_mouse_hint()
+        self.draw_list()
+        self.save('Controls reset to the defaults.')
+
+    def cancel_reset(self):
+        self.confirm_reset = False
+        self.scene.itemconfigure(self.reset_link, text='Reset to defaults', fill=theme.hex_colour((200, 225, 150)))
+
+    # The list of buttons
+
+    def wheel(self, event):
+        if not self.capturing:
+            self.list.yview_scroll(-event.delta // 120, 'units')
+
+    def draw_list(self):
+        view = self.list
+        view.delete('all')
+        for box in self.pad_boxes.values():
+            box.destroy()
+        self.pad_boxes = {}
+        pad_labels = ['None'] + [input_settings.PAD_LABELS[name] for name in input_settings.PAD_BUTTONS +
+                                 input_settings.PAD_HALF_AXES]
+        pad_names = [None] + input_settings.PAD_BUTTONS + input_settings.PAD_HALF_AXES
+        for row, (output, label, hint) in enumerate(input_settings.ACTIONS):
+            y = 6 + row * self.ROW
+            cy = y + self.ROW // 2 - 3
+            if row % 2:
+                view.create_rectangle(0, y - 2, int(view['width']), y + self.ROW - 4, fill='#141a2b', outline='')
+            item = view.create_text(12, cy, text=label, anchor='w', font=('Segoe UI Semibold', 10), fill=TEXT)
+            if hint:
+                view.create_text(view.bbox(item)[2] + 8, cy, text=hint, anchor='w', font=HINT_FONT, fill=MUTED)
+            for slot in (0, 1):
+                self.draw_cell(output, slot, y)
+            if output in input_settings.STICK_OUTPUTS:
+                view.create_text(self.COLUMNS[2] + 6, cy, text='The stick itself', anchor='w', font=HINT_FONT,
+                                 fill=MUTED)
+                continue
+            current = self.model.pad[output][0] if self.model.pad[output] else None
+            var = tk.StringVar(value=pad_labels[pad_names.index(current)] if current in pad_names else current)
+            box = ttk.Combobox(self.list, textvariable=var, values=pad_labels, state='readonly', font=UI_FONT,
+                               style='Night.TCombobox', height=16)
+            box.bind('<<ComboboxSelected>>', lambda _e, o=output, v=var: self.pad_changed(o, pad_names[
+                pad_labels.index(v.get())], v.get()))
+            view.create_window(self.COLUMNS[2], y + 2, window=box, anchor='nw', width=self.CELL_W + 20, height=26)
+            self.pad_boxes[output] = box
+        view.configure(scrollregion=(0, 0, int(view['width']), 12 + len(input_settings.ACTIONS) * self.ROW))
+
+    def draw_cell(self, output, slot, y):
+        view = self.list
+        tag = f'cell:{output}:{slot}'
+        view.delete(tag)
+        names = self.model.keys[output]
+        capturing = self.capturing == (output, slot)
+        name = names[slot] if slot < len(names) else None
+        if slot == 1 and len(names) == 0 and not capturing:
+            return  # a second key only once there is a first
+        x = self.COLUMNS[slot]
+        view.create_rectangle(x, y + 2, x + self.CELL_W, y + 28, fill=theme.FIELD, width=2 if capturing else 1,
+                              outline=theme.hex_colour(theme.ORANGE) if capturing else theme.FIELD_EDGE, tags=(tag,))
+        text = 'Press a key...' if capturing else input_settings.key_label(name) if name else 'Add'
+        view.create_text(x + self.CELL_W // 2, y + 15, text=text, font=UI_FONT, tags=(tag,),
+                         fill=theme.hex_colour(theme.ORANGE) if capturing else TEXT if name else MUTED)
+        view.tag_bind(tag, '<ButtonRelease-1>', lambda _e: self.start_capture(output, slot))
+        view.tag_bind(tag, '<Button-3>', lambda _e: self.clear(output, slot))
+        view.tag_bind(tag, '<Enter>', lambda _e: view.configure(cursor='hand2'))
+        view.tag_bind(tag, '<Leave>', lambda _e: view.configure(cursor=''))
+
+    def row_y(self, output):
+        return 6 + [o for o, _l, _h in input_settings.ACTIONS].index(output) * self.ROW
+
+    def label_of(self, output):
+        return next(label for o, label, _h in input_settings.ACTIONS if o == output)
+
+    def pad_changed(self, output, name, shown):
+        self.model.set_pad(output, name)
+        self.launcher.selection_clear()
+        self.save(f'{self.label_of(output)}: {shown} on the controller.')
+
+    def clear(self, output, slot):
+        if self.capturing:
+            return
+        self.model.clear_key(output, slot)
+        self.draw_list_row(output)
+        self.save(f'{self.label_of(output)}: key cleared.')
+
+    def draw_list_row(self, output):
+        for slot in (0, 1):
+            self.draw_cell(output, slot, self.row_y(output))
+
+    # Waiting for the new key
+
+    def start_capture(self, output, slot):
+        if self.capturing:
+            return
+        self.capturing = (output, slot)
+        self.draw_list_row(output)
+        self.set_status('Press the new key or mouse button for ' + self.label_of(output) + ' (Esc cancels).',
+                        theme.hex_colour(theme.ORANGE))
+        root = self.launcher
+        root.after(80, lambda: (root.bind_all('<KeyPress>', self.key_pressed), root.bind_all(
+            '<ButtonPress>', self.mouse_pressed), root.bind_all('<MouseWheel>', self.wheel_pressed)))
+
+    def stop_capture(self):
+        output = self.capturing[0]
+        self.capturing = None
+        for sequence in ('<KeyPress>', '<ButtonPress>', '<MouseWheel>'):
+            self.launcher.unbind_all(sequence)
+        self.draw_list_row(output)
+
+    def key_pressed(self, event):
+        if event.keysym == 'Escape':
+            self.stop_capture()
+            self.set_status('Not changed.')
+            return 'break'
+        name = tk_key_name(event)
+        if not name:
+            self.set_status(f'That key ({event.keysym}) cannot be used. Press another, or Esc.', ERROR)
+            return 'break'
+        self.assign(name)
+        return 'break'
+
+    def mouse_pressed(self, event):
+        name = TK_MOUSE.get(event.num)
+        if name:
+            self.assign(name)
+        return 'break'
+
+    def wheel_pressed(self, event):
+        self.assign('mousewheelup' if event.delta > 0 else 'mousewheeldown')
+        return 'break'
+
+    def assign(self, name):
+        output, slot = self.capturing
+        if name in input_settings.RESERVED_KEYS:
+            self.set_status(f'{input_settings.key_label(name)} {input_settings.RESERVED_KEYS[name]} in the game. '
+                            'Press another key, or Esc.', ERROR)
+            return
+        self.stop_capture()
+        moved = self.model.bind_key(output, slot, name)
+        self.draw_list_row(output)
+        if moved:
+            self.draw_list_row(moved)
+        label = input_settings.key_label(name)
+        self.save(f'{label} moved from {self.label_of(moved)} to {self.label_of(output)}.' if moved else
+                  f'{self.label_of(output)}: {label}.')
+
+
+class FriendsPanel:
+    """The player's shadNet friends, beside the settings: a name to send a request to, then the requests to answer,
+    the friends (online first), and the requests sent, each in its own card. Friends are the players who may join
+    this player's game (signaling_handler.cpp's join protection).
+
+    shadNet takes one sign-in per account, so the list signs in only for a moment (to read or change it) and never
+    while the game runs; Play waits for a sign-in in progress."""
+
+    REFRESH_MS = 60000
+    LIST_BG = '#0f1320'  # the panel's colour over the felt
+    SECTIONS = (('received', 'Friend requests', theme.ORANGE), ('friends', 'Friends', theme.GREEN),
+                ('sent', 'Sent requests', theme.GREY))
+
+    def __init__(self, launcher, x, y, w, h):
+        self.launcher, self.scene = launcher, launcher.scene
+        self.busy = self.paused = False
+        self.friends = None
+        self.signed_in_as = None
+        self.tabs, self.confirm = [], None
+        self.scene.image('panel:friends', theme.panel(w, h, 'Friends'), x, y)
+        self.add_name = tk.StringVar()
+        self.add_button = Tab(self.scene, 'Add', self.send_request, x + w - 18, y + 61, 'e', size=14, tilt=2)
+        entry = field(launcher, self.add_name)
+        entry.bind('<Return>', lambda _e: self.send_request())
+        self.scene.widget(entry, x + 20, y + 46, w - 40 - self.add_button.width - 14, 30)
+        self.status = self.scene.create_text(x + 21, y + 84, anchor='nw', font=HINT_FONT, fill=MUTED, width=w - 42,
+                                             text='Add a friend by their online name.')
+        self.list = Scene(launcher, w - 28, h - 124)
+        self.list.configure(bg=self.LIST_BG)
+        self.list_w = w - 28
+        self.scene.widget(self.list, x + 14, y + 112, w - 28, h - 124)
+        self.list.bind('<Enter>', lambda _e: self.list.bind_all('<MouseWheel>', self.wheel))
+        self.list.bind('<Leave>', lambda _e: self.list.unbind_all('<MouseWheel>'))
+        self.draw()
+        launcher.after(300, self.account_changed)
+        launcher.after(self.REFRESH_MS, self.tick)
+
+    # The account and when to sign in
+
+    def account(self):
+        """(shadNet server, name, password), or None with the reason shown."""
+        settings = self.launcher.settings
+        try:
+            online_accounts.check_name_and_password(settings['online_name'], settings['password'])
+            server = online_accounts.server_endpoints(settings['server'])['shadnet']
+        except online_accounts.AccountError:
+            return None
+        return server, settings['online_name'], settings['password']
+
+    def account_changed(self, force=False):
+        account = self.account()
+        if not account:
+            self.friends, self.signed_in_as = None, None
+            self.draw()
+            self.set_status('Add a friend by their online name.', MUTED)
+            return
+        if force or account != self.signed_in_as:
+            self.reload()
+
+    def tick(self):
+        if self.signed_in_as and not self.paused:
+            self.run(None, quiet=True)
+        self.launcher.after(self.REFRESH_MS, self.tick)
+
+    def game_running(self, running):
+        self.paused = running
+        if running:
+            self.set_status('The list updates again when the game closes.', MUTED)
+        self.draw()
+        if not running:
+            self.reload()
+
+    def set_status(self, text, colour):
+        self.scene.itemconfigure(self.status, text=text, fill=colour)
+
+    def run(self, action, done_text=None, quiet=False):
+        """`action(session)` on a fresh signed-in session, off the window's thread; the list is redrawn after."""
+        account = self.account()
+        if self.busy or self.paused or not account:
+            if not account and action:
+                self.set_status('Create an account (Online, on the left) to add friends.', ERROR)
+            return
+        self.busy = True
+        if not quiet:
+            self.set_status('Working...' if action else 'Signing in...', MUTED)
+        result = {}
+
+        def work():
+            client = f'LBPPC {VERSION} launcher'
+            try:
+                if action:
+                    with online_accounts.ShadnetSession(*account, client) as session:
+                        action(session)
+                with online_accounts.ShadnetSession(*account, client) as session:
+                    result['friends'] = session.friends
+            except online_accounts.AccountError as error:
+                result['error'] = str(error)
+
+        def finished():
+            if thread.is_alive():
+                self.launcher.after(150, finished)
+                return
+            self.busy = False
+            if 'error' in result:
+                self.set_status(result['error'], ERROR)
+                return
+            self.friends, self.signed_in_as = result['friends'], account
+            self.draw()
+            if done_text:
+                self.set_status(done_text, GOOD)
+            elif not quiet or self.scene.itemcget(self.status, 'fill') == ERROR:
+                self.set_status(f'Signed in as {account[1]}.', MUTED)
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        self.launcher.after(150, finished)
+
+    def reload(self):
+        self.run(None)
+
+    def send_request(self):
+        other = self.add_name.get().strip()
+        account = self.account()
+        if not re.fullmatch(online_accounts.NAME_PATTERN, other) or (account and other.lower() == account[1].lower()):
+            self.set_status('Type another player\'s online name.', ERROR)
+            return
+        self.add_name.set('')
+        self.run(lambda session: session.add(other), f'Request sent to {other}. They show as a friend once they '
+                                                      'accept.')
+
+    # The list
+
+    def wheel(self, event):
+        if self.list.bbox('all') and self.list.bbox('all')[3] > self.list.winfo_height():
+            self.list.yview_scroll(-event.delta // 120, 'units')
+
+    def link(self, x, y, text, command, colour=MUTED):
+        """A quiet text button (Decline, Cancel, Remove), right-aligned at x."""
+        item = self.list.create_text(x, y, text=text, anchor='e', font=('Segoe UI Semibold', 9), fill=colour)
+        self.list.tag_bind(item, '<Enter>', lambda _e: (self.list.itemconfigure(item, fill=TEXT),
+                                                        self.list.configure(cursor='hand2')))
+        self.list.tag_bind(item, '<Leave>', lambda _e: (self.list.itemconfigure(item, fill=colour),
+                                                        self.list.configure(cursor='')))
+        self.list.tag_bind(item, '<Button-1>', lambda _e: command())
+        return self.list.bbox(item)[0]
+
+    def remove_friend(self, other):
+        """Removing a friend asks once more: the first click turns the link into "Remove?"."""
+        if self.confirm == other:
+            self.confirm = None
+            self.run(lambda session: session.remove(other), f'Removed {other}.')
+        else:
+            self.confirm = other
+            self.draw()
+            self.launcher.after(4000, lambda: self.confirm == other and (setattr(self, 'confirm', None), self.draw()))
+
+    def draw(self):
+        view = self.list
+        for tab in self.tabs:
+            tab.forget()
+        self.tabs = []
+        view.delete('all')
+        view.images.clear()
+        view.configure(cursor='')
+        w, y = self.list_w, 0
+        if self.friends is None:
+            message = ('Create an account (Online, on the left) and your friends show here: requests to answer, '
+                       'friends, and requests you sent.') if not self.account() else 'Signing in...'
+            view.create_text(w // 2, 40, text=message, width=w - 40, justify='center', font=HINT_FONT, fill=MUTED)
+            return
+        friends = self.friends
+        rows = {'received': [(name, None) for name in friends.received],
+                'friends': sorted(friends.friends, key=lambda f: (not f[1], f[0].lower())),
+                'sent': [(name, None) for name in friends.sent]}
+        for key, title, accent in self.SECTIONS:
+            items = rows[key]
+            if not items and key != 'friends':
+                continue  # requests show only when there are some
+            empty = not items
+            height = 38 + (62 if empty else 36 * len(items)) + 6
+            view.image(f'card:{key}', theme.card(w, height, accent), 0, y)
+            heading = f'{title.upper()}  ({len(items)})'
+            if key == 'friends' and items:
+                heading += f'   {sum(1 for _n, online in items if online)} online'
+            view.create_text(18, y + 20, text=heading, anchor='w', font=('Segoe UI Semibold', 10),
+                             fill=theme.hex_colour(accent) if key != 'sent' else MUTED)
+            row_y = y + 38
+            if empty:
+                view.create_text(18, row_y + 26, anchor='w', width=w - 34, font=HINT_FONT, fill=MUTED,
+                                 text='No friends yet. Type a friend\'s online name above and press Add; once they '
+                                      'accept, they show here and can join your game.')
+            for name, online in items:
+                cy = row_y + 16
+                right = w - 14
+                if key == 'received':
+                    accept = Tab(view, 'Accept', lambda o=name: self.run(lambda s: s.add(o), f'You and {o} are friends.'),
+                                 right, cy, 'e', size=12, pad=(12, 6))
+                    self.tabs.append(accept)
+                    self.link(accept.cx - accept.width / 2 - 12, cy, 'Decline',
+                              lambda o=name: self.run(lambda s: s.remove(o), f'Declined {o}.'))
+                    view.create_text(18, cy, text=name, anchor='w', font=('Segoe UI Semibold', 10), fill=TEXT)
+                elif key == 'friends':
+                    dot = GOOD if online else '#5a6278'
+                    view.create_oval(18, cy - 5, 28, cy + 5, fill=dot, outline='')
+                    label = view.create_text(36, cy - 1, text=name, anchor='w', font=('Segoe UI Semibold', 10),
+                                             fill=TEXT)
+                    view.create_text(view.bbox(label)[2] + 8, cy, text='online' if online else 'offline', anchor='w',
+                                     font=('Segoe UI', 8), fill=GOOD if online else MUTED)
+                    if self.confirm == name:
+                        self.link(right, cy, 'Remove?', lambda o=name: self.remove_friend(o), ERROR)
+                    else:
+                        self.link(right, cy, 'Remove', lambda o=name: self.remove_friend(o))
+                else:
+                    view.create_text(18, cy, text=name, anchor='w', font=UI_FONT, fill=MUTED)
+                    self.link(right, cy, 'Cancel', lambda o=name: self.run(lambda s: s.remove(o),
+                                                                           f'Cancelled the request to {o}.'))
+                row_y += 36
+            y += height + 12
+        view.configure(scrollregion=(0, 0, w, max(y, 1)))
+        if self.paused:
+            for tab in self.tabs:
+                tab.set_enabled(False)
 
 
 def run_script(argv):
