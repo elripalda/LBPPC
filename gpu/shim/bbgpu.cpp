@@ -3,6 +3,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_invite.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -421,6 +422,12 @@ ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
+}
+
+extern "C" int bbgpu_invite_accept_shown(void) {
+    if (!BbInvite::Shown()) return 0;
+    BbInvite::Answer(true);
+    return 1;
 }
 
 extern "C" int bbgpu_audio_muted(void) {

@@ -6,6 +6,7 @@
  * Every entry here is an explicit contract; unknown functions still stop. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/bbgpu.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -127,10 +128,19 @@ static ABI int32_t tracker_no_state(void) { return MOVE_INVALID_HANDLE; }
 
 /* Live streaming: never broadcasting, no viewers' messages. */
 static ABI int32_t ok_void(void) { return ORBIS_OK; }
+/* Game custom data dialog (param: the common dialog header, 0x30 bytes, then size and mode). LBP3 opens mode 1
+ * to send its data to friends and mode 2 to look at what it received: its Triangle prompt for an invitation.
+ * Mode 2 with an invitation on screen joins it (bbport_invite.h), as the system dialog's choice would. Either
+ * way the dialog finishes at once with nothing chosen. */
+enum { CUSTOM_DATA_SEND=1, CUSTOM_DATA_RECEIVED=2 };
 static unsigned custom_dialogs;
-static ABI int32_t custom_dialog_open(const void *param) {
-    (void)param;
-    if (++custom_dialogs<=5) printf("Runtime: game custom data dialog opened\n");
+static ABI int32_t custom_dialog_open(const uint8_t *param) {
+    int32_t mode=0;
+    if (param) memcpy(&mode,param+0x34,4);
+    int joined=mode==CUSTOM_DATA_RECEIVED && bbgpu_invite_accept_shown();
+    if (++custom_dialogs<=20)
+        printf("Runtime: game custom data dialog opened (mode %d%s)\n",mode,
+               joined ? ": joining the invitation on screen" : "");
     return ORBIS_OK;
 }
 static ABI int32_t ok_zero_out(void *out) { if (out) memset(out,0,64); return ORBIS_OK; }

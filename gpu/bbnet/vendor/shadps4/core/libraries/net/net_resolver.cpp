@@ -65,6 +65,14 @@ bool IsOnline() {
 
 // IPv4 only, at most 10 records.
 s32 Lookup(std::string hostname, bool allow_literal, std::vector<u32>* addrs) {
+    // lbppc: Refresh's network_settings.nws gives its config URL as CDNHostName and TelemetryServer, which
+    // LBP3 looks up as names for its server ping ("https://play.lbppc.com/lbp"). A URL resolves its host.
+    if (const auto scheme = hostname.find("://"); scheme != std::string::npos) {
+        std::string host = hostname.substr(scheme + 3);
+        host = host.substr(0, host.find_first_of("/:?#"));
+        LOG_DEBUG(Lib_Net, "lookup of {} as {}", hostname, host);
+        hostname = std::move(host);
+    }
     if (!hostname.empty() && hostname.back() == '.') {
         hostname.pop_back();
     }

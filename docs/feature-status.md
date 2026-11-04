@@ -20,7 +20,7 @@ criteria and the release gates pass.
 | ID | Feature | State | Notes |
 |---|---|---|---|
 | NET-01 | Community account and identity | In Progress | One LBPPC account (shadNet and Refresh) created from the launcher; server at lbppc.com. |
-| NET-02 | Secure multiplayer sessions | In Progress | Invitations arrive and are accepted; joining still fails with "failed to join". Join protection: friends only. Open: Refresh `/match` 500, the GameCustomDataDialog, the GameConfigStorageUrl lookup. |
+| NET-02 | Secure multiplayer sessions | In Progress | Invitations arrive and are accepted; joining still fails with "failed to join". Join protection: friends only. LBP3's own Triangle prompt for an invitation (the game custom data dialog, mode 2) now joins it like Cross on ours; untested with two players. The server ping's lookup of Refresh's `CDNHostName` (a URL) now resolves the URL's host. Open: Refresh `/match` 500; sending game custom data (mode 1) still reports success without sending. |
 | NET-03 | Level publishing and discovery | Not Started | Refresh supports it; not yet tried from the game. |
 | NET-04 | Reporting, blocking, moderation | Not Started | |
 | NET-05 | Stats, events, leaderboards | Not Started | |
