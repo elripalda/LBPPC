@@ -91,6 +91,8 @@ public:
         u32 count, index; ///< generated frames for this pair, and which one (1-based)
     };
     [[nodiscard]] bool HasFrameGen(const FrameGenDesc& desc) const;
+    /// Whether a feature exists at all (one the GPU may still be using).
+    [[nodiscard]] bool HasAnyFrameGen() const;
     /// Records the feature creation. The GPU must be done with the previous one.
     bool CreateFrameGen(vk::CommandBuffer command, const FrameGenDesc& desc);
     bool EvaluateFrameGen(vk::CommandBuffer command, const FrameGenFrame& frame);

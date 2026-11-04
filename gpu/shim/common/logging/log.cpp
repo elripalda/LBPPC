@@ -17,7 +17,17 @@ static Level threshold() {
     }();
     return level;
 }
-bool ShouldLog(Level level) { return level >= threshold(); }
+static bool OnlineClass(std::string_view log_class) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("BB_ONLINE_LOG");
+        return v && v[0] == '1';
+    }();
+    return enabled && (log_class.starts_with("Lib.Np") || log_class.starts_with("Lib.Http") ||
+                       log_class == "NpHandler" || log_class == "ShadNet");
+}
+bool ShouldLog(std::string_view log_class, Level level) {
+    return level >= threshold() || (level >= Level::info && OnlineClass(log_class));
+}
 void Write(std::string_view log_class, Level level, const char* file, int line, const char* function,
            std::string&& message) {
     static std::mutex mutex;

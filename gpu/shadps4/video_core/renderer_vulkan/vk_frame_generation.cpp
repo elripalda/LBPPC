@@ -893,12 +893,19 @@ u32 FrameGenerator::GenerateDlss(vk::CommandBuffer cmdbuf, vk::Image color,
     const Dlss::FrameGenDesc desc{width, height, ColorFormat, input_width, input_height};
     if (!dlss->HasFrameGen(desc)) {
         // The previous feature may still be used by submitted work; `cmdbuf` stays open.
-        scheduler.WaitSubmitted();
+        if (dlss->HasAnyFrameGen()) {
+            scheduler.WaitSubmitted();
+        }
         dlss->ReleaseFrameGen();
+        const auto start = std::chrono::steady_clock::now();
         if (!dlss->CreateFrameGen(cmdbuf, desc)) {
             Fail(BbSettings::FrameGenDlss, "DLSS Frame Generation feature creation failed");
             return 0;
         }
+        std::printf("DLSS: Frame Generation set up in %.0f ms\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              start)
+                        .count());
         reset = true;
     }
     const auto resource = [](vk::Image image, vk::ImageView view, vk::Format format, u32 w,

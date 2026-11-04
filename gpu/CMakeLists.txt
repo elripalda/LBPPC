@@ -198,8 +198,8 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
 # bbport online: shadPS4 v.0.20.0's network, NP and shadNet sources (bbnet/vendor/shadps4,
-# 529ceb3, with bbnet/vendor-changes.diff) and The Hunter's Dream backend (bbnet/thd, from
-# droogie's bbhost), as Awaken (Awakenchan/BloodBorneButPc) put them together.
+# 529ceb3, with bbnet/vendor-changes.diff), as Awaken (Awakenchan/BloodBorneButPc) put them
+# together.
 # See bbnet/SHADNET-PORT.md.
 find_package(Protobuf CONFIG REQUIRED)
 set(BBNET_VENDOR "${CMAKE_CURRENT_SOURCE_DIR}/bbnet/vendor/shadps4")
@@ -217,9 +217,8 @@ file(GLOB_RECURSE BBNET_SOURCES CONFIGURE_DEPENDS
 # Trophies, commerce and the profile and Facebook dialogs stay in the C runtime.
 list(FILTER BBNET_SOURCES EXCLUDE REGEX
     "np_trophy|trophy_ui|np_sns_facebook_dialog|np_profile_dialog/|np_commerce/")
-file(GLOB BBNET_THD_SOURCES CONFIGURE_DEPENDS bbnet/thd/*.cpp)
 find_package(nlohmann_json CONFIG REQUIRED)
-add_library(bbnet STATIC ${BBNET_SOURCES} ${BBNET_THD_SOURCES} "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
+add_library(bbnet STATIC ${BBNET_SOURCES} "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
     bbnet/bbnet_glue.cpp)
 target_include_directories(bbnet PRIVATE bbnet/include bbnet shim "${BBNET_VENDOR}"
     "${BBNET_VENDOR}/shadnet" shadps4 "${SHADNET_PROTO_OUT}" third_party/imgui third_party/httplib)
@@ -231,7 +230,7 @@ target_compile_definitions(bbnet PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_Z
 # OpenSSL verifies the server's chain (with the Windows ROOT and CA stores) and the host name.
 # cpp-httplib's second check on Windows rebuilt the chain from the leaf alone and could pick an
 # expired cross-signed "ISRG Root X2" from the user's intermediate store: "SSL server
-# verification failed" (error 10) for The Hunter's Dream on some PCs.
+# verification failed" (error 10) on some PCs.
 target_compile_definitions(bbnet PRIVATE CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
 target_link_libraries(bbnet PRIVATE OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
 if (WIN32)
@@ -335,10 +334,6 @@ if (WIN32)
         fsr411_dx12/sdk/api/include fsr411_dx12/sdk/upscalers/include)
     target_compile_definitions(bb-gpu-capabilities PRIVATE NOMINMAX)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan d3d12 dxgi)
-    # "Play Bloodborne.exe": the game with the launcher's saved settings, no launcher window.
-    add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
-    target_compile_options(bb-play PRIVATE -municode)
-    target_link_options(bb-play PRIVATE -municode)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
@@ -431,14 +426,6 @@ target_compile_options(pad-use-test PRIVATE -UNDEBUG)
 add_executable(vram-warning-test EXCLUDE_FROM_ALL ../tests/test_vram_warning.cpp)
 target_include_directories(vram-warning-test PRIVATE shim)
 target_compile_options(vram-warning-test PRIVATE -UNDEBUG)
-
-# bbport: keyboard and mouse button prompt icons: ninja -C out/gpu prompt-icons-test, then run it
-# (with a folder argument it writes each icon drawn and encoded, for viewing).
-add_executable(prompt-icons-test EXCLUDE_FROM_ALL ../tests/test_prompt_icons.cpp shim/bbport_prompt_icons.cpp)
-target_include_directories(prompt-icons-test PRIVATE shim third_party/imgui)
-target_compile_definitions(prompt-icons-test PRIVATE
-    BB_TEST_FONT="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
-target_compile_options(prompt-icons-test PRIVATE -UNDEBUG)
 
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp

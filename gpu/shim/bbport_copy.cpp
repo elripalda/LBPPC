@@ -24,9 +24,10 @@ thread_local bool in_copy_thread = false;
 class Pool {
 public:
     Pool() {
-        // Copies are on the critical path (fences wait for them): normal priority, a quarter
-        // of the hardware threads available to the process (Steam Deck 2).
-        unsigned count = std::clamp(BbThreads::Available() / 4, 1u, 4u);
+        // Copies are on the critical path (fences wait for them): normal priority, half the
+        // hardware threads available to the process, at most 4. lbppc: they are idle between
+        // loading bursts; with a quarter (2 on 8 threads) level entry waited 45 ms for them.
+        unsigned count = std::clamp(BbThreads::Available() / 2, 1u, 4u);
         if (const char* env = std::getenv("BB_COPY_THREADS")) {
             count = static_cast<unsigned>(std::clamp(std::atoi(env), 0, 16));
         }

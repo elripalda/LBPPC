@@ -224,6 +224,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks) {
         flush_request();
     } else {
+        BbStats::fault_readbacks.fetch_add(1, std::memory_order_relaxed);
+        BbStats::Timer timer{BbStats::t_fault_readbacks};
         liverpool->SendCommand<true>(std::move(flush_request));
     }
 }

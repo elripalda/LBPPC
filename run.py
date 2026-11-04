@@ -10,10 +10,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / 'out'
 MSYS2_BIN = Path(r'C:\msys64\clang64\bin')  # development builds: SDL3 and the other CLANG64 DLLs
+RESTART_EXIT_CODE = 75  # the in-game menu's Apply and restart (probe.c runtime_restart)
 
 
 def script(name, *args):
@@ -22,6 +24,48 @@ def script(name, *args):
     result = subprocess.run([*python, str(HERE / 'scripts' / name), *map(str, args)], stdin=subprocess.DEVNULL)
     if result.returncode:
         sys.exit(f'{name} failed ({result.returncode})')
+
+
+def keep_previous_log(keep=10):
+    # The last run's log moves to out/logs/run-<when it ended>.log, so a play session's log survives later starts.
+    last = OUT / 'last_run.log'
+    if not last.is_file():
+        return
+    logs = OUT / 'logs'
+    logs.mkdir(exist_ok=True)
+    when = time.strftime('%Y%m%d-%H%M%S', time.localtime(last.stat().st_mtime))
+    try:
+        last.replace(logs / f'run-{when}.log')
+    except OSError:
+        return
+    for old in sorted(logs.glob('run-*.log'))[:-keep]:
+        old.unlink(missing_ok=True)
+
+
+def system_summary():
+    """One line for the top of the log: the port's version and the PC it runs on (the GPU and its driver follow
+    from the renderer), so a player's log says what it came from."""
+    import platform
+    cpu, ram = platform.processor() or '?', '?'
+    if os.name == 'nt':
+        import ctypes
+        import winreg
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\CentralProcessor\0')
+            cpu = winreg.QueryValueEx(key, 'ProcessorNameString')[0].strip()
+        except OSError:
+            pass
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + \
+                       [(name, ctypes.c_ulonglong) for name in ('total', 'avail', 'page_total', 'page_avail',
+                                                                'virtual_total', 'virtual_avail', 'extended')]
+        status = MemoryStatus(length=ctypes.sizeof(MemoryStatus))
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            ram = f'{status.total / 2**30:.0f} GB'
+    version = os.environ.get('LBPPC_VERSION', 'development build')
+    return (f'System: LBPPC {version}; {platform.system()} {platform.release()} ({platform.version()}); {cpu}, '
+            f'{os.cpu_count()} threads; {ram} RAM\n')
 
 
 def main(argv):
@@ -62,6 +106,9 @@ def main(argv):
     env.setdefault('BB_LOW_LATENCY', 'on')
     env.setdefault('BB_VBLANK_HZ', '0')
     env.setdefault('BB_FPS_LIMIT', '30')
+    # Beta: frame rate, pacing and where each frame's time went, every 5 s in the log (a few KB a minute), so a
+    # player's slow level can be told apart (the game's own work, the GPU, shader compiles, stalls).
+    env.setdefault('BB_FRAME_STATS', '1')
     # Online: LBPPC_NP_USER=<name> signs in locally as that player (no PSN or shadNet account) and
     # LBPPC_SERVER=<url> sends the game's server requests (Sony's, now closed) to a custom server, such as a
     # Refresh instance.
@@ -70,6 +117,10 @@ def main(argv):
     # game's PSN Web API calls.
     if env.get('BB_SHADNET_NPID'):
         env.setdefault('BB_ONLINE', '1')
+        # Beta: sign-in, sessions, invitations and joins in the log (the online classes from info).
+        env.setdefault('BB_ONLINE_LOG', '1')
+        # What the server's clientversions.cfg checks (it can turn old LBPPC builds away).
+        env.setdefault('BB_CLIENT_VERSION', f"LBPPC {env.get('LBPPC_VERSION', 'development build')}")
         env.setdefault('BB_P2P_PORT', '0')
         host = env.get('BB_SHADNET_SERVER', '127.0.0.1').rsplit(':', 1)[0]
         env.setdefault('BB_SHADNET_WEBAPI', f'http://{host}:31315')
@@ -86,14 +137,22 @@ def main(argv):
         env['PATH'] = f'{MSYS2_BIN}{os.pathsep}{env.get("PATH", "")}'
     command = [str(probe), str(OUT / 'boot-linked.bin'), '--content-profile', str(OUT / 'content.bin'),
                '--app0', str(game), '--user', str(user), '--timeout', '0', *argv[1:]]
+    keep_previous_log()
     with (OUT / 'last_run.log').open('wb') as log:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, env=env, cwd=HERE)
-        for line in process.stdout:
-            log.write(line)
-            sys.stdout.buffer.write(line)
-            sys.stdout.flush()
-        code = process.wait()
+        summary = system_summary()
+        log.write(summary.encode())
+        sys.stdout.write(summary)
+        while True:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, env=env, cwd=HERE)
+            for line in process.stdout:
+                log.write(line)
+                sys.stdout.buffer.write(line)
+                sys.stdout.flush()
+            code = process.wait()
+            if code != RESTART_EXIT_CODE:
+                break
+            print('Restarting the game (settings menu)', flush=True)
     if code:
         # Windows status codes say how it ended: 0xC00000FD stack overflow, 0xC0000374 heap corruption,
         # 0xC0000409 fast fail (abort, a security check), 0xC0000005 access violation.

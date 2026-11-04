@@ -93,42 +93,16 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "mute_unfocused") {
         v.mute_unfocused = i != 0;
-    } else if (key == "button_prompts") {
-        v.button_prompts = value == "playstation" ? PromptsPlayStation
-                         : value == "keyboard"    ? PromptsKeyboard
-                         : value == "xbox"        ? PromptsXbox
-                         : value == "switch"      ? PromptsSwitch
-                                                  : PromptsAuto;
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
         v.fsr4_invert_jitter = i != 0;
-    } else if (key == "model_lod") {
-        v.model_lod = std::clamp(i, -2, 2);
-    } else if (key == "live_resolution") {
-        v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
-    } else if (key == "hud_position") {
-        v.hud_position = std::clamp(i, 0, 100);
     } else if (key == "sharp_ui") {
         v.sharp_ui = i != 0;
-    } else if (key == "fov") {
-        v.fov = std::clamp(i, FovMin, FovMax);
-    } else if (key == "fps_mode") {
-        for (int m = 0; m < FpsModeCount; ++m) {
-            if (value == FpsModeNames[m]) v.fps_mode = m;
-        }
-    } else if (key == "frame_cap") {
-        v.frame_cap = value.empty() ? FrameCapAuto : std::max(i, 0);
     } else if (key == "output_res") {
         for (int r = 0; r < OutputCount; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
                 v.output_res = r;
-            }
-        }
-    } else {
-        for (int e = 0; e < EffectCount; ++e) {
-            if (key == Effects[e].key) {
-                v.effects[e] = i != 0;
             }
         }
     }
@@ -154,13 +128,6 @@ void Load() {
     v.fsr4_method_problem = nullptr;
     v.object_motion_cache = false;
     v.fsr_compatibility_options = false;
-    for (int e = 0; e < EffectCount; ++e) {
-        v.effects[e] = Effects[e].default_on;
-    }
-    // Before the file: what the launcher started the game with (older bbport.ini files have no
-    // fps_mode / frame_cap yet).
-    if (const char* fps = std::getenv("BB_FPS")) Set(v, "fps_mode", fps);
-    if (const char* cap = std::getenv("BB_FPS_LIMIT")) Set(v, "frame_cap", cap);
     if (FILE* file = std::fopen(Path(), "r")) {
         char line[256];
         while (std::fgets(line, sizeof(line), file)) {
@@ -216,16 +183,7 @@ void Load() {
     v.startup_fsr411_backend = v.fsr411_backend;
     v.active_fsr411_backend = v.fsr411_backend.load();
     v.startup_object_motion_cache = v.object_motion_cache;
-    for (int e = 0; e < EffectCount; ++e) {
-        v.startup_effects[e] = v.effects[e];
-    }
-    v.startup_model_lod = v.model_lod;
     v.startup_output_res = v.output_res;
-    v.startup_hud_position = v.hud_position;
-    v.startup_fov = v.fov;
-    v.startup_fps_mode = v.fps_mode;
-    v.startup_frame_cap = v.frame_cap;
-    v.startup_live_resolution = v.live_resolution;
 }
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411, const char* fsr411_problem) {
@@ -318,7 +276,6 @@ bool ResolutionNeedsRestart() {
     // TAA needs the live path (native guest targets): run.sh selects it on restart. Ultrawide
     // outputs patch the camera and HUD at startup.
     if (Ultrawide(v.output_res) != Ultrawide(v.startup_output_res)) return true;
-    if (Ultrawide(v.output_res) && v.hud_position != v.startup_hud_position) return true;
     return FixedRenderSession() &&
         (v.preset != v.startup_preset || v.output_res != v.startup_output_res ||
          (v.upscaler == UpscalerOff) != (v.startup_upscaler == UpscalerOff) ||
@@ -360,34 +317,12 @@ void Save() {
                  int(v.object_motion_cache.load()));
     std::fprintf(file, "fsr_compatibility_options=%d\n", int(v.fsr_compatibility_options.load()));
     std::fprintf(file, "fsr41_version=%s\n", v.fsr41_version == UpscalerFsr411 ? "fsr411" : "fsr412");
-    // Read by patches.py at start.
-    for (int e = 0; e < EffectCount; ++e) {
-        std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
-    }
     std::fprintf(file, "frame_gen=%s\nframe_gen_multiplier=%d\nframe_gen_fit_display=%d\n",
                  FrameGenName(v.frame_gen), v.frame_gen_multiplier.load(),
                  int(v.frame_gen_fit_display.load()));
-    std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
-                 OutputWidths[v.output_res], OutputHeights[v.output_res]);
+    std::fprintf(file, "output_res=%dx%d\n", OutputWidths[v.output_res], OutputHeights[v.output_res]);
     std::fprintf(file, "mute_unfocused=%d\n", int(v.mute_unfocused.load()));
-    static constexpr const char* prompts[PromptsCount] = {"auto", "playstation", "keyboard", "xbox", "switch"};
-    std::fprintf(file, "button_prompts=%s\n", prompts[std::clamp(v.button_prompts.load(), 0, PromptsCount - 1)]);
-    // Read by run.py at start (hud_layout.py).
-    std::fprintf(file, "hud_position=%d\n", v.hud_position.load());
-    // Read by run.py and patches.py at start (ui_viewport).
     std::fprintf(file, "sharp_ui=%d\n", int(v.sharp_ui.load()));
-    // Read by run.py at start (fov.py).
-    std::fprintf(file, "fov=%d\n", v.fov.load());
-    // Read by run.py at start (patches.py FPS preset, BB_FPS_LIMIT); the launcher shares them.
-    std::fprintf(file, "fps_mode=%s\n", FpsModeNames[std::clamp(v.fps_mode.load(), 0, FpsModeCount - 1)]);
-    if (v.frame_cap < 0) {
-        std::fprintf(file, "frame_cap=\n");
-    } else {
-        std::fprintf(file, "frame_cap=%d\n", v.frame_cap.load());
-    }
-    // Read by run.sh at start.
-    std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
-                                                  : v.live_resolution ? "1" : "0");
     std::fclose(file);
 }
 

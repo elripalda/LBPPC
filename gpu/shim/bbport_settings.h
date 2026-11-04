@@ -29,41 +29,6 @@ inline bool IsMlFrameGen(int provider) {
 }
 enum Fsr411Backend : int { Fsr411Vulkan = 0, Fsr411Dx12 = 1 };
 
-/// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
-/// menu label, default (the game's own behaviour).
-struct Effect {
-    const char* key;
-    const char* label;
-    bool default_on;
-};
-inline constexpr Effect Effects[] = {
-    {"effect_chromatic_aberration", "Chromatic aberration", true},
-    {"effect_dof", "Depth of field (DoF)", true},
-    {"effect_motion_blur", "Motion blur", true},
-    {"effect_ssao", "Ambient occlusion (SSAO)", true},
-    {"effect_game_aa", "Game anti-aliasing", true},
-    {"effect_dynamic_shadows", "Dynamic shadows", true},
-    {"effect_ssr", "Screen-space reflections (SSR)", false},
-    {"skip_intro", "Skip intro logos and movie", false},
-    {"debug_camera", "Free camera (Cross + L3)", false},
-    {"debug_menu", "Debug menu (requires font files)", false},
-    {"cheat_no_death", "Cheat: never die (minimum 1 HP)", false},
-    {"cheat_stealth", "Cheat: enemies cannot see you", false},
-    {"cheat_silent", "Cheat: enemies cannot hear you", false},
-    {"cheat_rally_no_decay", "Cheat: Rally never decays", false},
-    {"cheat_enemy_control", "Cheat: control targeted enemy (R3 / L3)", false},
-    {"tweak_no_rally", "Disable Rally (health recovery)", false},
-    {"tweak_camera_distance", "Increase camera distance", false},
-    {"tweak_no_camera_rotation", "Disable automatic camera rotation", false},
-    {"tweak_easy_run", "Run with less stick tilt", false},
-    {"tweak_ragdoll", "Dark Souls-style ragdoll physics", false},
-    {"tweak_circle_confirm", "Japanese/Asian buttons (Circle confirms)", false},
-    {"quit_to_desktop", "Quit to Desktop in the title and System menus", true},
-    {"pc_menu", "PC Settings in the System menu", true},
-    {"rebirth", "Rebirth at the Doll (5 Insight)", true},
-    {"steady_cloth", "Cloth as on PS4 (30 FPS)", true},
-};
-inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Output resolutions: the upscaler's output and the UI host targets. The 16:9 ones change
 /// live; the ultrawide ones need the startup patch (patches.py ultrawide_writes, run.py).
 inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840, 2560, 3440, 3840, 5120, 3840, 5120};
@@ -74,24 +39,6 @@ inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 inline bool Ultrawide(int output) {
     return OutputWidths[output] * 9 > OutputHeights[output] * 16;
 }
-
-/// Button prompts (bbport_prompts.cpp): the game's icons switch with the device in use, or stay.
-enum Prompts : int {
-    PromptsAuto = 0, PromptsPlayStation = 1, PromptsKeyboard = 2, PromptsXbox = 3, PromptsSwitch = 4, PromptsCount
-};
-
-/// Frame rate mode (patches.py FPS_PRESETS, bbport.ini fps_mode): the community patches applied
-/// at start. The launcher and the PC Settings page share it.
-enum FpsMode : int { Fps30 = 0, Fps60 = 1, Fps90 = 2, FpsUncap = 3, FpsModeCount };
-inline constexpr const char* FpsModeNames[FpsModeCount] = {"30", "60", "90", "uncap"};
-/// Frame cap of the unlocked mode (bbport.ini frame_cap, BB_FPS_LIMIT): -1 the port's own (the
-/// display refresh, at most 120), 0 none. Applied at start.
-inline constexpr int FrameCapAuto = -1;
-inline constexpr int FrameCaps[] = {FrameCapAuto, 60, 90, 120, 144, 165, 240, 0};
-inline constexpr int FrameCapCount = int(sizeof(FrameCaps) / sizeof(FrameCaps[0]));
-
-/// Field of view (fov.py): the game's camera has 43 degrees.
-inline constexpr int FovDefault = 43, FovMin = 30, FovMax = 90;
 
 struct Values {
     std::atomic<int> upscaler{UpscalerFsr3};
@@ -135,30 +82,14 @@ struct Values {
     std::atomic<bool> show_fps_graph{false};
     /// Silence the game while its window does not have focus (bbgpu_audio_muted).
     std::atomic<bool> mute_unfocused{false};
-    /// Keyboard and mouse button prompts: with the device in use (auto), or always one kind.
-    std::atomic<int> button_prompts{PromptsAuto};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
-    /// Applied at start (patches.py); the menu shows when a restart is needed.
-    std::atomic<bool> effects[EffectCount]{};
-    std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
-    /// Ultrawide outputs: the HUD's corner groups, 0 centred in 16:9 .. 100 at the screen edges
-    /// (hud_layout.py at start).
-    std::atomic<int> hud_position{100};
     /// Sharp UI: menus and HUD drawn at the output's size (patches.py ui_viewport at start). Set in
     /// the launcher; kept here so the menu's Save does not drop it.
     std::atomic<bool> sharp_ui{false};
-    /// Vertical field of view in degrees, 43 the game's (run.py, fov.py at start).
-    std::atomic<int> fov{FovDefault};
-    /// FpsMode and frame cap (run.py at start; the launcher passes the same).
-    std::atomic<int> fps_mode{FpsUncap};
-    std::atomic<int> frame_cap{FrameCapAuto};
-    /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
-    /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
-    std::atomic<int> live_resolution{0};
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
@@ -221,14 +152,7 @@ struct Values {
     bool startup_object_motion = true;
     int startup_fsr411_backend = Fsr411Vulkan;
     bool startup_object_motion_cache = false;
-    bool startup_effects[EffectCount]{};
-    int startup_model_lod = 0;
     int startup_output_res = OutputDefault;
-    int startup_hud_position = 100;
-    int startup_fov = FovDefault;
-    int startup_fps_mode = FpsUncap;
-    int startup_frame_cap = FrameCapAuto;
-    int startup_live_resolution = 0;
 };
 
 Values& Get();

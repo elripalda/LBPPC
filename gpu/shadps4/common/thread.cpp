@@ -294,4 +294,19 @@ std::string GetCurrentThreadName() {
 #endif
 }
 
+#ifdef _WIN32
+void GetCurrentThreadCpuTimes(u64* user_us, u64* kernel_us) {
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        *user_us = *kernel_us = 0;
+        return;
+    }
+    const auto us = [](const FILETIME& t) {
+        return ((u64(t.dwHighDateTime) << 32) | t.dwLowDateTime) / 10; // 100 ns units
+    };
+    *user_us = us(user);
+    *kernel_us = us(kernel);
+}
+#endif
+
 } // namespace Common

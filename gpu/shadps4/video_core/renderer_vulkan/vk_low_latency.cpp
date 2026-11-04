@@ -61,6 +61,8 @@ struct State {
     std::array<double, 4> parts_ms{}; ///< game, GPU thread, waiting to present, present
     double gpu_done_ms = 0.0; ///< from the game starting a frame to the GPU finishing it
     u32 gpu_done_frames = 0;
+    /// lbppc: the previous frame's present and start, for the "Slow frame" lines (state.log).
+    std::chrono::steady_clock::time_point last_present_end{}, last_start{};
     // The GPU watcher: waits for each game frame's GPU work (WatchGpu).
     struct GpuWatch {
         u64 id;
@@ -413,6 +415,22 @@ void PresentEnd(u64 id) {
         state.parts_ms[1] += span(times.submit, times.flip);
         state.parts_ms[2] += span(times.flip, times.present);
         state.parts_ms[3] += span(times.present, now);
+        // lbppc: a frame shown more than 40 ms after the one before (a missed 30 FPS frame), with
+        // where its time went: a late start is the game (or what it waits for before a frame),
+        // the rest this frame's own way to the screen.
+        if (state.log && state.last_present_end != std::chrono::steady_clock::time_point{}) {
+            const double since = span(state.last_present_end, now);
+            if (since > 40.0) {
+                std::printf("Slow frame: %.1f ms after the last one; started %.1f ms after the "
+                            "previous frame; game %.1f, GPU thread %.1f, waiting to present %.1f, "
+                            "present %.1f ms\n",
+                            since, span(state.last_start, times.start), span(times.start, times.submit),
+                            span(times.submit, times.flip), span(times.flip, times.present),
+                            span(times.present, now));
+            }
+        }
+        state.last_present_end = now;
+        state.last_start = times.start;
         state.latency_ms += ms;
         state.latency_max_ms = std::max(state.latency_max_ms, ms);
         ++state.latency_frames;

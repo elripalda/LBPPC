@@ -338,29 +338,38 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
-void Scheduler::Finish() {
+void Scheduler::Finish(const char* file, u32 line) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    Wait(presubmit_tick);
+    Wait(presubmit_tick, file, line);
 }
 
-void Scheduler::WaitSubmitted() {
+void Scheduler::WaitSubmitted(const char* file, u32 line) {
     const u64 tick = CurrentTick();
     if (tick > 1) {
-        Wait(tick - 1);
+        Wait(tick - 1, file, line);
     }
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, const char* file, u32 line) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    if (!BbStats::enabled || work_semaphore.IsFree(tick)) {
+        work_semaphore.Wait(tick);
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
+    BbStats::NoteWaitSite(file, line,
+                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count());
 }
 
 void Scheduler::PopPendingOperations() {

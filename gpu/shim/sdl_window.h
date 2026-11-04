@@ -114,10 +114,6 @@ private:
     /// desktop layout, reWASD, JoyToKey...): it neither brings the cursor back, nor switches the
     /// button prompts, nor turns the camera.
     BbPadUse::Pads pads;
-    /// Window thread, every PollEvents: installs/removes the direct camera hook
-    /// (bloodborne_cam.h) to match input.ini and the F7 toggle, and gates the BbMouse sampler.
-    void UpdateMouseCamera();
-    bool cam_hook_failed{false}; // camera code not found: stay on the stick until F7/F8
 };
 
 } // namespace Frontend

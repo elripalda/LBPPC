@@ -130,17 +130,31 @@ static DWORD WINAPI profile_threads(LPVOID arg) {
     const char *spec=getenv("LBPPC_PROFILE");
     char *e; unsigned start=(unsigned)strtoul(spec,&e,0), span=*e==',' ? (unsigned)strtoul(e+1,NULL,0) : 10;
     Sleep(start*1000);
-    static ProfThread threads[64]; int nthreads=0;
+    static ProfThread threads[64], waits[64]; int nthreads=0, nwaits=0;
     const uint64_t lo=(uint64_t)(uintptr_t)image, hi=lo+image_size_hint;
     fprintf(stderr,"PROFILE: sampling %u s\n",span);
-    ULONGLONG end=GetTickCount64()+span*1000ull;
+    /* The process's threads are listed (and their handles opened) twice a second, not on every pass: listing
+       and opening ~100 threads each time held sampling to about 12 passes a second. */
+    static struct { DWORD tid; HANDLE handle; } known[256]; int nknown=0;
+    ULONGLONG end=GetTickCount64()+span*1000ull, listed=0; uint64_t passes=0;
     while (GetTickCount64()<end) {
-        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
-        THREADENTRY32 entry={.dwSize=sizeof(entry)};
-        for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
-            if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
-            HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,entry.th32ThreadID);
-            if (!thread) continue;
+        ++passes;
+        if (GetTickCount64()-listed>=500) {
+            listed=GetTickCount64();
+            for (int k=0;k<nknown;++k) CloseHandle(known[k].handle);
+            nknown=0;
+            HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+            THREADENTRY32 entry={.dwSize=sizeof(entry)};
+            for (BOOL more=Thread32First(snapshot,&entry); more && nknown<256; more=Thread32Next(snapshot,&entry)) {
+                if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
+                HANDLE h=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT,FALSE,entry.th32ThreadID);
+                if (h) { known[nknown].tid=entry.th32ThreadID; known[nknown++].handle=h; }
+            }
+            CloseHandle(snapshot);
+        }
+        for (int k=0;k<nknown;++k) {
+            HANDLE thread=known[k].handle;
+            const DWORD tid=known[k].tid;
             if (SuspendThread(thread)!=(DWORD)-1) {
                 CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
                 /* LBPPC_PROFILE_HOST=1: also samples taken in the runtime (a guest loop around a host call): the
@@ -158,10 +172,38 @@ static DWORD WINAPI profile_threads(LPVOID arg) {
                         rbp=frame[0];
                     }
                 }
+                /* LBPPC_PROFILE_WAIT=1: a sample outside the game's code (waiting in the runtime or in Windows,
+                   where frame pointers are not kept) counts for the first game address found on the stack, the
+                   game function that made the call. */
+                static int wait_sites=-1;
+                if (wait_sites<0) wait_sites=getenv("LBPPC_PROFILE_WAIT")!=NULL;
+                if (wait_sites && !in_image && GetThreadContext(thread,&c) && (c.Rip<lo || c.Rip>=hi)) {
+                    /* Windows' and the runtime's code have unwind tables: unwound frame by frame until the return
+                       address is in the game's code (which has none). */
+                    CONTEXT u=c;
+                    uint64_t site=0;
+                    for (int d=0; d<64; ++d) {
+                        if (u.Rip>=lo && u.Rip<hi) { site=u.Rip; break; }
+                        DWORD64 base=0;
+                        PRUNTIME_FUNCTION fn=RtlLookupFunctionEntry(u.Rip,&base,NULL);
+                        if (!fn) { /* a leaf: the return address is on top */
+                            if (IsBadReadPtr((void *)(uintptr_t)u.Rsp,8)) break;
+                            u.Rip=*(DWORD64 *)(uintptr_t)u.Rsp; u.Rsp+=8;
+                        } else {
+                            PVOID data=NULL; DWORD64 frame=0;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,u.Rip,fn,&u,&data,&frame,NULL);
+                        }
+                        if (!u.Rip) break;
+                    }
+                    int wi=0;
+                    while (wi<nwaits && waits[wi].tid!=tid) ++wi;
+                    if (wi==nwaits && nwaits<64) { waits[nwaits].tid=tid; ++nwaits; }
+                    if (wi<64) { ++waits[wi].samples; prof_add(&waits[wi],site ? site-lo : 0); }
+                }
                 if (GetThreadContext(thread,&c) && ((c.Rip>=lo && c.Rip<hi) || in_image)) {
                     int ti=0;
-                    while (ti<nthreads && threads[ti].tid!=entry.th32ThreadID) ++ti;
-                    if (ti==nthreads && nthreads<64) { threads[nthreads].tid=entry.th32ThreadID; ++nthreads; }
+                    while (ti<nthreads && threads[ti].tid!=tid) ++ti;
+                    if (ti==nthreads && nthreads<64) { threads[nthreads].tid=tid; ++nthreads; }
                     if (ti<64) {
                         ProfThread *t=&threads[ti];
                         ++t->samples;
@@ -186,23 +228,46 @@ static DWORD WINAPI profile_threads(LPVOID arg) {
                 }
                 ResumeThread(thread);
             }
-            CloseHandle(thread);
         }
-        CloseHandle(snapshot);
         Sleep(1);
     }
-    fprintf(stderr,"PROFILE: done, %d threads in the image (image %llx size %llx)\n",nthreads,
-            (unsigned long long)lo,(unsigned long long)image_size_hint);
+    for (int k=0;k<nknown;++k) CloseHandle(known[k].handle);
+    fprintf(stderr,"PROFILE: done, %llu passes, %d threads in the image (image %llx size %llx)\n",
+            (unsigned long long)passes,nthreads,(unsigned long long)lo,(unsigned long long)image_size_hint);
     for (int ti=0;ti<nthreads;++ti) {
         ProfThread *t=&threads[ti];
         if (t->samples<5) continue;
-        fprintf(stderr,"PROFILE thread %lu: %llu samples\n",t->tid,(unsigned long long)t->samples);
+        typedef HRESULT (WINAPI *GetDescription)(HANDLE,PWSTR *);
+        GetDescription get=(GetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+        char name[96]="";
+        HANDLE h=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,t->tid);
+        PWSTR wide=NULL;
+        if (h && get && SUCCEEDED(get(h,&wide)) && wide) {
+            WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
+            LocalFree(wide);
+        }
+        if (h) CloseHandle(h);
+        fprintf(stderr,"PROFILE thread %lu '%s': %llu samples (%.1f%% of passes)\n",t->tid,name,
+                (unsigned long long)t->samples,passes ? 100.0*t->samples/passes : 0.0);
         for (int shown=0;shown<60;++shown) {
             uint32_t best=0; int bi=-1;
             for (uint32_t i=0;i<t->nsites;++i) if (t->hits[i]>best) { best=t->hits[i]; bi=(int)i; }
             if (bi<0) break;
             fprintf(stderr,"  %5.1f%%  0x%llx\n",100.0*best/t->samples,(unsigned long long)t->site[bi]);
             t->hits[bi]=0;
+        }
+    }
+    for (int wi=0;wi<nwaits;++wi) {
+        ProfThread *w=&waits[wi];
+        if (w->samples<20) continue;
+        fprintf(stderr,"PROFILE thread %lu outside the game's code: %llu samples (%.1f%% of passes), called from\n",
+                w->tid,(unsigned long long)w->samples,passes ? 100.0*w->samples/passes : 0.0);
+        for (int shown=0;shown<12;++shown) {
+            uint32_t best=0; int bi=-1;
+            for (uint32_t i=0;i<w->nsites;++i) if (w->hits[i]>best) { best=w->hits[i]; bi=(int)i; }
+            if (bi<0) break;
+            fprintf(stderr,"  %5.1f%%  0x%llx\n",100.0*best/w->samples,(unsigned long long)w->site[bi]);
+            w->hits[bi]=0;
         }
     }
     return 0;
@@ -951,7 +1016,7 @@ static void check_cpu(void) {
     snprintf(text,sizeof(text),"This processor cannot run the game:\n%s\n\nMissing instructions: %s\n\n"
              "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
              "generation (Haswell, 2013) or newer, or an AMD Ryzen.",name,missing);
-    MessageBoxA(NULL,text,"Bloodborne",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
+    MessageBoxA(NULL,text,"LBPPC",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
 #endif
     exit(24);
 }
@@ -1431,22 +1496,10 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
-    /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
-    const char *command=getenv("BB_RESTART_COMMAND");
-    puts("Runtime: restarting through run.py");
-    if (!command || !*command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n",stderr); _exit(1); }
-    char *line=_strdup(command);
-    /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
-    STARTUPINFOA startup={.cb=sizeof(startup),.dwFlags=STARTF_USESTDHANDLES,
-                          .hStdInput=GetStdHandle(STD_INPUT_HANDLE),.hStdOutput=GetStdHandle(STD_OUTPUT_HANDLE),
-                          .hStdError=GetStdHandle(STD_ERROR_HANDLE)};
-    PROCESS_INFORMATION process;
-    if (!line || !CreateProcessA(NULL,line,NULL,NULL,TRUE,0,NULL,NULL,&startup,&process)) {
-        fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError()); _exit(1);
-    }
-    CloseHandle(process.hThread); CloseHandle(process.hProcess);
-    /* The new launch waits for this process's GPU device to go away (run.py --after). */
-    TerminateProcess(GetCurrentProcess(),0);
+    /* lbppc: run.py starts the game again when it ends with this code (the menu's Apply and restart). */
+    puts("Runtime: restart requested");
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(),75);
 #else
     puts("Runtime: restarting through run.sh");
     syscall(SYS_close_range, 3u, ~0u, 0u);
@@ -1657,23 +1710,15 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
-    char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+    char title[128]="LBPPC", serial[16]="UNKNOWN", sfo[4096];
     uint32_t attributes=0;
     snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
     sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
     sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
     sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
-    /* The hooks below (Rebirth, PC menu, Discord status, The Hunter's Dream) work on Bloodborne's own code
-       at its addresses: any other game keeps them off. */
-    const int bloodborne=!strncmp(title,"Bloodborne",10);
     image = allocate(round_page(size));
-    if (bloodborne) {
-        runtime_rebirth_set_image(image);
-        bbgpu_pc_menu_set_image(image);
-    }
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
-    if (bloodborne) runtime_discord_start(image);
     if (!cpu_only) {
         uint64_t sdk=0;
         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
@@ -1733,8 +1778,6 @@ int main(int argc, char **argv) {
         fflush(stdout);
         _Exit(0);
     }
-    /* The Hunter's Dream backend reads the game's code before the patches change it. */
-    if (bloodborne) bbnet_set_image(image, size);
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     /* LBPPC_POKE=off:hex[,off:hex...] (test): byte writes at image offsets, after the patches. */
     apply_pokes(getenv("LBPPC_POKE"),segments,ns,0);
@@ -1751,7 +1794,6 @@ int main(int argc, char **argv) {
     custom_server_install();
     sim_divide_install();
     hooks_install(getenv("BB_HOOK"));
-    if (bloodborne) bbgpu_pc_menu_prepare(image);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
@@ -1802,7 +1844,7 @@ int main(int argc, char **argv) {
         }
     }
     /* The online session starts with the game (lbppc: LBP3's when signed in locally, LBPPC_NP_USER). */
-    if (bloodborne || (getenv("LBPPC_NP_USER") && *getenv("LBPPC_NP_USER")) ||
+    if ((getenv("LBPPC_NP_USER") && *getenv("LBPPC_NP_USER")) ||
         (getenv("BB_SHADNET_NPID") && *getenv("BB_SHADNET_NPID"))) bbnet_initialize();
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;

@@ -261,6 +261,10 @@ bool Dlss::HasFrameGen(const FrameGenDesc& desc) const {
     return impl->frame_gen && *impl->frame_gen == desc;
 }
 
+bool Dlss::HasAnyFrameGen() const {
+    return impl->frame_gen.has_value();
+}
+
 bool Dlss::CreateFrameGen(vk::CommandBuffer command, const FrameGenDesc& desc) {
     if (FrameGenMaxCount() < 1) {
         return false;
@@ -353,6 +357,9 @@ int Dlss::FrameGenMaxCount() const {
     return 0;
 }
 bool Dlss::HasFrameGen(const FrameGenDesc&) const {
+    return false;
+}
+bool Dlss::HasAnyFrameGen() const {
     return false;
 }
 bool Dlss::CreateFrameGen(vk::CommandBuffer, const FrameGenDesc&) {

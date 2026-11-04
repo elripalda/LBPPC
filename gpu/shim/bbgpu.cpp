@@ -29,7 +29,6 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "sdl_window.h"
-#include "bloodborne_cam.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 // bbport: input freshness (BB_LATENCY_LOG=1 or BB_FRAME_STATS=1): how often the window thread
@@ -212,7 +211,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
-    BbStats::Timer timer{BbStats::t_protect};
+    BbStats::MaxTimer timer{BbStats::t_protect, BbStats::max_protect_ns};
     const u64 pages = (size + 4095) / 4096;
     BbStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
     BbStats::protect_pages.fetch_add(pages, std::memory_order_relaxed);
@@ -298,7 +297,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
-    const std::string title = config->title ? config->title : "Bloodborne";
+    const std::string title = config->title ? config->title : "LBPPC";
     // A window (not fullscreen) opens at the chosen output size: at the game's 1920x1080 it
     // showed a 1440p or 4K output shrunk into 1080p, every other pixel skipped (blocky UI,
     // shimmering edges). WindowSDL fits it to the screen.
@@ -456,8 +455,6 @@ extern "C" void bbgpu_mouse_take(BbMouseInput* out) {
     out->buttons = mouse.buttons;
     out->wheel = mouse.wheel;
     out->captured = mouse.captured ? 1 : 0;
-    const Core::BloodborneCam& cam = Core::BloodborneCam::Instance();
-    out->locked_on = cam.IsEnabled() && cam.IsLockedOn() ? 1 : 0;
 }
 
 extern "C" void bbgpu_input_configure(int mouse_mode_available, int32_t toggle_scancode, int32_t reload_scancode) {
@@ -468,8 +465,4 @@ extern "C" void bbgpu_input_configure(int mouse_mode_available, int32_t toggle_s
 extern "C" int bbgpu_input_reload_requested(void) {
     if (!g_window) return 0;
     return g_window->TakeInputReloadRequested();
-}
-
-extern "C" void bbgpu_mouse_camera_configure(int direct, float sensitivity, float scale_x, float scale_y, int sync) {
-    Core::BloodborneCam::Instance().Configure(direct != 0, sensitivity, scale_x, scale_y, sync != 0);
 }

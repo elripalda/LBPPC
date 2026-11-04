@@ -315,8 +315,10 @@ bool TemporalUpscaler::OnFrameStart() {
     }
     const bool changed = output_changed || applied_preset != preset || active != last_active ||
                          jitter_on != last_jitter || applied_upscaler != upscaler || method_changed;
-    if (applied_upscaler != upscaler) {
+    if (applied_upscaler != upscaler && applied_upscaler != -1) {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
+        // (Not on the first frame: the context made with this object is unused, and waiting
+        // for the GPU there stalled level entry behind its texture uploads.)
         scheduler.Finish();
         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
         if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;

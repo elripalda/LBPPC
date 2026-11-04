@@ -9,29 +9,10 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
-#include "bbport_mouse.h"
 #include "bbport_overlay.h"
-#include "bbport_prompts.h"
-#include "bloodborne_cam.h"
+#include "bbport_invite.h"
 
 namespace Frontend {
-
-/// The buttons a controller has, for its prompts: SDL's type, by vendor and product.
-static BbPrompts::Device PadDevice(SDL_JoystickID id) {
-    switch (SDL_GetGamepadTypeForID(id)) {
-    case SDL_GAMEPAD_TYPE_PS3:
-    case SDL_GAMEPAD_TYPE_PS4:
-    case SDL_GAMEPAD_TYPE_PS5:
-        return BbPrompts::PlayStation;
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-        return BbPrompts::Switch;
-    default:
-        return BbPrompts::Xbox; // Xbox, and the many controllers that copy its buttons
-    }
-}
 
 namespace {
 // MOU-007: each wheel step keeps its direction's bit set for 33 ms (shadPS4's pulse length,
@@ -114,12 +95,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     if (on_hdr_display) {
         std::printf("Display: HDR on in Windows\n");
     }
-    BbMouse::Start();
 }
 
 WindowSDL::~WindowSDL() {
-    BbMouse::Stop();
-    Core::BloodborneCam::Instance().Shutdown();
     SDL_DestroyWindow(window);
 }
 
@@ -164,12 +142,9 @@ bool WindowSDL::PollEvents() {
     // the controller's in the same batch.
     bool mouse_seen = false, pad_busy = pads.InUse(), pad_turning = pads.SticksPushed(BbPadUse::Turning);
     while (SDL_PollEvent(&event)) {
-        // Button prompts follow the device that was used last: a key, a click, the wheel or a
-        // real mouse movement, or a controller button or a stick or trigger pushed past half.
+        // The cursor follows the device that was used last: a click, the wheel or a real mouse
+        // movement, or a controller button or a stick or trigger pushed past half.
         switch (event.type) {
-        case SDL_EVENT_KEY_DOWN:
-            if (!event.key.repeat) BbPrompts::OnInput(BbPrompts::Keyboard);
-            break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_WHEEL:
             mouse_seen = true;
@@ -189,7 +164,6 @@ bool WindowSDL::PollEvents() {
             }
             break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-            BbPrompts::OnInput(PadDevice(event.gbutton.which));
             pad_used = true;
             pads.Button(event.gbutton.which, event.gbutton.button, true);
             pad_busy = true;
@@ -201,14 +175,11 @@ bool WindowSDL::PollEvents() {
             pads.Removed(event.gdevice.which);
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
-            // The game starts with the controller's prompts.
-            std::printf("Prompts: controller %s: %s\n", SDL_GetGamepadNameForID(event.gdevice.which),
+            std::printf("Input: controller %s: %s\n", SDL_GetGamepadNameForID(event.gdevice.which),
                         SDL_GetGamepadStringForType(SDL_GetGamepadTypeForID(event.gdevice.which)));
-            BbPrompts::OnControllerConnected(PadDevice(event.gdevice.which));
             break;
         case SDL_EVENT_GAMEPAD_AXIS_MOTION:
             if (std::abs(int(event.gaxis.value)) > 16000) {
-                BbPrompts::OnInput(PadDevice(event.gaxis.which));
                 pad_used = true;
             }
             pads.Axis(event.gaxis.which, event.gaxis.axis, event.gaxis.value);
@@ -248,13 +219,9 @@ bool WindowSDL::PollEvents() {
         // can still see the old captured state for one iteration; accepted as a one-frame
         // edge case rather than re-evaluating capture per event for a cosmetic gain.
         if (mouse_captured_last) {
-            // Direct camera: the BbMouse thread turns motion into camera angles, so it must not
-            // also reach the stick -- except while locked on, where a flick switches targets.
-            const Core::BloodborneCam& cam = Core::BloodborneCam::Instance();
-            const bool motion_to_stick = !cam.IsEnabled() || cam.IsLockedOn();
             // A mapping program's movement and clicks while the controller is in use are the
             // controller's: they would turn the camera a second time and press its buttons twice.
-            if (event.type == SDL_EVENT_MOUSE_MOTION && motion_to_stick && !pad_turning) {
+            if (event.type == SDL_EVENT_MOUSE_MOTION && !pad_turning) {
                 std::scoped_lock lock{mouse_mutex};
                 mouse.dx += event.motion.xrel;
                 mouse.dy += event.motion.yrel;
@@ -299,6 +266,16 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
+        // An invitation on screen (bbport_invite.h): Cross (A) or Enter joins, Circle (B) or Esc does not.
+        if (BbInvite::Shown() && !text_active &&
+            ((event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+              (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER || event.key.key == SDLK_ESCAPE)) ||
+             (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+              (event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH || event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)))) {
+            BbInvite::Answer(event.type == SDL_EVENT_KEY_DOWN ? event.key.key != SDLK_ESCAPE
+                                                             : event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH);
+            continue;
+        }
         if (BbOverlay::HandleEvent(event)) {
             continue;
         }
@@ -325,9 +302,7 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
-    BbMouse::SetPadInUse(pad_turning || pads.SticksPushed(BbPadUse::Turning));
     if (mouse_seen && !pad_busy) { // a real mouse, not one a mapping program moves with the stick
-        BbPrompts::OnInput(BbPrompts::Keyboard);
         mouse_used = true;
     }
     // MOU-004: re-evaluated every PollEvents (not only on the events that could change it),
@@ -335,26 +310,7 @@ bool WindowSDL::PollEvents() {
     // button sets menu_open there, not through an SDL event here).
     UpdateMouseCapture();
     UpdateCursor(pad_used, mouse_used);
-    BbPrompts::Apply();
-    UpdateMouseCamera();
     return is_open;
-}
-
-void WindowSDL::UpdateMouseCamera() {
-    Core::BloodborneCam& cam = Core::BloodborneCam::Instance();
-    const bool wanted = cam.IsConfigured() && mouse_mode_available.load(std::memory_order_relaxed) &&
-                        mouse_mode_on.load(std::memory_order_relaxed);
-    if (!wanted) {
-        cam_hook_failed = false; // F7/F8 retry after a failed attempt
-        if (cam.IsEnabled()) {
-            cam.SetEnabled(false);
-        }
-    } else if (!cam.IsEnabled() && !cam_hook_failed && mouse_captured_last) {
-        // Hooked once the game is actually being played (captured), F7 off unhooks so the
-        // stick/arrow keys drive the camera again.
-        cam_hook_failed = !cam.SetEnabled(true);
-    }
-    BbMouse::SetActive(mouse_captured_last && cam.IsEnabled());
 }
 
 bool WindowSDL::WantsMouseCapture() const {

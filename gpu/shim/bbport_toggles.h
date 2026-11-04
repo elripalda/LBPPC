@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #ifdef _WIN32
 // bbport (Windows): no signals. The loader's exception handler resumes the faulting thread
 // in bb_longjmp (src/compat_win.c: no unwinding through the faulting frames).
@@ -95,8 +96,9 @@ inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};
 inline std::atomic<std::uint64_t> gpu_frames{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).
 inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
-    t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},
-    t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
+    t_read_faults{0}, read_faults{0}, t_write_faults{0};
+/// Faults of guest threads on GPU-written memory: each waits for the GPU thread to read it back.
+inline std::atomic<std::uint64_t> fault_readbacks{0}, t_fault_readbacks{0};
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");
@@ -116,6 +118,27 @@ struct Timer {
                         std::memory_order_relaxed);
     }
 };
+/// The longest single protection change and guest write fault since the last frame (ns): Windows
+/// sometimes holds one for ~30 ms, and every game thread that faults meanwhile waits.
+inline std::atomic<std::uint64_t> max_protect_ns{0}, max_write_fault_ns{0};
+struct MaxTimer {
+    std::atomic<std::uint64_t>& total;
+    std::atomic<std::uint64_t>& longest;
+    std::chrono::steady_clock::time_point start =
+        enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ~MaxTimer() {
+        if (!enabled) {
+            return;
+        }
+        const std::uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+        total.fetch_add(ns, std::memory_order_relaxed);
+        std::uint64_t seen = longest.load(std::memory_order_relaxed);
+        while (ns > seen && !longest.compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+        }
+    }
+};
 /// Wall time the GPU command thread waited for guest submissions (ns).
 inline std::atomic<std::uint64_t> gpu_idle_ns{0};
 /// Draws recorded into the reduced scene targets, and draws after the scene started.
@@ -133,6 +156,35 @@ struct WaitTimer {
                         std::memory_order_relaxed);
     }
 };
+/// Waits for GPU ticks by the code that asked for them, so a stall names where it waited.
+struct WaitSite {
+    const char* file = nullptr;
+    std::uint32_t line = 0;
+    std::uint64_t ns = 0;
+};
+inline std::mutex wait_sites_mutex;
+inline WaitSite wait_sites[16];
+inline void NoteWaitSite(const char* file, std::uint32_t line, std::uint64_t ns) {
+    std::scoped_lock lock{wait_sites_mutex};
+    for (auto& site : wait_sites) {
+        if (site.file == nullptr || (site.line == line && site.file == file)) {
+            site = {file, line, site.ns + ns};
+            return;
+        }
+    }
+}
+/// The site that waited longest since the last call (file null if none), and resets them.
+inline WaitSite TakeLongestWaitSite() {
+    std::scoped_lock lock{wait_sites_mutex};
+    WaitSite longest{};
+    for (auto& site : wait_sites) {
+        if (site.file && site.ns > longest.ns) {
+            longest = site;
+        }
+        site = {};
+    }
+    return longest;
+}
 /// GPU thread rusage, refreshed after each graphics submission.
 inline std::atomic<std::uint64_t> gpu_sys_us{0}, gpu_user_us{0}, gpu_invol_switches{0},
     gpu_vol_switches{0}, gpu_minor_faults{0};

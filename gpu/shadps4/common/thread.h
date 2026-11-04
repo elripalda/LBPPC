@@ -54,4 +54,10 @@ public:
 
 std::string GetCurrentThreadName();
 
+#ifdef _WIN32
+/// bbport: CPU time the calling thread has used so far, in microseconds (user, kernel). For the
+/// stall report; Windows advances it in scheduler ticks (about 15.6 ms).
+void GetCurrentThreadCpuTimes(u64* user_us, u64* kernel_us);
+#endif
+
 } // namespace Common

@@ -18,9 +18,7 @@ typedef struct {
 void bbgpu_register_kernel(void);
 /* Co-op: the game folder and param.sfo identity for the network and PSN libraries. */
 void bbnet_configure(const char *app0, const char *serial, const char *title, const char *app_ver);
-/* The game's code before the patches (The Hunter's Dream backend), then the online session's
- * start (bbnet/bbnet_glue.cpp). */
-void bbnet_set_image(unsigned char *image, uint64_t size);
+/* The online session's start (bbnet/bbnet_glue.cpp). */
 void bbnet_initialize(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
@@ -38,29 +36,9 @@ int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
-/* PC Settings in the game's System menu (gpu/shim/bbport_pc_menu.cpp, scripts/pc_menu.py): the
- * game image, then its System menu's request for the line ("bb:o"); `list` points at the menu's
- * line list, which the call may replace. */
-void bbgpu_pc_menu_set_image(unsigned char *base);
-/* After the patches, while the code is still writable: the PC page's name table. */
-void bbgpu_pc_menu_prepare(unsigned char *base);
-int bbgpu_pc_menu_add_line(void *list);
-int bbgpu_pc_menu_hide(void *movie);
-/* The settings pages' Defaults button (Restart Game on the PC page): its texts ("bb:l" name and
- * help, "bb:r" question) and its Yes ("bb:y", 1 when the port took it). */
-int bbgpu_pc_menu_button_text(void *page);
-int bbgpu_pc_menu_question(void *page);
-int bbgpu_pc_menu_yes(void *page);
 /* 1 while the game should be silent: bbport.ini mute_unfocused is on and the window does not
  * have focus. Safe from any thread (the audio ports read it for every buffer). */
 int bbgpu_audio_muted(void);
-/* Button prompts (gpu/shim/bbport_prompts.cpp): what each of the game's key-guide icons shows
- * on keyboard and mouse, one string per icon in bbport_prompt_icons.h's order ("e",
- * "lshift+leftbutton", "w a s d", "mouse", "" for nothing). Draws them; safe from any thread. */
-/* The controller button each key-guide icon's action is bound to (input.ini names, "" for the
- * game's own), in the same order: the controller prompts follow rebinding. */
-void bbgpu_prompts_configure_pad(const char *const *buttons, int count);
-void bbgpu_prompts_configure(const char *const *inputs, int count);
 
 /* Mouse input accumulated by the window thread since the last call; the call resets the
  * motion (dx/dy) but not held buttons. All zero (and captured=0) while capture is inactive
@@ -75,7 +53,6 @@ typedef struct {
     uint32_t buttons;
     uint32_t wheel;
     int32_t captured;
-    int32_t locked_on; /* the direct mouse camera sees a lock-on target (motion reaches dx/dy) */
 } BbMouseInput;
 void bbgpu_mouse_take(BbMouseInput *out);
 /* Applies a just-(re)loaded input.ini to the window thread: whether mouse-to-joystick mode
@@ -87,12 +64,6 @@ void bbgpu_input_configure(int mouse_mode_available, int32_t toggle_scancode, in
  * thread polls this once per sample() (CFG-008) to know when to re-read input.ini. 0 if no
  * window exists yet. */
 int bbgpu_input_reload_requested(void);
-/* Direct mouse camera (mouse_camera = direct in input.ini): whether it is wanted, its
- * sensitivity multiplier, and the motion's per-axis multipliers (input_mouse_scale_x/_y: -1 to
- * invert, the vertical sensitivity) and whether the drawn position turns too (mouse_camera_sync).
- * Safe from any thread; applied on the window thread's next
- * PollEvents. */
-void bbgpu_mouse_camera_configure(int direct, float sensitivity, float scale_x, float scale_y, int sync);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 #ifdef __cplusplus

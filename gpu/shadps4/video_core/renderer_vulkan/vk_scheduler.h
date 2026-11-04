@@ -684,7 +684,7 @@ public:
     void Flush();
 
     /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(const char* file = __builtin_FILE(), u32 line = __builtin_LINE());
 
     // Applied to the next submission, before it can consume external GPU output.
     void WaitExternal(vk::Semaphore semaphore, u64 value) {
@@ -696,10 +696,11 @@ public:
     /// bbport: waits for the work submitted so far but leaves the command buffer being
     /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
     /// recording into a submitted buffer crashes AMD's driver).
-    void WaitSubmitted();
+    void WaitSubmitted(const char* file = __builtin_FILE(), u32 line = __builtin_LINE());
 
-    /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    /// Waits for the given tick to trigger on the GPU. The caller's place is kept for the
+    /// stall report (BB_FRAME_STATS).
+    void Wait(u64 tick, const char* file = __builtin_FILE(), u32 line = __builtin_LINE());
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();

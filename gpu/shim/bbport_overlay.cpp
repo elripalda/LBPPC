@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_overlay.h"
+#include "bbport_invite.h"
 
 #include <algorithm>
 #include <array>
@@ -480,7 +481,7 @@ void Menu() {
         ImVec2(0.0f, 0.0f),
         ImVec2(FLT_MAX, std::max(viewport->WorkSize.y - 60.0f * base_scale, 200.0f * base_scale)));
     bool keep_open = true;
-    static const std::string title = "Bloodborne - Settings (" + MenuOpeners() + ")###settings";
+    static const std::string title = "LBPPC - Settings (" + MenuOpeners() + ")###settings";
     if (!ImGui::Begin(title.c_str(), &keep_open, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
@@ -753,77 +754,8 @@ void Menu() {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s", problem);
     }
 
-    ImGui::SeparatorText("Output resolution");
-    static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160",
-                                    "2560 x 1080 (21:9)", "3440 x 1440 (21:9)",
-                                    "3840 x 1600 (21:9)", "5120 x 2160 (21:9)",
-                                    "3840 x 1080 (32:9)", "5120 x 1440 (32:9)"};
-    static_assert(sizeof(outputs) / sizeof(*outputs) == BbSettings::OutputCount);
-    int output = s.output_res;
-    if (ImGui::BeginCombo("Output resolution", outputs[output])) {
-        for (int i = 0; i < BbSettings::OutputCount; ++i) {
-            if (ImGui::Selectable(outputs[i], i == output)) {
-                Store(s.output_res, i, true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    if (BbSettings::Ultrawide(s.output_res)) {
-        int hud = s.hud_position;
-        Store(s.hud_position, hud,
-              ImGui::SliderInt("HUD position", &hud, 0, 100, hud == 0 ? "Centred (16:9)" :
-                                                         hud == 100 ? "Screen edges" : "%d%%"));
-        Hint("Ultrawide (21:9, 32:9): moves the health, items and Blood Echoes from the centred 16:9 area toward the screen edges. Changes require a restart.");
-    }
-    if (BbSettings::FixedRenderSession()) {
-        Hint("Final image and HUD resolution. The preset controls scene resolution relative to the output. 4K Performance is approximately 1920x1080. Changes require a restart.");
-    } else {
-        Hint("Output and HUD resolution changes at the next frame boundary. The preset controls scene resolution relative to the output. Resizing resets upscaler history and may pause briefly.");
-    }
-    static const char* live_modes[] = {"Auto (based on GPU)", "Off (faster)", "On"};
-    int live = s.live_resolution + 1;
-    if (ImGui::BeginCombo("Live resolution changes", live_modes[live])) {
-        for (int i = 0; i < 3; ++i) {
-            if (ImGui::Selectable(live_modes[i], i == live)) {
-                Store(s.live_resolution, i - 1, true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    Hint("On: output and presets change without restarting, while game post-processing stays at 1080p. Off: the scene is patched to the preset resolution at startup. Auto enables the live path on capable discrete GPUs, except for outputs above 1080p with depth of field on (the live path blurs those scenes). Changes apply after restarting the game.");
-    ImGui::SeparatorText("Game effects (restart required)");
-    static const char* lods[] = {"Highest (-2)", "Original", "Lower (1)", "Lowest (2)"};
-    static constexpr int lod_values[] = {-2, 0, 1, 2};
-    int lod_index = 1;
-    for (int i = 0; i < 4; ++i) {
-        if (lod_values[i] == s.model_lod) lod_index = i;
-    }
-    if (ImGui::BeginCombo("Model detail", lods[lod_index])) {
-        for (int i = 0; i < 4; ++i) {
-            if (ImGui::Selectable(lods[i], i == lod_index)) {
-                Store(s.model_lod, lod_values[i], true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    int fov = s.fov;
-    Store(s.fov, fov, ImGui::SliderInt("Field of view", &fov, BbSettings::FovMin, BbSettings::FovMax,
-                                       fov == BbSettings::FovDefault ? "%d (game)" : "%d"));
-    Hint("Vertical field of view in degrees; the game's camera has 43. Every camera is scaled by the same amount (scripts/fov.py).");
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        Checkbox(BbSettings::Effects[e].label, s.effects[e]);
-    }
-    Hint("Effects are applied through game patches at startup (patches/Bloodborne.xml). Motion blur and dynamic shadows can increase GPU load.");
-    Hint("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from the debug-font mod. Right touchpad: Backspace.");
-
-    bool restart = BbSettings::FsrSettingsNeedRestart() || s.object_motion != s.startup_object_motion ||
-                   s.model_lod != s.startup_model_lod || s.fov != s.startup_fov ||
-                   s.live_resolution != s.startup_live_resolution ||
-                   s.fps_mode != s.startup_fps_mode || s.frame_cap != s.startup_frame_cap ||
-                   BbSettings::ResolutionNeedsRestart();
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        restart |= s.effects[e] != s.startup_effects[e];
-    }
+    const bool restart = BbSettings::FsrSettingsNeedRestart() ||
+                         s.object_motion != s.startup_object_motion || BbSettings::ResolutionNeedsRestart();
     if (restart) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
                            "Changes will apply after restarting the game");
@@ -851,16 +783,6 @@ void Menu() {
     ImGui::SameLine();
     Checkbox("Colour-coded values", s.counter_colors);
     Checkbox("Mute when the game is in the background", s.mute_unfocused);
-    static const char* prompt_modes[] = {"Follow the device in use", "PlayStation", "Keyboard and mouse", "Xbox",
-                                         "Nintendo Switch"};
-    int prompts = s.button_prompts;
-    if (ImGui::BeginCombo("Button prompts", prompt_modes[prompts])) {
-        for (int i = 0; i < BbSettings::PromptsCount; ++i) {
-            if (ImGui::Selectable(prompt_modes[i], i == prompts)) Store(s.button_prompts, i, true);
-        }
-        ImGui::EndCombo();
-    }
-    Hint("The game's button icons: keyboard and mouse keys from input.ini while you play with them, the controller's (PlayStation, Xbox or Switch) while you use it.");
 
     ImGui::Spacing();
     if (ImGui::Button("Close")) {
@@ -913,6 +835,30 @@ void TextEntryBox() {
     ImGui::Separator();
     ImGui::TextDisabled("Keyboard: type, Backspace to erase, Enter = OK, Esc = cancel");
     ImGui::TextDisabled("Controller: Cross (A) = OK, Circle (B) = cancel");
+    ImGui::End();
+}
+
+// An invitation from another player (bbport_invite.h): window.cpp takes the answer.
+void InvitationBox() {
+    const std::string from = BbInvite::ShownFrom();
+    if (from.empty()) {
+        return;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.18f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.94f);
+    ImGui::Begin("##invitation", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::SetWindowFontScale(1.4f);
+    ImGui::TextColored(ImVec4(0.95f, 0.64f, 0.23f, 1.0f), "%s invited you to play", from.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Separator();
+    ImGui::Text("Cross (A) or Enter: join their game");
+    ImGui::Text("Circle (B) or Esc: not now");
     ImGui::End();
 }
 
@@ -1468,11 +1414,11 @@ bool ReadoutsOn() {
 
 bool Visible() {
     return initialized &&
-           (menu_open || text_entry_active || WarningActive() || ReadoutsOn());
+           (menu_open || text_entry_active || BbInvite::Shown() || WarningActive() || ReadoutsOn());
 }
 
 bool CapturesInput() {
-    return menu_open || text_entry_active;
+    return menu_open || text_entry_active || BbInvite::Shown();
 }
 
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {
@@ -1575,6 +1521,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (text_entry_active) {
         TextEntryBox();
+    }
+    if (!menu_open) {
+        InvitationBox();
     }
     if (WarningActive()) {
         WarningBanner();
