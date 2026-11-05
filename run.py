@@ -117,7 +117,8 @@ def main(argv):
     env.setdefault('LBPPC_WRITE_FAULT_NO_READBACK', '1')
     # Climbing teleports (temporary): optimizations switched off while the game runs, by writing their mask
     # (gpu/shim/bbport_toggles.h, src/runtime_memory.c) to user/toggles.txt; read 4 times a second.
-    env.setdefault('BB_TOGGLE_FILE', str(user / 'toggles.txt'))    # Online: LBPPC_NP_USER=<name> signs in locally as that player (no PSN or shadNet account) and
+    env.setdefault('BB_TOGGLE_FILE', str(user / 'toggles.txt'))
+    # Online: LBPPC_NP_USER=<name> signs in locally as that player (no PSN or shadNet account) and
     # LBPPC_SERVER=<url> sends the game's server requests (Sony's, now closed) to a custom server, such as a
     # Refresh instance.
     # Or BB_SHADNET_SERVER=<host[:port]>, BB_SHADNET_NPID and BB_SHADNET_PASSWORD: signed in to a shadNet server (friends,
