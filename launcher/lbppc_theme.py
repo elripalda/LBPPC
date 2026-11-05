@@ -218,7 +218,10 @@ def checkbox(on):
 
 def tag(text, colour):
     """A small luggage tag (the game folder's status), its text in `colour`."""
-    f = ImageFont.truetype('segoeuib.ttf', 12 * S) if sys.platform == 'win32' else font(12)
+    try:
+        f = ImageFont.truetype('segoeuib.ttf', 12 * S) if sys.platform == 'win32' else font(12)
+    except OSError:  # Proton and Wine have no Segoe UI: the bundled font instead
+        f = font(12)
     l, t, r, b = f.getbbox(text)
     w, h = r - l + 44 * S, b - t + 14 * S
     img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
