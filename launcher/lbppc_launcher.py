@@ -43,7 +43,7 @@ LOG = ROOT / 'out' / 'last_run.log'
 # The game renders at these sizes natively (LBPPC_RENDER_RES: its render targets are made that large).
 # Other aspects widen the view (ultrawide: more of the level at the sides, the menus laid out for it). Wider than
 # 4480 the game does not survive yet (probe.c render_res_install); the window scales the picture up.
-RESOLUTIONS = [('1920 x 1080 (original)', '1920x1080'), ('2560 x 1440', '2560x1440'), ('3840 x 2160 (4K)', '3840x2160'),
+RESOLUTIONS = [('1280 x 720 (lighter on the GPU)', '1280x720'), ('1920 x 1080 (original)', '1920x1080'), ('2560 x 1440', '2560x1440'), ('3840 x 2160 (4K)', '3840x2160'),
                ('2560 x 1080 (21:9)', '2560x1080'), ('3440 x 1440 (21:9)', '3440x1440'),
                ('3840 x 1600 (21:9)', '3840x1600'), ('3840 x 1080 (32:9)', '3840x1080'),
                ('4480 x 1260 (32:9)', '4480x1260')]

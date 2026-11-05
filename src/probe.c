@@ -830,7 +830,11 @@ static void render_res_install(void) {
     const uint64_t mask=getenv("LBPPC_RENDER_RES_MASK") ? strtoull(getenv("LBPPC_RENDER_RES_MASK"),NULL,0) : ~0ull;
     for (size_t i=0;i<sizeof(targets)/sizeof(*targets);++i) {
         if (!(mask>>i&1)) continue;
-        const uint32_t tw=(uint32_t)(((uint64_t)targets[i].w*w+960)/1920), th=(uint32_t)(((uint64_t)targets[i].h*h+540)/1080);
+        uint32_t tw=(uint32_t)(((uint64_t)targets[i].w*w+960)/1920), th=(uint32_t)(((uint64_t)targets[i].h*h+540)/1080);
+        /* The smaller targets (1280x720 and below at 1080p) grow with the size but never shrink below it: the game
+           cuts a centred 256x256 square from one of them (0x4014f0, picked by the screen's height), and at 720p
+           the 640x360 one became 427x240, the offset went negative and the copy read past it. */
+        if (targets[i].w<1920) { if (tw<targets[i].w) tw=targets[i].w; if (th<targets[i].h) th=targets[i].h; }
         memcpy(image+targets[i].w_at,&tw,4); memcpy(image+targets[i].h_at,&th,4);
     }
     printf("Runtime: rendering at %ux%u (aspect %.3f)\n",w,h,aspect);
