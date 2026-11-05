@@ -78,5 +78,13 @@ int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us);
 typedef unsigned long long bb_jmp_buf[32];
 __attribute__((returns_twice)) int bb_setjmp(bb_jmp_buf buffer);
 __attribute__((noreturn)) void bb_longjmp(bb_jmp_buf buffer, int value);
+/* pthread_cond_timedwait to a CLOCK_REALTIME deadline, to about a millisecond: winpthreads' timed waits end on the
+ * 15.6 ms tick, so a poll (a deadline of now) took 15.4 ms and a 1 ms wait 15 ms. May return 0 early, as a spurious
+ * wakeup: callers check their condition again. */
+#include <pthread.h>
+int compat_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *deadline);
+#define runtime_cond_timedwait compat_cond_timedwait
+#else
+#define runtime_cond_timedwait pthread_cond_timedwait
 #endif
 #endif

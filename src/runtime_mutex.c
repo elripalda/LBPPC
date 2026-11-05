@@ -208,7 +208,7 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     if (!mutex_valid(*mutex)) return invalid_handle("condition wait", mutex, __builtin_return_address(0));
     ++waits;
-    return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
+    return timed_error(runtime_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     struct timespec end;

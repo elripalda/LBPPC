@@ -294,7 +294,7 @@ static ABI int32_t flag_wait(EventFlag *f,uint64_t want,uint32_t mode,uint64_t *
     const int spu=!timeout_us && !strcmp(f->name,"SpuEventFlag");
     if (spu) { spu_flag=f; spu_bits|=want; ++spu_waiters; }
     while (!flag_met(f->pattern,want,mode)) {
-        int e=timeout_us ? pthread_cond_timedwait(&f->changed,&f->lock,&deadline) : pthread_cond_wait(&f->changed,&f->lock);
+        int e=timeout_us ? runtime_cond_timedwait(&f->changed,&f->lock,&deadline) : pthread_cond_wait(&f->changed,&f->lock);
         if (e==ETIMEDOUT) { status=KERNEL_ETIMEDOUT; break; }
     }
     if (spu) --spu_waiters;
@@ -318,7 +318,7 @@ static ABI int32_t kernel_sleep(uint32_t seconds) {
 
 /* POSIX semaphores: the guest's sem_t holds a pointer to a host semaphore made of a count, a lock and a
  * condition. Errors go to the guest errno (FreeBSD numbers) with -1, as POSIX does. */
-typedef struct { pthread_mutex_t lock; pthread_cond_t posted; int64_t count; } Sem;
+typedef struct { pthread_mutex_t lock; pthread_cond_t posted; int64_t count; unsigned long poster; } Sem;
 static int32_t sem_fail(int host_errno) {
     static int logged;
     if (host_errno!=ETIMEDOUT && logged++<10)
@@ -349,23 +349,48 @@ static ABI int32_t sem_post_guest(Sem **sem) {
     Sem *s=*sem;
     pthread_mutex_lock(&s->lock);
     ++s->count;
+#ifdef _WIN32
+    s->poster=GetCurrentThreadId();
+#endif
     pthread_cond_signal(&s->posted);
     pthread_mutex_unlock(&s->lock);
     return 0;
 }
 typedef struct { int64_t sec, nsec; } GuestTimespec;
+/* LBPPC_SEM_LOG=1 (test): each wait of 5 ms or more, with how it ended, the timeout it was given (from the guest's
+ * clock_gettime(CLOCK_REALTIME), compared with the host's) and the thread that last posted. */
+static void sem_log_wait(Sem *s,const GuestTimespec *abstime,const struct timespec *start,int timed_out) {
+#ifdef _WIN32
+    static int log=-1;
+    if (log<0) log=getenv("LBPPC_SEM_LOG") && getenv("LBPPC_SEM_LOG")[0]=='1';
+    if (!log) return;
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME,&now);
+    const double waited=(double)(now.tv_sec-start->tv_sec)*1e3+(double)(now.tv_nsec-start->tv_nsec)/1e6;
+    if (waited<5.0) return;
+    const double timeout=abstime ? (double)(abstime->sec-start->tv_sec)*1e3+(double)(abstime->nsec-start->tv_nsec)/1e6 : -1.0;
+    extern const char *runtime_thread_name_of(unsigned long tid);
+    const char *me=runtime_thread_name_of(GetCurrentThreadId()), *by=runtime_thread_name_of(s->poster);
+    printf("Sem: %s waited %.1f ms (timeout %.1f ms), %s; last post by %s\n",me && *me ? me : "thread",waited,timeout,
+           timed_out ? "timed out" : "posted",by && *by ? by : "a host thread");
+#else
+    (void)s; (void)abstime; (void)start; (void)timed_out;
+#endif
+}
 static int32_t sem_take(Sem **sem,const GuestTimespec *abstime) {
     if (!sem || !*sem) return sem_fail(EINVAL);
     Sem *s=*sem;
-    struct timespec deadline;
+    struct timespec deadline, start;
+    clock_gettime(CLOCK_REALTIME,&start);
     if (abstime) { deadline.tv_sec=(time_t)abstime->sec; deadline.tv_nsec=(long)abstime->nsec; }
     pthread_mutex_lock(&s->lock);
     while (s->count<=0) {
-        int e=abstime ? pthread_cond_timedwait(&s->posted,&s->lock,&deadline) : pthread_cond_wait(&s->posted,&s->lock);
-        if (e==ETIMEDOUT) { pthread_mutex_unlock(&s->lock); return sem_fail(ETIMEDOUT); }
+        int e=abstime ? runtime_cond_timedwait(&s->posted,&s->lock,&deadline) : pthread_cond_wait(&s->posted,&s->lock);
+        if (e==ETIMEDOUT) { pthread_mutex_unlock(&s->lock); sem_log_wait(s,abstime,&start,1); return sem_fail(ETIMEDOUT); }
     }
     --s->count;
     pthread_mutex_unlock(&s->lock);
+    sem_log_wait(s,abstime,&start,0);
     return 0;
 }
 static ABI int32_t sem_wait_guest(Sem **sem) { return sem_take(sem,NULL); }

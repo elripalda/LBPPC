@@ -124,6 +124,26 @@ void compat_sleep_ns(uint64_t ns) {
         Sleep((DWORD)((ns + 999999) / 1000000));
 }
 
+/* An expired deadline times out at once. Up to 20 ms before the deadline the wait is winpthreads' own (it can
+ * overrun by a tick, which those 20 ms absorb); the rest is slept in 1 ms steps with the mutex released. */
+int compat_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex, const struct timespec *deadline) {
+    enum { TAIL_NS = 20000000, STEP_NS = 1000000 };
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    const int64_t left = (int64_t)(deadline->tv_sec - now.tv_sec) * 1000000000 + (deadline->tv_nsec - now.tv_nsec);
+    if (left <= 0) return ETIMEDOUT;
+    if (left > TAIL_NS) {
+        const int64_t until = (int64_t)deadline->tv_sec * 1000000000 + deadline->tv_nsec - TAIL_NS;
+        const struct timespec early = {.tv_sec = (time_t)(until / 1000000000), .tv_nsec = (long)(until % 1000000000)};
+        const int e = pthread_cond_timedwait(cond, mutex, &early);
+        return e == ETIMEDOUT ? 0 : e;
+    }
+    pthread_mutex_unlock(mutex);
+    compat_sleep_ns(left < STEP_NS ? (uint64_t)left : STEP_NS);
+    pthread_mutex_lock(mutex);
+    return 0;
+}
+
 int compat_remove_tree(const char *path) {
     DWORD attributes = GetFileAttributesA(path);
     if (attributes == INVALID_FILE_ATTRIBUTES) return 0;
