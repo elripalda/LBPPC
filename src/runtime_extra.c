@@ -439,8 +439,47 @@ static int32_t socket_host_fail(void) {
 /* PS4 (BSD) sockaddr_in: length, family, port (network order), address, zero. */
 typedef struct { uint8_t len, family; uint16_t port; uint32_t addr; uint8_t zero[8]; } GuestAddr;
 static int loopback(uint32_t addr) { return (ntohl(addr)>>24)==127; }
+/* Online (BB_ONLINE=1) the game's own sockets are the network library's, where sceNetSetsockopt and sceNetEpoll*
+ * look for them: here its P2P socket could not leave this PC, so joined players never exchanged a game message
+ * and the joiner gave up ten seconds after connecting. Only the raw ping socket stays below (it needs
+ * administrator rights there); its ids are SOCKET_BASE and up. */
+uintptr_t bbgpu_resolve(const char *name);
+uint16_t bbnet_p2p_bound_port(void);
+enum { P2P_DEFAULT_PORT=3658, MAX_NET_LOGS=300, MAX_LOCAL_NET_LOGS=6 };
+static int socket_online(void) {
+    static int online=-1;
+    if (online<0) { const char *v=getenv("BB_ONLINE"); online=v && v[0]=='1'; }
+    return online;
+}
+static int net_socket(int32_t fd) { return socket_online() && fd<SOCKET_BASE; }
+/* sceNet calls answer 0x804101xx; these POSIX names answer -1 with the code in errno. */
+static int64_t net_result(int64_t r) {
+    if (r>=0 || ((uint32_t)r&0xffffff00)!=0x80410100) return r;
+    *runtime_errno()=(int32_t)(r&0xff);
+    return -1;
+}
+static int net_log_turn(int64_t r,const GuestAddr *addr) {
+    static int local, remote;
+    if (r<0 && *runtime_errno()==35) return 0; /* EAGAIN: nothing waiting, every poll */
+    if (addr && loopback(addr->addr)) return __atomic_add_fetch(&local,1,__ATOMIC_RELAXED)<=MAX_LOCAL_NET_LOGS;
+    return __atomic_add_fetch(&remote,1,__ATOMIC_RELAXED)<=MAX_NET_LOGS;
+}
+static void net_log_call(const char *what,int32_t fd,const GuestAddr *addr,uint64_t size,int64_t r) {
+    if (!net_log_turn(r,addr)) return;
+    uint32_t ip=addr ? ntohl(addr->addr) : 0;
+    printf("Runtime: net %s socket %d, %llu bytes, %u.%u.%u.%u port %u vport %u -> %lld (errno %d)\n",what,fd,(unsigned long long)size,
+           ip>>24,(ip>>16)&255,(ip>>8)&255,ip&255,addr ? ntohs(addr->port) : 0,addr ? ntohs(*(const uint16_t *)addr->zero) : 0,
+           (long long)r,r<0 ? *runtime_errno() : 0);
+}
+#define NET_FUNCTION(type,variable,nid) static type variable; if (!variable) variable=(type)bbgpu_resolve(nid)
 static ABI int32_t socket_open(int32_t family,int32_t type,int32_t protocol) {
-    (void)protocol;
+    if (socket_online() && type!=3) {
+        typedef ABI int32_t (*Create)(const char *,int32_t,int32_t,int32_t);
+        NET_FUNCTION(Create,create,"Q4qBuN-c0ZM");
+        int32_t r=(int32_t)net_result(create("game",family,type,protocol));
+        printf("Runtime: game socket (family %d, type %d, protocol %d) -> %d, online\n",family,type,protocol,r);
+        return r;
+    }
 #ifdef _WIN32
     static int started;
     if (!started) { WSADATA data; WSAStartup(MAKEWORD(2,2),&data); started=1; }
@@ -467,6 +506,13 @@ static ABI int32_t socket_open(int32_t family,int32_t type,int32_t protocol) {
     return SOCKET_BASE+i;
 }
 static ABI int32_t socket_bind(int32_t fd,const GuestAddr *addr,uint32_t size) {
+    if (net_socket(fd)) {
+        typedef ABI int32_t (*Bind)(int32_t,const GuestAddr *,uint32_t);
+        NET_FUNCTION(Bind,net_bind,"bErx49PgxyY");
+        int32_t r=(int32_t)net_result(net_bind(fd,addr,size));
+        net_log_call("bind",fd,addr,0,r);
+        return r;
+    }
     int i=socket_slot(fd);
     if (i<0) return socket_fail(EBADF);
     if (!addr || size<8) return socket_fail(EINVAL);
@@ -478,6 +524,20 @@ static ABI int32_t socket_bind(int32_t fd,const GuestAddr *addr,uint32_t size) {
     return 0;
 }
 static ABI int64_t socket_send(int32_t fd,const void *data,uint64_t size,int32_t flags,const GuestAddr *to,uint32_t to_size) {
+    if (net_socket(fd)) {
+        typedef ABI int32_t (*Send)(int32_t,const void *,uint64_t,int32_t,const GuestAddr *,uint32_t);
+        NET_FUNCTION(Send,net_send,"gvD1greCu0A");
+        /* The game wakes its own threads through 127.0.0.1:3658; the P2P port here is another one. */
+        GuestAddr self;
+        if (to && to_size>=sizeof(self) && loopback(to->addr) && ntohs(to->port)==P2P_DEFAULT_PORT) {
+            self=*to;
+            self.port=htons(bbnet_p2p_bound_port());
+            to=&self;
+        }
+        int64_t r=net_result(net_send(fd,data,size,flags,to,to_size));
+        net_log_call("send",fd,to,size,r);
+        return r;
+    }
     (void)flags;
     int i=socket_slot(fd);
     if (i<0) return socket_fail(EBADF);
@@ -490,6 +550,13 @@ static ABI int64_t socket_send(int32_t fd,const void *data,uint64_t size,int32_t
     return n<0 ? socket_host_fail() : n;
 }
 static ABI int64_t socket_receive_from(int32_t fd,void *data,uint64_t size,int32_t flags,GuestAddr *from,uint32_t *from_size) {
+    if (net_socket(fd)) {
+        typedef ABI int32_t (*Receive)(int32_t,void *,uint64_t,int32_t,GuestAddr *,uint32_t *);
+        NET_FUNCTION(Receive,net_receive,"304ooNZxWDY");
+        int64_t r=net_result(net_receive(fd,data,size,flags,from,from_size));
+        net_log_call("receive",fd,from,size,r);
+        return r;
+    }
     (void)flags;
     int i=socket_slot(fd);
     if (i<0) return socket_fail(EBADF);

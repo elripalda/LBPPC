@@ -903,6 +903,16 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     pthread_mutex_lock(&lock);
     sample(data); ++reads;
     pthread_mutex_unlock(&lock);
+    /* Online: each change of the buttons and touches, to see what opened something in a shared game. */
+    static int online=-1, told;
+    static uint32_t last_buttons;
+    static uint8_t last_touches;
+    if (online<0) { const char *v=getenv("BB_ONLINE"); online=v && v[0]=='1'; }
+    if (online && (data->buttons!=last_buttons || data->touch_count!=last_touches) && told<2000) {
+        ++told;
+        last_buttons=data->buttons; last_touches=data->touch_count;
+        printf("Input: pad buttons 0x%x, %d touches%s\n",data->buttons,data->touch_count,data->buttons&BTN_TOUCHPAD ? ", touchpad clicked" : "");
+    }
     return 0;
 }
 /* Buffered read: the port samples once per call, so one entry is returned. */

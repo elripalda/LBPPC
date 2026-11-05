@@ -23,7 +23,7 @@ static bool OnlineClass(std::string_view log_class) {
         return v && v[0] == '1';
     }();
     return enabled && (log_class.starts_with("Lib.Np") || log_class.starts_with("Lib.Http") ||
-                       log_class == "NpHandler" || log_class == "ShadNet");
+                       log_class == "NpHandler" || log_class == "ShadNet" || log_class == "Lib.Net");
 }
 bool ShouldLog(std::string_view log_class, Level level) {
     return level >= threshold() || (level >= Level::info && OnlineClass(log_class));

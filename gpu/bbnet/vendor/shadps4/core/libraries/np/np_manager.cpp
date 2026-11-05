@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -319,7 +320,18 @@ s32 PS4_SYSV_ABI sceNpGetParentalControlInfo(s32 req_id, OrbisNpOnlineId* online
     }
     const s32 user_id = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
     if (user_id == -1) {
-        return ORBIS_NP_ERROR_USER_NOT_FOUND;
+        // lbppc: LBP3's parental-controls check takes a failure as a restriction (its "user-generated
+        // content" notice, then no join), so a player not on this PC is answered as unrestricted.
+        std::scoped_lock lk{g_request_mutex};
+        s32 err;
+        NpRequest* req = GetRequest(req_id, &err);
+        if (!req)
+            return err;
+        LOG_INFO(Lib_NpManager, "parental controls of another player ({}): none",
+                 std::string_view(online_id->data, strnlen(online_id->data, sizeof(online_id->data))));
+        *age = 18;
+        std::memset(info, 0, sizeof(OrbisNpParentalControlInfo));
+        return CompleteRequest(*req, ORBIS_OK);
     }
     return sceNpGetParentalControlInfoA(req_id, user_id, age, info);
 }
@@ -339,9 +351,10 @@ sceNpGetParentalControlInfoA(s32 req_id, Libraries::UserService::OrbisUserServic
     if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
-    LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
     *age = GetAgeFromProfile(user_id);
     std::memset(info, 0, sizeof(OrbisNpParentalControlInfo));
+    LOG_DEBUG(Lib_NpManager, "parental controls of user {}: age {}, no restrictions", user_id,
+              static_cast<int>(*age));
     return CompleteRequest(*req, ORBIS_OK);
 }
 
@@ -993,9 +1006,12 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
         LegacyNpStateCb.func = callback;
         LegacyNpStateCb.userdata = userdata;
     }
-    // lbppc: signed in locally, the SignedIn event was raised at startup, before the game listened (and
-    // dropped by the next dispatch): the new callback hears it on the game's next sceNpCheckCallback.
-    if (!EmulatorSettings.GetLocalNpUser().empty()) {
+    // lbppc: signed in (locally or to shadNet), the SignedIn event was raised at startup, before the game
+    // listened (and dropped by the next dispatch): the new callback hears it on the game's next
+    // sceNpCheckCallback. Without it LBP3 never learns the player's online ID; its parental-controls check
+    // then fails and joining an invitation stops at the "user-generated content" notice.
+    if (!EmulatorSettings.GetLocalNpUser().empty() ||
+        (g_shadnet_enabled && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(1))) {
         QueueNpStateEvent(1, OrbisNpState::SignedIn);
     }
     return ORBIS_OK;

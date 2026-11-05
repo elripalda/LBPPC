@@ -388,8 +388,44 @@ static void watch_slot(uint64_t entry_rsp) {
     DWORD written;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,(DWORD)n,&written,NULL);
 }
+/* lbppc: LBP3's online sync check. Every 60 world frames each game hashes its players' matrices (0x1acaa0: world+0x120,
+ * up to 4 players, ->8 ->0x40 ->0x10, matrix at +0x40) and sends frame and hash to the others (0x256cc0); the receiver
+ * (0x269eb0) compares it with its own record of that frame and ends the game on a difference. Both are logged, to
+ * compare the two players' logs. LBPPC_DIVERGE_KICK=0 (diagnostics) keeps the game going after a difference, with the
+ * flag at +0x5e8 the game has for this, so that a test collects more than one. */
+enum { SYNC_SEND_SITE=0x256d9a, SYNC_RECEIVE_SITE=0x269ed6 };
+typedef struct { unsigned char id[0x24]; uint32_t where_a, where_b, frame, hash, session; } SyncRecord;
+static void sync_log_send(uint64_t world, uint64_t frame) {
+    const uint32_t count=*(uint32_t *)(uintptr_t)(world+0x128);
+    const uint64_t *players=*(const uint64_t **)(uintptr_t)(world+0x120);
+    printf("Sync: frame %llu, %u players\n",(unsigned long long)frame,count);
+    for (uint32_t i=0;i<count && i<4;++i) {
+        uint64_t p=*(uint64_t *)(uintptr_t)(players[i]+8);
+        p=*(uint64_t *)(uintptr_t)(p+0x40);
+        p=*(uint64_t *)(uintptr_t)(p+0x10);
+        const uint32_t *m=(const uint32_t *)(uintptr_t)(p+0x40);
+        const float *f=(const float *)m;
+        printf("Sync:  player %u at %.6f %.6f %.6f;",i,(double)f[12],(double)f[13],(double)f[14]);
+        for (int k=0;k<16;++k) printf(" %08x",m[k]);
+        printf("\n");
+    }
+}
+static void sync_log_receive(uint64_t game, const SyncRecord *message) {
+    static int kick=-1;
+    if (kick<0) { const char *v=getenv("LBPPC_DIVERGE_KICK"); kick=!(v && v[0]=='0'); }
+    if (!kick) *(unsigned char *)(uintptr_t)(game+0x5e8)=1;
+    printf("Sync: received frame %u hash %08x (where %x %x, session %u, id %.16s); ours:",message->frame,message->hash,
+           message->where_a,message->where_b,message->session,(const char *)message->id);
+    const SyncRecord *held=*(const SyncRecord **)(uintptr_t)(game+0x550);
+    const uint32_t count=*(uint32_t *)(uintptr_t)(game+0x558);
+    for (uint32_t i=0;i<count && held;++i)
+        printf(" frame %u hash %08x%s",held[i].frame,held[i].hash,held[i].frame==message->frame ? (held[i].hash==message->hash ? " (same)" : " (DIFFERENT)") : "");
+    printf("\n");
+}
 static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot, uint64_t c, uint64_t *frame) {
     /* frame: the stub's saved registers, below its rbp: flags, rax rcx rdx rsi rdi r8-r11 rbx r12-r15. */
+    if (offset==SYNC_SEND_SITE) { sync_log_send(frame[-11],frame[-14]); return; }
+    if (offset==SYNC_RECEIVE_SITE) { sync_log_receive(frame[-14],(const SyncRecord *)(uintptr_t)frame[-15]); return; }
     uint64_t rax=frame[-2];
     /* BB_HOOK_RET_SLOT=n: the return address is n slots up (a hook in an epilogue, before its pops). */
     static long ret_slot=-1;
@@ -756,9 +792,14 @@ static void custom_server_install(void) {
     for (size_t i=0;i<sizeof(key)/sizeof(*key);++i) memcpy(image+key[i].at,key[i].custom,strlen(key[i].custom));
     printf("Online: custom server %s\n",server);
 }
-/* Executable memory within 2 GiB of the image (for rel32 jumps and calls into stubs). */
+/* Executable memory within 2 GiB of the image (for rel32 jumps and calls into stubs): any free 64 KiB, the space
+   around the image being cut up by the GPU and network libraries. */
 static unsigned char *near_image_alloc(void) {
     unsigned char *p=NULL;
+    const uintptr_t past=((uintptr_t)image+image_size_hint+0xffff)&~(uintptr_t)0xffff;
+    for (uintptr_t at=past; !p && at<(uintptr_t)image+0x70000000; at+=0x10000)
+        p=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    if (p) return p;
     for (uintptr_t at=((uintptr_t)image-0x10000000)&~(uintptr_t)0xffff;
          !p && (uintptr_t)image>0x70000000 && at>(uintptr_t)image-0x70000000; at-=0x10000000)
         p=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
@@ -844,22 +885,143 @@ static void sim_divide_install(void) {
     printf("Runtime: world update every %d frames (stub at %p)\n",n,(void *)s);
     if (getenv("LBPPC_UNCAP_TRIGGER")) CloseHandle(CreateThread(NULL,0,uncap_thread,NULL,0,NULL));
 }
+/* lbppc: online play runs both players' worlds in lockstep and compares them ("The game diverged"). rcpps and rsqrtps
+ * are approximations whose results differ between CPU makers, harmless on a console where every machine is alike:
+ * online, each site in the game and its spu.prx (exact_math_sites.inc, CUSA00473 1.28; checked first, else nothing
+ * changes) jumps to a stub computing 1/x or 1/sqrt(x) exactly. dpps goes the same way, as a fixed sequence of additions.
+ * LBPPC_EXACT_MATH=0 leaves them, =1 applies them offline too. */
+static const struct { uint32_t offset; uint8_t site_length, moved, rip_at, rip_next; } exact_math_sites[]={
+#include "exact_math_sites.inc"
+};
+/* A 3-byte VEX instruction on registers: map 1 (0F) or 3 (0F3A), prefix pp, 128 bits. */
+static unsigned char *vex_op(unsigned char *o,unsigned map,unsigned pp,unsigned opcode,unsigned reg,unsigned first,unsigned rm) {
+    *o++=0xc4;
+    *o++=(unsigned char)((reg<8 ? 0x80 : 0)|0x40|(rm<8 ? 0x20 : 0)|map);
+    *o++=(unsigned char)(((~first&15)<<3)|pp);
+    *o++=(unsigned char)opcode;
+    *o++=(unsigned char)(0xc0|((reg&7)<<3)|(rm&7));
+    return o;
+}
+/* dpps as Intel documents it: (x0*y0+x1*y1)+(x2*y2+x3*y3), the elements not in the mask +0. */
+static unsigned char *exact_dpps(unsigned char *o,const unsigned char *site) {
+    const unsigned dst=((site[4]>>3)&7)|(site[1]&0x80 ? 0 : 8), rm=(site[4]&7)|(site[1]&0x20 ? 0 : 8);
+    const unsigned first=(~(site[2]>>3))&15, mask=site[5];
+    unsigned t=0, z;
+    while (t==dst || t==first || t==rm) ++t;
+    z=t+1;
+    while (z==dst || z==first || z==rm) ++z;
+    static const unsigned char below[]={0x48,0x8d,0xa4,0x24,0x40,0xff,0xff,0xff}; /* lea rsp,[rsp-192]: past the red zone */
+    static const unsigned char above[]={0x48,0x8d,0xa4,0x24,0xc0,0x00,0x00,0x00}; /* lea rsp,[rsp+192] */
+    memcpy(o,below,8); o+=8;
+    *o++=0xc5; *o++=0xfc; *o++=0x11; *o++=(unsigned char)(0x04|(t<<3)); *o++=0x24;   /* vmovups [rsp],ymmT */
+    *o++=0xc5; *o++=0xfc; *o++=0x11; *o++=(unsigned char)(0x44|(z<<3)); *o++=0x24; *o++=0x20; /* vmovups [rsp+32],ymmZ */
+    o=vex_op(o,1,0,0x59,t,first,rm);                                                 /* vmulps t,first,rm */
+    o=vex_op(o,1,0,0x57,z,z,z);                                                      /* vxorps z,z,z */
+    o=vex_op(o,3,1,0x0c,t,z,t); *o++=(unsigned char)(mask>>4);                       /* vblendps t,z,t,mask>>4 */
+    o=vex_op(o,1,3,0x7c,t,t,t);                                                      /* vhaddps t,t,t */
+    o=vex_op(o,1,3,0x7c,t,t,t);                                                      /* vhaddps t,t,t */
+    o=vex_op(o,1,0,0xc6,t,t,t); *o++=0;                                              /* vshufps t,t,t,0 */
+    o=vex_op(o,3,1,0x0c,dst,z,t); *o++=(unsigned char)(mask&15);                     /* vblendps dst,z,t,mask&15 */
+    *o++=0xc5; *o++=0xfc; *o++=0x10; *o++=(unsigned char)(0x44|(z<<3)); *o++=0x24; *o++=0x20; /* vmovups ymmZ,[rsp+32] */
+    *o++=0xc5; *o++=0xfc; *o++=0x10; *o++=(unsigned char)(0x04|(t<<3)); *o++=0x24;   /* vmovups ymmT,[rsp] */
+    memcpy(o,above,8); o+=8;
+    return o;
+}
+static void exact_math_install(void) {
+    const char *setting=getenv("LBPPC_EXACT_MATH"), *online=getenv("BB_ONLINE");
+    if (setting ? setting[0]=='0' : !(online && online[0]=='1')) return;
+    const size_t count=sizeof(exact_math_sites)/sizeof(*exact_math_sites);
+    for (size_t i=0;i<count;++i) {
+        const unsigned char *site=image+exact_math_sites[i].offset;
+        const unsigned char op=site[0]==0xc5 ? site[2] : site[3];
+        const int is_dpps=site[0]==0xc4 && (site[1]&0x1f)==3 && op==0x40 && (site[4]>>6)==3 && exact_math_sites[i].site_length==6;
+        if ((site[0]!=0xc5 && site[0]!=0xc4) || (op!=0x52 && op!=0x53 && !is_dpps)) {
+            fprintf(stderr,"Exact math: unexpected game code at 0x%x, not applied (online play may diverge)\n",exact_math_sites[i].offset);
+            return;
+        }
+    }
+    const float one=1.0f;
+    unsigned char *stubs=NULL, *o=NULL;
+    size_t chunks=0;
+    for (size_t i=0;i<count;++i) {
+        if (!stubs || (size_t)(o-stubs)+96>65536) {
+            stubs=near_image_alloc();
+            if (!stubs) { fprintf(stderr,"Exact math: no memory near the image after %zu sites (online play may diverge)\n",i); return; }
+            memcpy(stubs,&one,4);
+            o=stubs+16;
+            ++chunks;
+        }
+        unsigned char *site=image+exact_math_sites[i].offset;
+        const unsigned length=exact_math_sites[i].site_length, moved=exact_math_sites[i].moved;
+        if (site[0]==0xc4 && (site[1]&0x1f)==3) {
+            unsigned char *dot=o;
+            o=exact_dpps(o,site);
+            *o++=0xe9; { int32_t d=(int32_t)((site+moved)-(o+4)); memcpy(o,&d,4); o+=4; }
+            const int32_t jump=(int32_t)(dot-(site+5));
+            DWORD was;
+            VirtualProtect(site,moved,PAGE_EXECUTE_READWRITE,&was);
+            site[0]=0xe9; memcpy(site+1,&jump,4);
+            for (unsigned k=5;k<moved;++k) site[k]=0x90;
+            VirtualProtect(site,moved,was,&was);
+            continue;
+        }
+        const unsigned rip_at=exact_math_sites[i].rip_at, rip_next=exact_math_sites[i].rip_next;
+        const int vex2=site[0]==0xc5;
+        const unsigned op_at=vex2 ? 2 : 3, modrm=site[op_at+1];
+        const int is_sqrt=site[op_at]==0x52;
+        const unsigned dst=((modrm>>3)&7)|(site[1]&0x80 ? 0 : 8);
+        const unsigned src=(modrm>>6)==3 ? (unsigned)((modrm&7)|(!vex2 && !(site[1]&0x20) ? 8 : 0)) : 16;
+        unsigned t=0;
+        while (t==dst || t==src) ++t;
+        unsigned char *stub=o;
+        static const unsigned char below[]={0x48,0x8d,0xa4,0x24,0x60,0xff,0xff,0xff}; /* lea rsp,[rsp-160]: past the red zone */
+        static const unsigned char above[]={0x48,0x8d,0xa4,0x24,0xa0,0x00,0x00,0x00}; /* lea rsp,[rsp+160] */
+        memcpy(o,below,8); o+=8;
+        *o++=0xc5; *o++=0xfc; *o++=0x11; *o++=(unsigned char)(0x04|(t<<3)); *o++=0x24;   /* vmovups [rsp],ymmT */
+        *o++=0xc4; *o++=0xe2; *o++=0x79; *o++=0x18; *o++=(unsigned char)(0x05|(t<<3));   /* vbroadcastss xmmT,[rip+one] */
+        { int32_t d=(int32_t)(stubs-(o+4)); memcpy(o,&d,4); o+=4; }
+        if (is_sqrt) {
+            memcpy(o,site,length); o[op_at]=0x51; o+=length;                             /* vsqrtps dst,src */
+            *o++=0xc4; *o++=(unsigned char)(0x41|(dst<8 ? 0xa0 : 0));                    /* vdivps dst,xmmT,dst */
+            *o++=(unsigned char)((~t&15)<<3); *o++=0x5e; *o++=(unsigned char)(0xc0|((dst&7)<<3)|(dst&7));
+        } else {
+            /* The site itself as vdivps dst,xmmT,src: same operands, another opcode and first source. */
+            memcpy(o,site,length);
+            o[op_at]=0x5e;
+            o[op_at-1]=(unsigned char)((o[op_at-1]&0x87)|((~t&15)<<3));
+            if (rip_at && rip_at<length) {
+                int32_t d;
+                memcpy(&d,site+rip_at,4);
+                d=(int32_t)((site+rip_next+d)-(o+rip_next));
+                memcpy(o+rip_at,&d,4);
+            }
+            o+=length;
+        }
+        *o++=0xc5; *o++=0xfc; *o++=0x10; *o++=(unsigned char)(0x04|(t<<3)); *o++=0x24;   /* vmovups ymmT,[rsp] */
+        memcpy(o,above,8); o+=8;
+        if (moved>length) {
+            memcpy(o,site+length,moved-length);
+            if (rip_at>=length) {
+                int32_t d;
+                memcpy(&d,site+rip_at,4);
+                d=(int32_t)((site+rip_next+d)-(o+rip_next-length));
+                memcpy(o+rip_at-length,&d,4);
+            }
+            o+=moved-length;
+        }
+        *o++=0xe9; { int32_t d=(int32_t)((site+moved)-(o+4)); memcpy(o,&d,4); o+=4; }
+        const int32_t rel=(int32_t)(stub-(site+5));
+        DWORD old;
+        VirtualProtect(site,moved,PAGE_EXECUTE_READWRITE,&old);
+        site[0]=0xe9; memcpy(site+1,&rel,4);
+        for (unsigned k=5;k<moved;++k) site[k]=0x90;
+        VirtualProtect(site,moved,old,&old);
+    }
+    printf("Online: exact math at %zu sites, %zu blocks of stubs\n",count,chunks);
+}
 static void hooks_install(const char *spec) {
     if (!spec || !*spec) return;
-    /* Stubs within 2 GiB of the image, for 5-byte jumps. */
-    unsigned char *stubs=NULL;
-    for (uintptr_t at=((uintptr_t)image-0x10000000)&~(uintptr_t)0xffff;
-         !stubs && (uintptr_t)image>0x70000000 && at>(uintptr_t)image-0x70000000; at-=0x10000000)
-        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
-    /* lbppc: an image at the low base (0x400000) has no room below it: above it, past the modules. */
-    for (uintptr_t at=((uintptr_t)image+0x08000000)&~(uintptr_t)0xffff; !stubs && at<(uintptr_t)image+0x70000000; at+=0x01000000)
-        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
-    for (uintptr_t at=0x10000; !stubs && at+65536<=(uintptr_t)image; at+=0x10000)
-        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
-    /* Any free 64 KiB just past the image (the GPU and network libraries take much of the space above it). */
-    for (uintptr_t at=((uintptr_t)image+image_size_hint+0xffff)&~(uintptr_t)0xffff;
-         !stubs && at<(uintptr_t)image+0x70000000; at+=0x10000)
-        stubs=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    unsigned char *stubs=near_image_alloc();
     if (!stubs) { fprintf(stderr,"BB_HOOK: no memory near the image\n"); return; }
     unsigned char *o=stubs;
     for (const char *p=spec; *p;) {
@@ -917,6 +1079,86 @@ static void hooks_install(const char *spec) {
         o=(unsigned char *)(((uintptr_t)o+15)&~(uintptr_t)15);
         fprintf(stderr,"BB_HOOK: guest 0x%llx hooked (%u bytes moved)\n",(unsigned long long)offset,length);
     }
+}
+/* lbppc: every 5 seconds online, which threads used the CPU: the frame diagnostics say a frame waited for the game, not
+ * why. 100% is one core; names are the game's thread names or Windows' thread descriptions. */
+typedef struct { DWORD tid; uint64_t cpu; } ThreadCpu;
+static uint64_t thread_cpu_100ns(HANDLE thread) {
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(thread,&created,&exited,&kernel,&user)) return 0;
+    return ((uint64_t)kernel.dwHighDateTime<<32|kernel.dwLowDateTime)+((uint64_t)user.dwHighDateTime<<32|user.dwLowDateTime);
+}
+static const char *thread_label(HANDLE thread,DWORD tid,char *out,size_t size) {
+    extern const char *runtime_thread_name_of(unsigned long tid);
+    const char *guest=runtime_thread_name_of(tid);
+    if (guest && *guest) return guest;
+    typedef HRESULT (WINAPI *Describe)(HANDLE,PWSTR *);
+    static Describe describe;
+    if (!describe) describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    PWSTR wide=NULL;
+    snprintf(out,size,"thread %lu",tid);
+    if (describe && SUCCEEDED(describe(thread,&wide)) && wide) {
+        if (*wide) WideCharToMultiByte(CP_UTF8,0,wide,-1,out,(int)size,NULL,NULL);
+        LocalFree(wide);
+    }
+    return out;
+}
+static DWORD WINAPI thread_load_monitor(LPVOID arg) {
+    (void)arg;
+    enum { MAX_THREADS=512, SHOWN=14 };
+    static ThreadCpu last[MAX_THREADS];
+    static struct { uint64_t used; char name[32]; } now[MAX_THREADS];
+    size_t last_count=0;
+    const DWORD self=GetCurrentProcessId();
+    for (;;) {
+        Sleep(5000);
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        if (snapshot==INVALID_HANDLE_VALUE) continue;
+        THREADENTRY32 entry;
+        entry.dwSize=sizeof(entry);
+        size_t count=0;
+        static ThreadCpu next[MAX_THREADS];
+        uint64_t total=0;
+        for (BOOL more=Thread32First(snapshot,&entry); more && count<MAX_THREADS; more=Thread32Next(snapshot,&entry)) {
+            if (entry.th32OwnerProcessID!=self) continue;
+            HANDLE thread=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ThreadID);
+            if (!thread) continue;
+            const uint64_t cpu=thread_cpu_100ns(thread);
+            uint64_t before=cpu;
+            for (size_t i=0;i<last_count;++i) if (last[i].tid==entry.th32ThreadID) { before=last[i].cpu; break; }
+            next[count]=(ThreadCpu){entry.th32ThreadID,cpu};
+            now[count].used=cpu-before;
+            total+=now[count].used;
+            char label[32];
+            snprintf(now[count].name,sizeof(now[count].name),"%s",thread_label(thread,entry.th32ThreadID,label,sizeof(label)));
+            CloseHandle(thread);
+            ++count;
+        }
+        CloseHandle(snapshot);
+        memcpy(last,next,count*sizeof(*last));
+        const int first=last_count==0;
+        last_count=count;
+        if (first) continue;
+        char line[1024];
+        int n=snprintf(line,sizeof(line),"Threads: %.0f%% of one core over 5 s:",(double)total/500000.0);
+        for (int shown=0;shown<SHOWN;++shown) {
+            size_t best=count;
+            for (size_t i=0;i<count;++i) if (now[i].used && (best==count || now[i].used>now[best].used)) best=i;
+            if (best==count || (double)now[best].used/500000.0<1.0) break;
+            n+=snprintf(line+n,sizeof(line)-(size_t)n,"%s %s %.0f%%",shown ? "," : "",now[best].name,(double)now[best].used/500000.0);
+            now[best].used=0;
+        }
+        puts(line);
+    }
+    return 0;
+}
+static void sync_log_install(void) {
+    const char *online=getenv("BB_ONLINE");
+    if (!online || online[0]!='1') return;
+    CloseHandle(CreateThread(NULL,0,thread_load_monitor,NULL,0,NULL));
+    static const unsigned char send[]={0x41,0x8b,0x87,0x60,0x05,0x00,0x00}, receive[]={0x41,0x8b,0x47,0x34,0x85,0xc0};
+    if (memcmp(image+SYNC_SEND_SITE,send,7) || memcmp(image+SYNC_RECEIVE_SITE,receive,6)) { fprintf(stderr,"Sync: unexpected game code, not logged\n"); return; }
+    hooks_install("0x256d9a:7,0x269ed6:6");
 }
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
@@ -1794,9 +2036,11 @@ int main(int argc, char **argv) {
     custom_server_install();
     sim_divide_install();
     hooks_install(getenv("BB_HOOK"));
+    sync_log_install();
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
+    exact_math_install();
     protect(traps, round_page((import_count + 1) * 32), 5);
     /* Each page goes straight to its final protection (a later segment wins, as before), never
        through no access: another thread that already found the image (a mod DLL's memory

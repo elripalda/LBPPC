@@ -2,6 +2,7 @@
 // bbport co-op: what shadPS4 0.20.0's network and NP libraries need from the rest of
 // shadPS4, implemented on top of the bbport runtime, and their registration.
 
+#include "core/libraries/net/net_p2p.h"
 #include "core/libraries/net/net_kernel.h"
 #include <chrono>
 #include <condition_variable>
@@ -448,6 +449,10 @@ extern "C" void bbnet_configure(const char* app0, const char* serial, const char
 // ---- Registration ------------------------------------------------------------------------------
 
 namespace Libraries::Np::NpManager { void InitializeRuntime(); }
+extern "C" u16 bbnet_p2p_bound_port(void) {
+    return Libraries::Net::GetP2PBoundPort();
+}
+
 extern "C" void bbnet_initialize(void) {
     Libraries::Np::NpManager::InitializeRuntime();
 }

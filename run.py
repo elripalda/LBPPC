@@ -122,6 +122,9 @@ def main(argv):
         # What the server's clientversions.cfg checks (it can turn old LBPPC builds away).
         env.setdefault('BB_CLIENT_VERSION', f"LBPPC {env.get('LBPPC_VERSION', 'development build')}")
         env.setdefault('BB_P2P_PORT', '0')
+        # The router forwards the P2P port to this PC (UPnP), so a joining player can reach the host: without
+        # it their packets stop at the host's router. BB_UPNP=0 turns it off.
+        env.setdefault('BB_UPNP', '1')
         host = env.get('BB_SHADNET_SERVER', '127.0.0.1').rsplit(':', 1)[0]
         env.setdefault('BB_SHADNET_WEBAPI', f'http://{host}:31315')
     elif env.get('LBPPC_NP_USER'):

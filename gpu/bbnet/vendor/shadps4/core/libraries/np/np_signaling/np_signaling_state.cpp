@@ -401,11 +401,14 @@ s32 GetConnectionInfoInternal(s32 ctx_id, s32 conn_id, s32 info_code, void* out_
         if (!established) {
             return ORBIS_NP_SIGNALING_ERROR_CONN_IN_PROGRESS;
         }
+        // lbppc: nothing measures it, and 0 bits per second made LBP3 drop a connection that worked ten
+        // seconds after it was made ("could not connect"). A broadband line, as the bandwidth test reports.
+        constexpr u32 kAssumedBandwidthBps = 10'000'000;
         if (out_a) {
-            *reinterpret_cast<u32*>(out_a) = 0;
+            *reinterpret_cast<u32*>(out_a) = kAssumedBandwidthBps;
         }
         if (out_b) {
-            *reinterpret_cast<u32*>(out_b) = 0;
+            *reinterpret_cast<u32*>(out_b) = kAssumedBandwidthBps;
         }
         result = ORBIS_OK;
         break;
@@ -607,11 +610,13 @@ void DispatchPeerActivatedEvent(s32 conn_id) {
         owner_it != NpHandler::GetInstance().GetSignalingState().contexts.end()
             ? owner_it->second.owner_npid
             : OrbisNpId{};
+    // lbppc: the context the connection belongs to hears it too. LBP3 has one context; skipped, the host
+    // never learned a joining player had connected, and the joiner gave up ten seconds later.
     for (auto& [cid, ctx] : NpHandler::GetInstance().GetSignalingState().contexts) {
-        if (cid == owner_ctx || !ctx.active) {
+        if (!ctx.active) {
             continue;
         }
-        if (std::memcmp(&ctx.owner_npid, &local_npid, sizeof(local_npid)) == 0) {
+        if (cid == owner_ctx || std::memcmp(&ctx.owner_npid, &local_npid, sizeof(local_npid)) == 0) {
             StageBasicCallbackLocked(ctx, cid, conn_id, ORBIS_NP_SIGNALING_EVENT_PEER_ACTIVATED, 0);
         }
     }

@@ -117,6 +117,13 @@ static GuestThread *new_thread(void) {
 static void publish(GuestThread *t) {
     pthread_mutex_lock(&lock); t->next=threads; threads=t; pthread_mutex_unlock(&lock);
 }
+const char *runtime_thread_name_of(unsigned long tid) {
+    const char *name=NULL;
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t;t=t->next) if (t->host_tid==tid && !t->finished) { name=t->name; break; }
+    pthread_mutex_unlock(&lock);
+    return name;
+}
 /* Host threads that call into guest code without being created by the guest
  * (the main thread, test threads) get a record on first use. */
 GuestThread *runtime_thread_current(void) {
