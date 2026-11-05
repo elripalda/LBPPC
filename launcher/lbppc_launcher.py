@@ -356,8 +356,15 @@ class TitleBar:
         if ctypes.windll.dwmapi.DwmSetWindowAttribute(self.hwnd(), 33, ctypes.byref(preference),  # CORNER_PREFERENCE
                                                       ctypes.sizeof(preference)) == 0:
             return
+        cut_size = None
         def cut(_event=None):
+            # Only for a new size: setting the region sends the window a <Configure> of its own, and cutting
+            # again for that one never ends (the launcher froze on Windows 10).
+            nonlocal cut_size
             w, h = self.window.winfo_width(), self.window.winfo_height()
+            if (w, h) == cut_size:
+                return
+            cut_size = (w, h)
             region = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16)
             ctypes.windll.user32.SetWindowRgn(self.hwnd(), region, True)
         cut()
