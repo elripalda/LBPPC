@@ -124,7 +124,18 @@ uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
 static int sleep_ns(uint64_t ns) {
 #ifdef _WIN32
+    /* LBPPC_SLEEP_LOG=1 (test): each sleep of 2 ms or more asked, or that overran by 2 ms, with what it took. */
+    static int log=-1;
+    if (log<0) log=getenv("LBPPC_SLEEP_LOG") && getenv("LBPPC_SLEEP_LOG")[0]=='1';
+    struct timespec a,b;
+    if (log) clock_gettime(CLOCK_MONOTONIC,&a);
     compat_sleep_ns(ns);
+    if (log) {
+        clock_gettime(CLOCK_MONOTONIC,&b);
+        const uint64_t took=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
+        if (ns>=2000000 || took>ns+2000000)
+            printf("Sleep: thread %lu asked %.2f ms, took %.2f ms\n",(unsigned long)(uintptr_t)pthread_self(),ns/1e6,took/1e6);
+    }
 #else
     struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)};
     while (nanosleep(&t,&t)) if (errno!=EINTR) return errno;

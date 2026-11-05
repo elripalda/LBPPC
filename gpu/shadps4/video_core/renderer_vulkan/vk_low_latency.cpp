@@ -396,6 +396,11 @@ void PresentStart(u64 id) {
     }
 }
 
+// lbppc: set by the runtime's profiler (LBPPC_PROFILE=1) to hear of each slow frame: its length and how long ago
+// the game's part of it started and ended, in ms.
+extern "C" void (*lbppc_slow_frame_hook)(double frame_ms, double game_start_ago_ms, double game_end_ago_ms);
+void (*lbppc_slow_frame_hook)(double, double, double) = nullptr;
+
 void PresentEnd(u64 id) {
     if (id && state.mode == Mode::Reflex) {
         Marker(VK_LATENCY_MARKER_PRESENT_END_NV, id);
@@ -427,6 +432,9 @@ void PresentEnd(u64 id) {
                             since, span(state.last_start, times.start), span(times.start, times.submit),
                             span(times.submit, times.flip), span(times.flip, times.present),
                             span(times.present, now));
+                if (lbppc_slow_frame_hook) {
+                    lbppc_slow_frame_hook(since, span(times.start, now), span(times.submit, now));
+                }
             }
         }
         state.last_present_end = now;

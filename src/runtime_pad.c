@@ -853,6 +853,9 @@ static void touch_ids(PadData *d) {
     d->touch_held_time=d->touch_count ? (uint32_t)(d->timestamp-since) : 0;
 }
 void bbgpu_input_note_read(void); /* gpu/shim/bbgpu.cpp: input freshness log */
+/* lbppc (LBPPC_POS_LOG, test): the buttons the game read since the last world step, and the left stick last read. */
+uint32_t runtime_pad_buttons_seen;
+uint8_t runtime_pad_left_stick[2];
 static void sample(PadData *d) {
     bbgpu_input_note_read();
     reload_config_if_requested();
@@ -877,6 +880,8 @@ static void sample(PadData *d) {
         if (d->buttons) d->buttons=0;
         else hold_after_capture=0;
     }
+    __atomic_fetch_or(&runtime_pad_buttons_seen,d->buttons,__ATOMIC_RELAXED);
+    runtime_pad_left_stick[0]=d->left_x; runtime_pad_left_stick[1]=d->left_y;
 }
 
 static ABI int32_t pad_init(void) { pthread_mutex_lock(&lock); initialized=1; pthread_mutex_unlock(&lock); return 0; }

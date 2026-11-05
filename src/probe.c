@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <math.h>
 #include <cpuid.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
@@ -15,7 +16,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <timeapi.h>
+#include <x86intrin.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -422,8 +425,67 @@ static void sync_log_receive(uint64_t game, const SyncRecord *message) {
         printf(" frame %u hash %08x%s",held[i].frame,held[i].hash,held[i].frame==message->frame ? (held[i].hash==message->hash ? " (same)" : " (DIFFERENT)") : "");
     printf("\n");
 }
+/* lbppc: LBPPC_POS_LOG=1 (test): at each world update (0x254450, the game in rdi) every player's position, how far
+ * it moved since the last update and the real time between the two, to tell a jump in the simulation from a jump in
+ * timing. The world is found from the game as the sync check finds it (0x256ce6-0x256d4c); read through
+ * ReadProcessMemory, as the game may not hold a world yet. */
+enum { WORLD_UPDATE=0x254450 };
+static int read_guest(uint64_t address,void *out,size_t size) {
+    SIZE_T read=0;
+    return ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)address,out,size,&read) && read==size;
+}
+static uint64_t world_of(uint64_t game) {
+    uint64_t object=0, handle=0, bits18=0, bits20=0, base=0, world=0;
+    uint32_t bits28=0;
+    unsigned char kind=0;
+    if (!read_guest(game+0x70,&object,8) || !object || !read_guest(object+0x45,&kind,1) || (kind&0xfe)!=4) return 0;
+    if (!read_guest(object+0x68,&handle,8) || !handle) return 0;
+    if (!read_guest(handle+0x18,&bits18,8) || !read_guest(handle+0x20,&bits20,8) || !read_guest(handle+0x28,&bits28,4) ||
+        !read_guest(handle+0x50,&base,8)) return 0;
+    if (!(bits18&4)) return 0;
+    const uint64_t slot=(bits28&2) ? handle+0x58+(bits20&0xc)*2 : base+0x10;
+    return read_guest(slot,&world,8) ? world : 0;
+}
+static void position_log(uint64_t game) {
+    const uint64_t world=world_of(game);
+    if (!world) return;
+    static float last[4][3], last_step[4];
+    static int have[4];
+    static LARGE_INTEGER previous, hz;
+    static unsigned long long step;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!hz.QuadPart) QueryPerformanceFrequency(&hz);
+    const double ms=previous.QuadPart ? (double)(now.QuadPart-previous.QuadPart)*1000.0/(double)hz.QuadPart : 0.0;
+    previous=now;
+    ++step;
+    /* The pad (player 0's controller): buttons held at any read since the last step, and the left stick. */
+    extern uint32_t runtime_pad_buttons_seen;
+    extern uint8_t runtime_pad_left_stick[2];
+    const uint32_t buttons=__atomic_exchange_n(&runtime_pad_buttons_seen,0,__ATOMIC_RELAXED);
+    const uint8_t stick[2]={runtime_pad_left_stick[0],runtime_pad_left_stick[1]};
+    uint32_t count=0;
+    uint64_t players=0;
+    if (!read_guest(world+0x128,&count,4) || !read_guest(world+0x120,&players,8) || !count || count>4) return;
+    for (uint32_t i=0;i<count;++i) {
+        uint64_t p=0;
+        float f[3];
+        if (!read_guest(players+8*i,&p,8) || !read_guest(p+8,&p,8) || !read_guest(p+0x40,&p,8) || !read_guest(p+0x10,&p,8) ||
+            !read_guest(p+0x40+12*4,f,sizeof(f))) continue;
+        const float dx=f[0]-last[i][0], dy=f[1]-last[i][1], dz=f[2]-last[i][2];
+        const float moved=have[i] ? sqrtf(dx*dx+dy*dy+dz*dz) : 0.0f;
+        /* A jump: a step over 30 units and three times the one before (a fall speeds up gradually). */
+        printf("Pos: step %llu, %.1f ms, player %u at %.1f %.1f %.1f, moved %.1f %.1f %.1f; pad 0x%x, stick %d %d%s\n",step,ms,
+               i,(double)f[0],(double)f[1],(double)f[2],have[i] ? (double)dx : 0.0,have[i] ? (double)dy : 0.0,
+               have[i] ? (double)dz : 0.0,buttons,stick[0]-128,stick[1]-128,moved>30.0f && moved>3.0f*last_step[i] ? " JUMP" : "");
+        last_step[i]=moved;
+        memcpy(last[i],f,sizeof(f));
+        have[i]=1;
+    }
+}
 static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot, uint64_t c, uint64_t *frame) {
     /* frame: the stub's saved registers, below its rbp: flags, rax rcx rdx rsi rdi r8-r11 rbx r12-r15. */
+    if (offset==WORLD_UPDATE) { position_log(frame[-6]); return; }
     if (offset==SYNC_SEND_SITE) { sync_log_send(frame[-11],frame[-14]); return; }
     if (offset==SYNC_RECEIVE_SITE) { sync_log_receive(frame[-14],(const SyncRecord *)(uintptr_t)frame[-15]); return; }
     uint64_t rax=frame[-2];
@@ -1080,14 +1142,11 @@ static void hooks_install(const char *spec) {
         fprintf(stderr,"BB_HOOK: guest 0x%llx hooked (%u bytes moved)\n",(unsigned long long)offset,length);
     }
 }
-/* lbppc: every 5 seconds online, which threads used the CPU: the frame diagnostics say a frame waited for the game, not
- * why. 100% is one core; names are the game's thread names or Windows' thread descriptions. */
-typedef struct { DWORD tid; uint64_t cpu; } ThreadCpu;
-static uint64_t thread_cpu_100ns(HANDLE thread) {
-    FILETIME created, exited, kernel, user;
-    if (!GetThreadTimes(thread,&created,&exited,&kernel,&user)) return 0;
-    return ((uint64_t)kernel.dwHighDateTime<<32|kernel.dwLowDateTime)+((uint64_t)user.dwHighDateTime<<32|user.dwLowDateTime);
-}
+/* lbppc: performance diagnostics (LBPPC_PROFILE=1; the thread lines also online). The frame lines say a frame waited
+ * for the game, not why: "Threads:" is the CPU each thread used every 5 seconds, from cycle counts (100% is one core),
+ * and "Profile:" is where the game's main thread was during each slow frame's game time, sampled about 1000 times a
+ * second. Every 30 seconds "Profile: slow frames" compares each place's share of slow frames with its share overall. */
+typedef struct { DWORD tid; uint64_t cycles; } ThreadCycles;
 static const char *thread_label(HANDLE thread,DWORD tid,char *out,size_t size) {
     extern const char *runtime_thread_name_of(unsigned long tid);
     const char *guest=runtime_thread_name_of(tid);
@@ -1106,28 +1165,31 @@ static const char *thread_label(HANDLE thread,DWORD tid,char *out,size_t size) {
 static DWORD WINAPI thread_load_monitor(LPVOID arg) {
     (void)arg;
     enum { MAX_THREADS=512, SHOWN=14 };
-    static ThreadCpu last[MAX_THREADS];
+    static ThreadCycles last[MAX_THREADS], next[MAX_THREADS];
     static struct { uint64_t used; char name[32]; } now[MAX_THREADS];
     size_t last_count=0;
+    uint64_t last_tsc=0;
     const DWORD self=GetCurrentProcessId();
     for (;;) {
         Sleep(5000);
         HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
         if (snapshot==INVALID_HANDLE_VALUE) continue;
+        /* Thread cycles count at the time stamp counter's rate, so the counter's own advance is one core's worth. */
+        const uint64_t tsc=__rdtsc(), elapsed=tsc-last_tsc;
         THREADENTRY32 entry;
         entry.dwSize=sizeof(entry);
         size_t count=0;
-        static ThreadCpu next[MAX_THREADS];
         uint64_t total=0;
         for (BOOL more=Thread32First(snapshot,&entry); more && count<MAX_THREADS; more=Thread32Next(snapshot,&entry)) {
             if (entry.th32OwnerProcessID!=self) continue;
             HANDLE thread=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ThreadID);
             if (!thread) continue;
-            const uint64_t cpu=thread_cpu_100ns(thread);
-            uint64_t before=cpu;
-            for (size_t i=0;i<last_count;++i) if (last[i].tid==entry.th32ThreadID) { before=last[i].cpu; break; }
-            next[count]=(ThreadCpu){entry.th32ThreadID,cpu};
-            now[count].used=cpu-before;
+            ULONG64 cycles=0;
+            QueryThreadCycleTime(thread,&cycles);
+            uint64_t before=cycles;
+            for (size_t i=0;i<last_count;++i) if (last[i].tid==entry.th32ThreadID) { before=last[i].cycles; break; }
+            next[count]=(ThreadCycles){entry.th32ThreadID,cycles};
+            now[count].used=cycles-before;
             total+=now[count].used;
             char label[32];
             snprintf(now[count].name,sizeof(now[count].name),"%s",thread_label(thread,entry.th32ThreadID,label,sizeof(label)));
@@ -1136,26 +1198,214 @@ static DWORD WINAPI thread_load_monitor(LPVOID arg) {
         }
         CloseHandle(snapshot);
         memcpy(last,next,count*sizeof(*last));
-        const int first=last_count==0;
+        const int first=last_tsc==0;
         last_count=count;
-        if (first) continue;
+        last_tsc=tsc;
+        if (first || !elapsed) continue;
         char line[1024];
-        int n=snprintf(line,sizeof(line),"Threads: %.0f%% of one core over 5 s:",(double)total/500000.0);
+        int n=snprintf(line,sizeof(line),"Threads: %.0f%% of one core over 5 s:",(double)total*100.0/(double)elapsed);
         for (int shown=0;shown<SHOWN;++shown) {
             size_t best=count;
             for (size_t i=0;i<count;++i) if (now[i].used && (best==count || now[i].used>now[best].used)) best=i;
-            if (best==count || (double)now[best].used/500000.0<1.0) break;
-            n+=snprintf(line+n,sizeof(line)-(size_t)n,"%s %s %.0f%%",shown ? "," : "",now[best].name,(double)now[best].used/500000.0);
+            if (best==count || (double)now[best].used*100.0/(double)elapsed<1.0) break;
+            n+=snprintf(line+n,sizeof(line)-(size_t)n,"%s %s %.0f%%",shown ? "," : "",now[best].name,(double)now[best].used*100.0/(double)elapsed);
             now[best].used=0;
         }
         puts(line);
     }
     return 0;
 }
+/* A place is the host module the main thread was in (or guest code), the nearest return address into the port's own
+ * code (bb-probe.exe, offset from its base: llvm-symbolizer names it) and the three nearest guest return addresses. */
+typedef struct { int64_t qpc; uint64_t where; uint32_t port; uint32_t guest[3]; } ProfileSample;
+typedef struct { uint64_t where; uint32_t port; uint32_t guest[3]; uint32_t slow, all; } ProfilePlace;
+typedef struct { int64_t from, to; float frame_ms, game_ms; } SlowFrame;
+enum { PROFILE_RING=32768, SLOW_FRAMES=64, GUEST_CODE=1 };
+static ProfileSample profile_ring[PROFILE_RING];
+static SlowFrame slow_frames[SLOW_FRAMES];
+static volatile LONG slow_frames_written;
+static int64_t profile_qpc_hz;
+static DWORD profile_thread_id;
+/* Called by the frame timing (vk_low_latency.cpp) on its own thread for each slow frame: the game's part of it ended
+ * game_end_ago_ms before now. Only the timing thread writes, so publishing the count after the entry is enough. */
+static void slow_frame_seen(double frame_ms,double game_start_ago_ms,double game_end_ago_ms) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const LONG at=slow_frames_written;
+    SlowFrame *frame=&slow_frames[at%SLOW_FRAMES];
+    frame->from=now.QuadPart-(int64_t)(game_start_ago_ms*(double)profile_qpc_hz/1000.0);
+    frame->to=now.QuadPart-(int64_t)(game_end_ago_ms*(double)profile_qpc_hz/1000.0);
+    frame->frame_ms=(float)frame_ms;
+    frame->game_ms=(float)(game_start_ago_ms-game_end_ago_ms);
+    InterlockedExchange(&slow_frames_written,at+1);
+}
+static int return_address(uint64_t value,uint64_t lo,uint64_t hi) {
+    if (value<lo+8 || value>=hi) return 0;
+    /* The image has unmapped gaps and this thread must not fault: the port treats that as a crash. */
+    unsigned char before[7];
+    SIZE_T read=0;
+    if (!ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)(value-7),before,7,&read) || read!=7) return 0;
+    return before[2]==0xe8 || before[5]==0xff || before[4]==0xff || before[1]==0xff || before[0]==0xff;
+}
+static const char *place_name(uint64_t where,char *out,size_t size) {
+    snprintf(out,size,"?");
+    if (where==GUEST_CODE) snprintf(out,size,"guest code");
+    else if (where && !GetModuleBaseNameA(GetCurrentProcess(),(HMODULE)(uintptr_t)where,out,(DWORD)size)) snprintf(out,size,"?");
+    return out;
+}
+static int same_place(const ProfileSample *s,const ProfilePlace *p) {
+    return s->where==p->where && s->port==p->port && !memcmp(s->guest,p->guest,sizeof(p->guest));
+}
+static size_t place_of(ProfilePlace *places,size_t *used,size_t max,const ProfileSample *s) {
+    size_t at=0;
+    while (at<*used && !same_place(s,&places[at])) ++at;
+    if (at==*used && *used<max) {
+        places[at]=(ProfilePlace){s->where,s->port,{s->guest[0],s->guest[1],s->guest[2]},0,0};
+        ++*used;
+    }
+    return at;
+}
+static DWORD WINAPI main_thread_profiler(LPVOID arg) {
+    (void)arg;
+    enum { MAX_PLACES=512, SHOWN=4, SUMMARY_SHOWN=10, STACK_WORDS=4096, SUMMARY_SECONDS=30 };
+    static ProfilePlace frame_places[MAX_PLACES], summary[MAX_PLACES];
+    static uint64_t words[STACK_WORDS];
+    const uint64_t lo=(uint64_t)(uintptr_t)image, hi=lo+image_size_hint;
+    MODULEINFO exe={0};
+    GetModuleInformation(GetCurrentProcess(),GetModuleHandleA(NULL),&exe,sizeof(exe));
+    const uint64_t port_lo=(uint64_t)(uintptr_t)exe.lpBaseOfDll, port_hi=port_lo+exe.SizeOfImage;
+    HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,profile_thread_id);
+    if (!thread) return 0;
+    timeBeginPeriod(1);
+    uint64_t written=0;
+    LONG frames_done=0;
+    size_t summary_used=0;
+    uint32_t summary_frames=0;
+    LARGE_INTEGER started;
+    QueryPerformanceCounter(&started);
+    int64_t next_summary=started.QuadPart+SUMMARY_SECONDS*profile_qpc_hz;
+    for (;;) {
+        Sleep(1);
+        CONTEXT c;
+        memset(&c,0,sizeof(c));
+        c.ContextFlags=CONTEXT_CONTROL;
+        size_t got=0;
+        if (SuspendThread(thread)==(DWORD)-1) return 0;
+        int have=GetThreadContext(thread,&c);
+        if (have) {
+            /* Only memory of the stack's own region: no allocation or lock while the thread is stopped. */
+            MEMORY_BASIC_INFORMATION region;
+            if (VirtualQuery((void *)(uintptr_t)c.Rsp,&region,sizeof(region))) {
+                const uint64_t end=(uint64_t)(uintptr_t)region.BaseAddress+region.RegionSize;
+                got=(size_t)((end-c.Rsp)/8);
+                if (got>STACK_WORDS) got=STACK_WORDS;
+                SIZE_T read=0;
+                if (!ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)c.Rsp,words,got*8,&read)) read=0;
+                got=(size_t)read/8;
+            }
+        }
+        ResumeThread(thread);
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (have) {
+            ProfileSample *sample=&profile_ring[written%PROFILE_RING];
+            memset(sample,0,sizeof(*sample));
+            sample->qpc=now.QuadPart;
+            if (c.Rip>=lo && c.Rip<hi) sample->where=GUEST_CODE;
+            else {
+                HMODULE module=NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(const char *)(uintptr_t)c.Rip,&module);
+                sample->where=(uint64_t)(uintptr_t)module;
+            }
+            int found=0;
+            for (size_t i=0;i<got && found<3;++i) {
+                if (return_address(words[i],lo,hi)) sample->guest[found++]=(uint32_t)(words[i]-lo);
+                else if (!found && !sample->port && return_address(words[i],port_lo,port_hi)) sample->port=(uint32_t)(words[i]-port_lo);
+            }
+            ++written;
+        }
+        /* Each slow frame whose game time has passed: its samples, newest first, while the ring still holds them. */
+        const LONG frames_written=slow_frames_written;
+        if (frames_written-frames_done>SLOW_FRAMES) frames_done=frames_written-SLOW_FRAMES;
+        while (frames_done<frames_written && slow_frames[frames_done%SLOW_FRAMES].to<now.QuadPart) {
+            const SlowFrame frame=slow_frames[frames_done%SLOW_FRAMES];
+            ++frames_done;
+            size_t used=0;
+            uint32_t samples=0;
+            for (uint64_t i=written; i>0 && written-i<PROFILE_RING; --i) {
+                const ProfileSample *s=&profile_ring[(i-1)%PROFILE_RING];
+                if (s->qpc<frame.from) break;
+                if (s->qpc>frame.to) continue;
+                const size_t at=place_of(frame_places,&used,MAX_PLACES,s);
+                if (at<used) ++frame_places[at].slow;
+                const size_t total_at=place_of(summary,&summary_used,MAX_PLACES,s);
+                if (total_at<summary_used) ++summary[total_at].slow;
+                ++samples;
+            }
+            ++summary_frames;
+            char line[1024];
+            int n=snprintf(line,sizeof(line),"Profile: slow frame %.1f ms, game %.1f ms, %u samples:",frame.frame_ms,frame.game_ms,samples);
+            for (int shown=0;shown<SHOWN && n<(int)sizeof(line)-160;++shown) {
+                size_t best=used;
+                for (size_t i=0;i<used;++i) if (frame_places[i].slow && (best==used || frame_places[i].slow>frame_places[best].slow)) best=i;
+                if (best==used) break;
+                char name[64];
+                n+=snprintf(line+n,sizeof(line)-(size_t)n,"%s %u%% %s < port 0x%x < 0x%x < 0x%x < 0x%x",shown ? "," : "",
+                            frame_places[best].slow*100/(samples ? samples : 1),place_name(frame_places[best].where,name,sizeof(name)),
+                            frame_places[best].port,frame_places[best].guest[0],frame_places[best].guest[1],frame_places[best].guest[2]);
+                frame_places[best].slow=0;
+            }
+            puts(line);
+        }
+        if (now.QuadPart<next_summary) continue;
+        next_summary+=SUMMARY_SECONDS*profile_qpc_hz;
+        if (!summary_frames) continue;
+        /* The same places' share of every sample over the period, so a place common in slow frames but no more common
+         * than usual stands out as not the cause. */
+        uint32_t slow_total=0, all_total=0;
+        for (size_t i=0;i<summary_used;++i) slow_total+=summary[i].slow;
+        for (uint64_t i=written; i>0 && written-i<PROFILE_RING; --i) {
+            const ProfileSample *s=&profile_ring[(i-1)%PROFILE_RING];
+            if (s->qpc<now.QuadPart-SUMMARY_SECONDS*profile_qpc_hz) break;
+            ++all_total;
+            for (size_t p=0;p<summary_used;++p) if (same_place(s,&summary[p])) { ++summary[p].all; break; }
+        }
+        printf("Profile: slow frames over %d s: %u frames, %u samples in their game time, %u samples in all\n",
+               SUMMARY_SECONDS,summary_frames,slow_total,all_total);
+        for (int shown=0;shown<SUMMARY_SHOWN;++shown) {
+            size_t best=summary_used;
+            for (size_t i=0;i<summary_used;++i) if (summary[i].slow && (best==summary_used || summary[i].slow>summary[best].slow)) best=i;
+            if (best==summary_used) break;
+            char name[64];
+            printf("Profile:  %5.1f%% of slow, %5.1f%% of all: %s < port 0x%x < 0x%x < 0x%x < 0x%x\n",
+                   summary[best].slow*100.0/(slow_total ? slow_total : 1),summary[best].all*100.0/(all_total ? all_total : 1),
+                   place_name(summary[best].where,name,sizeof(name)),summary[best].port,summary[best].guest[0],summary[best].guest[1],summary[best].guest[2]);
+            summary[best].slow=0;
+        }
+        summary_used=0;
+        summary_frames=0;
+    }
+}
 static void sync_log_install(void) {
-    const char *online=getenv("BB_ONLINE");
+    const char *online=getenv("BB_ONLINE"), *profile=getenv("LBPPC_PROFILE");
+    const int profiling=profile && profile[0]=='1';
+    if (profiling || (online && online[0]=='1')) CloseHandle(CreateThread(NULL,0,thread_load_monitor,NULL,0,NULL));
+    if (profiling) {
+        extern void (*lbppc_slow_frame_hook)(double,double,double);
+        LARGE_INTEGER hz;
+        QueryPerformanceFrequency(&hz);
+        profile_qpc_hz=hz.QuadPart;
+        profile_thread_id=GetCurrentThreadId();
+        lbppc_slow_frame_hook=slow_frame_seen;
+        CloseHandle(CreateThread(NULL,0,main_thread_profiler,NULL,0,NULL));
+    }
+    const char *positions=getenv("LBPPC_POS_LOG");
+    static const unsigned char update[]={0x55,0x48,0x89,0xe5,0x41,0x57};
+    if (positions && positions[0]=='1') {
+        if (memcmp(image+WORLD_UPDATE,update,sizeof(update))) fprintf(stderr,"Pos: unexpected game code, not logged\n");
+        else hooks_install("0x254450:6");
+    }
     if (!online || online[0]!='1') return;
-    CloseHandle(CreateThread(NULL,0,thread_load_monitor,NULL,0,NULL));
     static const unsigned char send[]={0x41,0x8b,0x87,0x60,0x05,0x00,0x00}, receive[]={0x41,0x8b,0x47,0x34,0x85,0xc0};
     if (memcmp(image+SYNC_SEND_SITE,send,7) || memcmp(image+SYNC_RECEIVE_SITE,receive,6)) { fprintf(stderr,"Sync: unexpected game code, not logged\n"); return; }
     hooks_install("0x256d9a:7,0x269ed6:6");

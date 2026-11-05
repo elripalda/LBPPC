@@ -109,7 +109,15 @@ def main(argv):
     # Beta: frame rate, pacing and where each frame's time went, every 5 s in the log (a few KB a minute), so a
     # player's slow level can be told apart (the game's own work, the GPU, shader compiles, stalls).
     env.setdefault('BB_FRAME_STATS', '1')
-    # Online: LBPPC_NP_USER=<name> signs in locally as that player (no PSN or shadNet account) and
+    # Performance work (temporary, before release): where the game's main thread was during each slow frame, and CPU
+    # per thread ("Profile:" and "Threads:" lines). Measured to cost nothing visible: 80-86 slow frames with it on or
+    # off in the same scripted run.
+    env.setdefault('LBPPC_PROFILE', '1')
+    # Readback test (temporary): guest writes into GPU-written memory skip the copy back (buffer_cache.cpp).
+    env.setdefault('LBPPC_WRITE_FAULT_NO_READBACK', '1')
+    # Climbing teleports (temporary): optimizations switched off while the game runs, by writing their mask
+    # (gpu/shim/bbport_toggles.h, src/runtime_memory.c) to user/toggles.txt; read 4 times a second.
+    env.setdefault('BB_TOGGLE_FILE', str(user / 'toggles.txt'))    # Online: LBPPC_NP_USER=<name> signs in locally as that player (no PSN or shadNet account) and
     # LBPPC_SERVER=<url> sends the game's server requests (Sony's, now closed) to a custom server, such as a
     # Refresh instance.
     # Or BB_SHADNET_SERVER=<host[:port]>, BB_SHADNET_NPID and BB_SHADNET_PASSWORD: signed in to a shadNet server (friends,
