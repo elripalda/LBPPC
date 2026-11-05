@@ -35,6 +35,7 @@ constexpr Readout Readouts[] = {
     {"show_cpu", &Values::show_cpu},
     {"show_ram", &Values::show_ram},
     {"show_fps_graph", &Values::show_fps_graph},
+    {"graph_game_frames", &Values::graph_game_frames},
     {"counter_colors", &Values::counter_colors},
 };
 

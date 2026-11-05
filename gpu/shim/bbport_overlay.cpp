@@ -229,6 +229,12 @@ constexpr size_t FrameHistorySize = 240; ///< about four seconds at 60 Hz
 std::array<float, FrameHistorySize> frame_history{};
 size_t frame_history_count = 0;
 size_t frame_history_next = 0;
+// lbppc: the game's own frames for the graph (NoteGameFrame, on the GPU thread). Read by the present
+// thread without a lock: a sample read while it is written is one point of a statistics graph.
+std::array<float, FrameHistorySize> game_history{};
+std::atomic<size_t> game_history_count{0};
+std::atomic<size_t> game_history_next{0};
+std::atomic<float> game_ms_avg{0.0f};
 
 // The counter's values in plain grey when the player turned its colours off (counter_colors=0).
 constexpr ImVec4 PlainValue{0.80f, 0.80f, 0.80f, 1.0f};
@@ -781,6 +787,7 @@ void Menu() {
     Checkbox("RAM usage", s.show_ram);
     Checkbox("Frame time graph", s.show_fps_graph);
     ImGui::SameLine();
+    Checkbox("Graph the game's own frames", s.graph_game_frames);
     Checkbox("Colour-coded values", s.counter_colors);
     Checkbox("Mute when the game is in the background", s.mute_unfocused);
 
@@ -930,19 +937,18 @@ void Label(const char* text, float column) {
 // heights read as FPS on the right. Auto-ranged like a scope, no fixed reference lines: the axes
 // carry the scale. Each axis gets a gutter sized from its own widest tick, and the plot is inset by
 // half a line top and bottom, so no number sits on the curve or gets cut by the box.
-void FrameTimeGraph(float average_ms) {
+void FrameTimeGraph(const std::array<float, FrameHistorySize>& history, size_t count, size_t next,
+                    float average_ms) {
     char text[32];
     const float font = ImGui::GetFontSize();
     const float unit = 4.0f * base_scale;
-    // The samples in ring order, oldest first. frame_history_next is the next slot to write, so the
-    // oldest stored one is frame_history_count back from it (not next itself: it is unwritten until
-    // the ring has filled once).
-    const size_t oldest =
-        (frame_history_next + FrameHistorySize - frame_history_count) % FrameHistorySize;
-    float lo = frame_history[oldest];
+    // The samples in ring order, oldest first. next is the next slot to write, so the oldest stored
+    // one is count back from it (not next itself: it is unwritten until the ring has filled once).
+    const size_t oldest = (next + FrameHistorySize - count) % FrameHistorySize;
+    float lo = history[oldest];
     float hi = lo;
-    for (size_t i = 1; i < frame_history_count; ++i) {
-        const float ms = frame_history[(oldest + i) % FrameHistorySize];
+    for (size_t i = 1; i < count; ++i) {
+        const float ms = history[(oldest + i) % FrameHistorySize];
         lo = std::min(lo, ms);
         hi = std::max(hi, ms);
     }
@@ -1006,15 +1012,15 @@ void FrameTimeGraph(float average_ms) {
 
     const float step = (plot_max.x - plot_min.x) / float(FrameHistorySize);
     ImVec2 points[FrameHistorySize];
-    for (size_t i = 0; i < frame_history_count; ++i) {
+    for (size_t i = 0; i < count; ++i) {
         const size_t sample = (oldest + i) % FrameHistorySize; // oldest first
         const float x = plot_min.x + step * float(i + 1);
-        points[i] = ImVec2(x, std::clamp(y_for(frame_history[sample]), plot_min.y, plot_max.y));
+        points[i] = ImVec2(x, std::clamp(y_for(history[sample]), plot_min.y, plot_max.y));
         draw->AddRectFilledMultiColor(ImVec2(x - step, points[i].y), ImVec2(x, plot_max.y),
                                       fill_top, fill_top, fill_bottom, fill_bottom);
     }
-    draw->AddPolyline(points, int(frame_history_count), line, ImDrawFlags_None, 1.5f * base_scale);
-    draw->AddCircleFilled(points[frame_history_count - 1], 2.2f * base_scale, line);
+    draw->AddPolyline(points, int(count), line, ImDrawFlags_None, 1.5f * base_scale);
+    draw->AddCircleFilled(points[count - 1], 2.2f * base_scale, line);
 }
 
 void FpsCounter() {
@@ -1145,19 +1151,29 @@ void FpsCounter() {
             }
         }
     }
-    if (s.show_fps_graph && frame_history_count > 1) {
-        FrameTimeGraph(frame_ms_avg);
+    // lbppc: the game's own frames when asked (the default) and the game has flipped; otherwise every
+    // presented image.
+    const size_t game_count = game_history_count.load(std::memory_order_relaxed);
+    const bool game_graph = s.graph_game_frames && game_count > 1;
+    if (s.show_fps_graph && (game_graph || frame_history_count > 1)) {
+        const float graph_ms = game_graph ? game_ms_avg.load(std::memory_order_relaxed) : frame_ms_avg;
+        if (game_graph) {
+            FrameTimeGraph(game_history, game_count, game_history_next.load(std::memory_order_relaxed),
+                           graph_ms);
+        } else {
+            FrameTimeGraph(frame_history, frame_history_count, frame_history_next, graph_ms);
+        }
         // Legend under the graph, the current values of what the line shows.
         const float square = 9.0f * base_scale;
         const ImVec2 at = ImGui::GetCursorScreenPos();
         ImGui::Dummy(ImVec2(square, square));
         ImGui::GetWindowDrawList()->AddRectFilled(at, ImVec2(at.x + square, at.y + square),
-                                                  ImGui::ColorConvertFloat4ToU32(pace),
+                                                  ImGui::ColorConvertFloat4ToU32(PaceColor(graph_ms)),
                                                   1.5f * base_scale);
         ImGui::SameLine(0.0f, 6.0f * base_scale);
-        ImGui::Text("Frame: %.1f ms", frame_ms_avg);
+        ImGui::Text("%s: %.1f ms", game_graph ? "Game frame" : "Frame", double(graph_ms));
         ImGui::SameLine(0.0f, 14.0f * base_scale);
-        ImGui::TextDisabled("%.0f FPS", double(rate));
+        ImGui::TextDisabled("%.0f FPS", graph_ms > 0.0f ? 1000.0 / double(graph_ms) : 0.0);
     }
     ImGui::End();
 }
@@ -1443,6 +1459,24 @@ void SetVramUsage(u64 used_bytes, u64 limit_bytes, u64 pressure_bytes, u64 criti
     vram_pressure.store(pressure_bytes, std::memory_order_relaxed);
     vram_critical.store(critical_bytes, std::memory_order_relaxed);
     vram_card_free.store(card_free_bytes, std::memory_order_relaxed);
+}
+
+void NoteGameFrame() {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const float ms = std::chrono::duration<float, std::milli>(now - last).count();
+    last = now;
+    if (ms <= 0.0f || ms >= 1000.0f) {
+        return; // loading screens and pauses would flatten the graph
+    }
+    const float average = game_ms_avg.load(std::memory_order_relaxed);
+    game_ms_avg.store(average == 0.0f ? ms : average * 0.9f + ms * 0.1f, std::memory_order_relaxed);
+    const size_t next = game_history_next.load(std::memory_order_relaxed);
+    game_history[next] = ms;
+    game_history_next.store((next + 1) % FrameHistorySize, std::memory_order_relaxed);
+    game_history_count.store(std::min(game_history_count.load(std::memory_order_relaxed) + 1,
+                                      FrameHistorySize),
+                             std::memory_order_relaxed);
 }
 
 // Called for every presented image: the interval for the FPS readout and BB_FPS_LOG.

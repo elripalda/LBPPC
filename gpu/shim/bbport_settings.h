@@ -80,6 +80,9 @@ struct Values {
     std::atomic<bool> show_cpu{false};
     std::atomic<bool> show_ram{false};
     std::atomic<bool> show_fps_graph{false};
+    /// lbppc: the graph plots the game's own frames (its flips: 30 a second in LBP3) instead of every
+    /// presented image, generated ones included, which hide the game's stutter (bbport.ini graph_game_frames).
+    std::atomic<bool> graph_game_frames{true};
     /// Silence the game while its window does not have focus (bbgpu_audio_muted).
     std::atomic<bool> mute_unfocused{false};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.

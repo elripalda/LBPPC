@@ -57,8 +57,25 @@ OPTIONS = [('resolution', 'Resolution', RESOLUTIONS, 'Wider than 16:9 shows more
            ('display', 'Display', DISPLAY_MODES, 'Borderless suits most screens; a full-size window is shrunk.'),
            ('frame_gen', 'Frame generation', FRAME_GENS, 'The game runs 30 steps a second; this shows 60.'),
            ('latency', 'Low latency', LATENCY, 'Less delay between your input and the screen.')]
+# The Debug page's Diagnostics: (key, environment variable, title, hint, default). Each is passed to the game on
+# Play as 1 or 0.
+DIAGNOSTICS = [('frame_stats', 'BB_FRAME_STATS', 'Frame log', 'Frame rate, pacing and every slow frame in the log.',
+                True),
+               ('profile', 'LBPPC_PROFILE', 'Slow-frame profiler',
+                'What the game waited for in each slow frame, and the CPU each thread used.', True),
+               ('positions', 'LBPPC_POS_LOG', 'Player positions',
+                'Each player\'s position and buttons at every step. Large logs: for chasing a bug.', False),
+               ('no_readback', 'LBPPC_WRITE_FAULT_NO_READBACK', 'Skip GPU readbacks',
+                'Faster in busy levels. Turn it off if something flickers or looks wrong.', True)]
+# The Debug page's Performance overlay: bbport.ini switches, which the in-game menu (Insert) also changes.
+OVERLAY = [('show_fps', 'Frame rate', False), ('show_frame_times', 'Frame times', False),
+           ('show_latency', 'Render latency', False), ('show_vram', 'Video memory', False),
+           ('show_gpu', 'GPU usage', False), ('show_cpu', 'CPU usage', False), ('show_ram', 'RAM usage', False),
+           ('show_fps_graph', 'Frame time graph', False), ('graph_game_frames', 'Graph the game\'s own frames', True),
+           ('counter_colors', 'Colour-coded values', True)]
 DEFAULTS = {'game': '', 'resolution': '1920x1080', 'display': 'borderless', 'frame_gen': 'dlss', 'latency': 'on',
             'online': False, 'online_name': '', 'password': '',
+            'diagnostics': {key: on for key, _env, _title, _hint, on in DIAGNOSTICS},
             # Not shown: the LBPPC server unless launcher.json names another (a test server on this PC).
             'server': online_accounts.OFFICIAL_SERVER}
 DLSS_FILES = ('bbport_dlss.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll')
@@ -117,13 +134,32 @@ def ini_frame_gen():
     return value if value in {v for _name, v in FRAME_GENS} else None
 
 
+def ini_values():
+    """bbport.ini as key -> value (empty when it does not exist yet)."""
+    try:
+        lines = INI.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return {}
+    return {line.split('=', 1)[0].strip(): line.split('=', 1)[1].strip() for line in lines
+            if '=' in line and not line.lstrip().startswith('#')}
+
+
+def ini_set(key, value):
+    """One bbport.ini line set, the others kept."""
+    lines = INI.read_text(encoding='utf-8').splitlines() if INI.is_file() else []
+    lines = [line for line in lines if not line.startswith(f'{key}=')] + [f'{key}={value}']
+    INI.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
 def load_settings():
     try:
         values = json.loads(SETTINGS.read_text(encoding='utf-8'))
         values.setdefault('password', values.get('shadnet_password', ''))  # 0.0.1 betas' name for it
         settings = {**DEFAULTS, **{k: v for k, v in values.items() if k in DEFAULTS}}
-    except (OSError, ValueError):
+        settings['diagnostics'] = {**DEFAULTS['diagnostics'], **(values.get('diagnostics') or {})}
+    except (OSError, ValueError, AttributeError, TypeError):
         settings = dict(DEFAULTS)
+        settings['diagnostics'] = dict(DEFAULTS['diagnostics'])
     settings['frame_gen'] = ini_frame_gen() or settings['frame_gen']
     return settings
 
@@ -436,10 +472,14 @@ class Launcher(tk.Tk):
             TitleBar(self, self.scene, f'{VERSION} beta', self.close)
         self.friends = FriendsPanel(self, self.SIDE_X, self.GAME_Y, self.SIDE_W, self.ONLINE_Y + 202 - self.GAME_Y)
         self.controls = ControlsPage(self, self.PANEL_X, self.GAME_Y, self.PANEL_W, self.ONLINE_Y + 202 - self.GAME_Y)
-        # The pages: Game (the panels built above) and Controls, switched by the tabs on the banner.
+        self.debug = DebugPage(self, self.PANEL_X, self.GAME_Y, self.PANEL_W, self.ONLINE_Y + 202 - self.GAME_Y)
+        # The pages: Game (the panels built above), Controls and Debug, switched by the tabs on the banner.
         tab_y = TITLE_HEIGHT + BANNER_HEIGHT - 16
-        self.page_tabs = {'controls': Tab(self.scene, 'Controls', lambda: self.show_page('controls'),
-                                          self.PANEL_X + self.PANEL_W - 4, tab_y, 'e', size=14, tilt=2)}
+        self.page_tabs = {'debug': Tab(self.scene, 'Debug', lambda: self.show_page('debug'),
+                                       self.PANEL_X + self.PANEL_W - 4, tab_y, 'e', size=14, tilt=-2)}
+        self.page_tabs['controls'] = Tab(self.scene, 'Controls', lambda: self.show_page('controls'),
+                                         self.page_tabs['debug'].cx - self.page_tabs['debug'].width / 2 - 14,
+                                         tab_y, 'e', size=14, tilt=2)
         self.page_tabs['game'] = Tab(self.scene, 'Game', lambda: self.show_page('game'),
                                      self.page_tabs['controls'].cx - self.page_tabs['controls'].width / 2 - 14,
                                      tab_y, 'e', size=14, tilt=-2)
@@ -553,6 +593,8 @@ class Launcher(tk.Tk):
             self.scene.itemconfigure(item, state='normal' if page == 'game' else 'hidden')
         for item in self.controls.items:
             self.scene.itemconfigure(item, state='normal' if page == 'controls' else 'hidden')
+        for item in self.debug.items:
+            self.scene.itemconfigure(item, state='normal' if page == 'debug' else 'hidden')
         for name, tab in self.page_tabs.items():
             tab.select(name == page)
             self.scene.tag_raise(tab.item)
@@ -704,6 +746,8 @@ class Launcher(tk.Tk):
                 return
             env.update(LBPPC_SERVER=servers['refresh'], BB_SHADNET_NPID=name, BB_SHADNET_PASSWORD=password,
                        BB_SHADNET_SERVER=servers['shadnet'], BB_SHADNET_WEBAPI=servers['webapi'])
+        for key, variable, _title, _hint, _on in DIAGNOSTICS:
+            env[variable] = '1' if self.settings['diagnostics'].get(key) else '0'
         env['PYTHONUNBUFFERED'] = '1'
         env['LBPPC_VERSION'] = VERSION
         flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -840,6 +884,86 @@ WINDOWS_KEYPAD = {**{96 + d: f'kp{d}' for d in range(10)}, 106: 'kpasterisk', 10
                   110: 'kpperiod', 111: 'kpslash'}
 TK_MOUSE = {1: 'leftbutton', 2: 'middlebutton', 3: 'rightbutton', 4: 'sidebuttonback', 5: 'sidebuttonforward',
             8: 'sidebuttonback', 9: 'sidebuttonforward'}
+
+
+class DebugPage:
+    """The Debug page (in place of the Game page's panels): the in-game performance overlay's switches, written to
+    bbport.ini at once (the game reads it at start; Insert in the game changes them live), and the diagnostics the
+    game logs, passed to it on Play."""
+
+    ROW = 34
+
+    def __init__(self, launcher, x, y, w, h):
+        self.launcher, self.scene = launcher, launcher.scene
+        self.items = []
+        scene = self.scene
+        before = set(scene.find_all())
+        half = (w - 40) // 2 - 10
+        right = x + 20 + half + 20
+        rows = (len(OVERLAY) + 1) // 2
+        overlay_h = 44 + rows * self.ROW + 30
+
+        # Performance overlay: two columns of switches
+        scene.image('panel:overlay', theme.panel(w, overlay_h, 'Performance overlay'), x, y)
+        values = ini_values()
+        self.overlay = {key: values.get(key, '1' if on else '0') == '1' for key, _title, on in OVERLAY}
+        for index, (key, title, _on) in enumerate(OVERLAY):
+            cx = (x + 20, right)[index // rows]
+            cy = y + 44 + (index % rows) * self.ROW
+            self.switch(f'overlay:{key}', cx, cy, title, self.overlay[key], lambda k=key: self.toggle_overlay(k))
+        self.overlay_status = launcher.text(x + 22, y + overlay_h - 24, 'Shown in the top right of the game. '
+                                            'Insert in the game changes these while you play.', HINT_FONT, MUTED,
+                                            'nw', width=w - 44)
+
+        # Diagnostics: a switch and what it does
+        dy = y + overlay_h + 12
+        scene.image('panel:diagnostics', theme.panel(w, h - overlay_h - 12, 'Diagnostics'), x, dy)
+        for index, (key, _variable, title, hint, _on) in enumerate(DIAGNOSTICS):
+            cy = dy + 44 + index * 52
+            self.switch(f'diag:{key}', x + 20, cy, title, launcher.settings['diagnostics'].get(key),
+                        lambda k=key: self.toggle_diagnostic(k))
+            launcher.text(x + 52, cy + 24, hint, HINT_FONT, MUTED, 'nw', width=w - 74)
+        self.diag_status = launcher.text(x + 22, dy + h - overlay_h - 12 - 24, 'Used the next time you press Play. '
+                                         'Logs go in the report from Make a report.', HINT_FONT, MUTED, 'nw',
+                                         width=w - 44)
+        self.items = [item for item in scene.find_all() if item not in before]
+
+    def switch(self, key, x, y, title, on, command):
+        box = self.scene.image(f'{key}:box', theme.checkbox(on), x, y)
+        label = self.scene.image(f'{key}:label', theme.text_image(title, 13, TEXT, 'Medium'), x + 30, y + 1)
+        for item in (box, label):
+            self.scene.tag_bind(item, '<Button-1>', lambda _e: command())
+            self.scene.tag_bind(item, '<Enter>', lambda _e: self.scene.configure(cursor='hand2'))
+            self.scene.tag_bind(item, '<Leave>', lambda _e: self.scene.configure(cursor=''))
+
+    def redraw(self, key, x_y_on):
+        x, y, on = x_y_on
+        self.scene.image(f'{key}:box', theme.checkbox(on), x, y)
+
+    def box_position(self, key):
+        return self.scene.coords(self.scene.images[f'{key}:box'][0])
+
+    def toggle_overlay(self, key):
+        self.overlay[key] = not self.overlay[key]
+        x, y = self.box_position(f'overlay:{key}')
+        self.redraw(f'overlay:{key}', (x, y, self.overlay[key]))
+        try:
+            ini_set(key, '1' if self.overlay[key] else '0')
+        except OSError as error:
+            self.scene.itemconfigure(self.overlay_status, text=f'bbport.ini could not be saved: {error}', fill=ERROR)
+            return
+        text = 'Saved.' + (' Used the next time the game starts, or press Insert in the game.'
+                           if self.launcher.process else '')
+        self.scene.itemconfigure(self.overlay_status, text=text, fill=GOOD)
+
+    def toggle_diagnostic(self, key):
+        diagnostics = self.launcher.settings['diagnostics']
+        diagnostics[key] = not diagnostics.get(key)
+        x, y = self.box_position(f'diag:{key}')
+        self.redraw(f'diag:{key}', (x, y, diagnostics[key]))
+        save_settings(self.launcher.settings)
+        text = 'Saved.' + (' Used the next time you press Play.' if self.launcher.process else '')
+        self.scene.itemconfigure(self.diag_status, text=text, fill=GOOD)
 
 
 def tk_key_name(event):
