@@ -43,7 +43,21 @@ This repository contains no game files and never will. To play, you dump LittleB
 | `tests/` | Tests of the GPU layer |
 | `docs/` | Research notes and design documents |
 
-The runtime and graphics layer come from the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) 1.9.5, merged with its history (remote `bloodborne`); the Bloodborne-only features (its patches, menus, mouse camera, Discord status and online backend) have been removed. Build on Windows with MSYS2 CLANG64: `./build.sh` (packages in `packaging/windows/README.md`).
+The runtime and graphics layer come from the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) 1.9.5 (see [Credits](#credits)); the Bloodborne-only features (its patches, menus, mouse camera, Discord status and online backend) have been removed. Build on Windows with MSYS2 CLANG64: `./build.sh` (packages in `packaging/windows/README.md`).
+
+## Credits
+
+LBPPC is built on the work of the Bloodborne PC port and the projects behind it. Its full history is in [that repository](https://github.com/Supermedo/bloodborne_pc), and this code was imported from version 1.9.5 at commit `ff42e28`.
+
+- [bbport](https://github.com/deadinside28/bloodborne_pc), the native port of Bloodborne by deadinside28, and the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) by Supermedo, nick24051998 and their contributors.
+- [shadPS4](https://github.com/shadps4-emu/shadPS4), whose renderer and network, NP and shadNet code are at the heart of the graphics and online layers, and the [shadNet](https://github.com/shadps4-emu/shadNet) server by the shadPS4 team.
+- **Awaken** ([BloodBorneButPc](https://github.com/Awakenchan/BloodBorneButPc)), who put together the online code, and Wozzardman's [shadp2p](https://github.com/Wozzardman/shadp2p), which the first online version was built on.
+- **fixdag** and **bashiku**, for the low-VRAM profile.
+- [Refresh](https://github.com/LittleBigRefresh/Refresh), the community server for levels and profiles.
+
+Contributors to the Bloodborne PC port's history: Aljoscha-Ide, 𝗔ᴍʙʀᴏsᴇ, andrecabralgit, Awaken, Axel, ayozetr, Berleis, DarkSpartan, deadinside28, devilismyfriend, DUDUYG, Eric DaRosa, FIocker, fliperama86, gStone, JackRushante, Jgamrot, Joao Ramos, João Pedro Valadares, lewiwiii, Macypor, Maurdekye, Mitra, nick24051998, noatdk, oat018, parsifal295, Pirvondal, RafaelHGOliveira, rattensuppe, Sergey Leonov, Stefano Scalfari, Supermedo, T0ug and yshtonytc.
+
+Also used: [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK, the DLSS bridge adapted from [IFreemz/shadPS4-Bloodborne-DLSS-FSR](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR), the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS), [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [SDL3](https://github.com/libsdl-org/SDL), [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui), [sirit](https://github.com/shadps4-emu/sirit), [magic_enum](https://github.com/Neargye/magic_enum), [miniz](https://github.com/richgel999/miniz), [xbyak](https://github.com/herumi/xbyak), [wepoll](https://github.com/piscisaureus/wepoll), [cpp-httplib](https://github.com/yhirose/cpp-httplib), [Protocol Buffers](https://protobuf.dev), [OpenSSL](https://www.openssl.org), [miniupnpc](https://miniupnp.tuxfamily.org), [JSON for Modern C++](https://github.com/nlohmann/json), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [MSYS2](https://www.msys2.org), [LLVM](https://llvm.org), [PyInstaller](https://pyinstaller.org) and [Pillow](https://python-pillow.org).
 
 ## Licence
 

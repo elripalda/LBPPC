@@ -40,7 +40,6 @@ __pycache__/
 # IDE and session-local
 .idea/
 .vscode/
-.claude/
 
 # Build and runtime leftovers (from the Bloodborne port)
 /out
