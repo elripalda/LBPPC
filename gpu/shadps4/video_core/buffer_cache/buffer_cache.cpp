@@ -202,8 +202,61 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
+namespace {
+// lbppc (LBPPC_PROFILE=1): every 5 s, the guest writes and reads that had to wait for GPU-written data to be
+// copied back ("Readback:"), by 1 MiB region, with the time each waited: the GPU thread finishes all queued
+// GPU work for each one.
+void NoteReadback(VAddr address, u64 size, bool is_write, u64 ns) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("LBPPC_PROFILE");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct Region {
+        u64 count{}, ns{}, bytes{}, writes{};
+    };
+    static std::mutex mutex;
+    static std::map<u64, Region> regions;
+    static auto window = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    auto& region = regions[address >> 20];
+    ++region.count;
+    region.ns += ns;
+    region.bytes += size;
+    region.writes += is_write;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(5)) {
+        return;
+    }
+    window = now;
+    u64 count = 0, total_ns = 0;
+    for (const auto& [key, r] : regions) {
+        count += r.count;
+        total_ns += r.ns;
+    }
+    std::vector<std::pair<u64, Region>> sorted(regions.begin(), regions.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    char line[1024];
+    int len = std::snprintf(line, sizeof(line), "Readback: %llu in 5 s, %.1f ms waited:",
+                            static_cast<unsigned long long>(count), total_ns / 1e6);
+    for (size_t i = 0; i < sorted.size() && i < 6 && len > 0 && len < int(sizeof(line)) - 96; ++i) {
+        const auto& [key, r] = sorted[i];
+        len += std::snprintf(line + len, sizeof(line) - len, "%s %#llx: %llu (%llu writes), %.1f ms, %.1f KB",
+                             i ? "," : "", static_cast<unsigned long long>(key << 20),
+                             static_cast<unsigned long long>(r.count),
+                             static_cast<unsigned long long>(r.writes), r.ns / 1e6, r.bytes / 1024.0);
+    }
+    std::puts(line);
+    regions.clear();
+}
+} // namespace
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
+        const auto started = std::chrono::steady_clock::now();
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -216,10 +269,27 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
-        DownloadMemory(arena, window_start, window_end - window_start);
+        // lbppc: LBPPC_WRITE_FAULT_NO_READBACK=1 (test): a guest write into GPU-written memory takes the
+        // guest's bytes as the newest instead of first copying the GPU's back, which finishes all queued GPU
+        // work (LBP3's second level: about 13 a frame, 12% of the time). The GPU's data in that window is
+        // dropped, so a later guest read of it sees the old bytes.
+        static const bool no_write_readback = [] {
+            const char* env = std::getenv("LBPPC_WRITE_FAULT_NO_READBACK");
+            return env && env[0] == '1';
+        }();
+        if (is_write && no_write_readback) {
+            gpu_modified_ranges.Subtract(window_start, window_end - window_start);
+            memory_tracker->UnmarkRegionAsGpuModified(window_start, window_end - window_start);
+        } else {
+            DownloadMemory(arena, window_start, window_end - window_start);
+        }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
+        NoteReadback(device_addr, size, is_write,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count());
     };
     if (assume_locks) {
         flush_request();
