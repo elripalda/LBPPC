@@ -8,6 +8,7 @@ Its look follows LittleBigPlanet 3's menus (lbppc_theme.py draws it); the banner
 
 usage: python launcher/lbppc_launcher.py
 """
+import base64
 import json
 import math
 import os
@@ -151,10 +152,35 @@ def ini_set(key, value):
     INI.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
+def _dpapi(data, protect):
+    """Windows DPAPI (also in Wine and Proton): data locked to, or unlocked by, this Windows account.
+    None when it is not available or the data was locked by another account."""
+    import ctypes
+    from ctypes import wintypes
+    if not hasattr(ctypes, 'windll'):
+        return None
+
+    class Blob(ctypes.Structure):
+        _fields_ = [('size', wintypes.DWORD), ('data', ctypes.POINTER(ctypes.c_char))]
+
+    buffer = ctypes.create_string_buffer(data, len(data))
+    source, result = Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char))), Blob()
+    call = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not call(ctypes.byref(source), None, None, None, None, 0x1, ctypes.byref(result)):  # no prompts
+        return None
+    try:
+        return ctypes.string_at(result.data, result.size)
+    finally:
+        ctypes.windll.kernel32.LocalFree(result.data)
+
+
 def load_settings():
     try:
         values = json.loads(SETTINGS.read_text(encoding='utf-8'))
         values.setdefault('password', values.get('shadnet_password', ''))  # 0.0.1 betas' name for it
+        if values.get('password_protected'):  # save_settings's DPAPI copy
+            plain = _dpapi(base64.b64decode(values['password_protected']), protect=False)
+            values['password'] = plain.decode('utf-8') if plain is not None else ''
         settings = {**DEFAULTS, **{k: v for k, v in values.items() if k in DEFAULTS}}
         settings['diagnostics'] = {**DEFAULTS['diagnostics'], **(values.get('diagnostics') or {})}
     except (OSError, ValueError, AttributeError, TypeError):
@@ -166,7 +192,14 @@ def load_settings():
 
 def save_settings(values):
     USER.mkdir(exist_ok=True)
-    SETTINGS.write_text(json.dumps(values, indent=2), encoding='utf-8')
+    # The password is kept locked with DPAPI, not as text; plain text only where DPAPI is missing.
+    stored = dict(values)
+    stored.pop('shadnet_password', None)
+    locked = _dpapi(values.get('password', '').encode('utf-8'), protect=True) if values.get('password') else None
+    if locked is not None:
+        stored['password'] = ''
+        stored['password_protected'] = base64.b64encode(locked).decode('ascii')
+    SETTINGS.write_text(json.dumps(stored, indent=2), encoding='utf-8')
     # bbport.ini: frame_gen set, its other lines kept.
     lines = INI.read_text(encoding='utf-8').splitlines() if INI.is_file() else []
     lines = [line for line in lines if not line.startswith('frame_gen=')]
@@ -184,8 +217,10 @@ def open_path(path):
 
 
 def make_report():
-    """A zip for a bug report: the last game logs, the settings and input files. The Windows user name is
-    replaced in every file and the shadNet password left out; no game files. Returns its path."""
+    """A zip for a bug report: the last game logs, the settings and input files. The Windows user name and
+    every public IP address (the player's own, the other players', the server's) are replaced in every file
+    and the shadNet password left out; no game files. Returns its path."""
+    import ipaddress
     import time
     import zipfile
     reports = ROOT / 'out' / 'reports'
@@ -194,11 +229,25 @@ def make_report():
     home = str(Path.home())
     names = {home: '<home>', home.replace('\\', '/'): '<home>', os.environ.get('USERNAME', '') or '<none>': '<user>'}
 
+    # Each public address gets one label across the whole report (<ip-1>, <ip-2>, ...), so the logs still
+    # tell the peers apart; LAN and loopback addresses stay, they name no one.
+    labels = {}
+
+    def label_address(match):
+        try:
+            address = ipaddress.ip_address(match.group(0))
+        except ValueError:
+            return match.group(0)  # a version number such as a driver's
+        if not address.is_global:
+            return match.group(0)
+        return labels.setdefault(str(address), f'<ip-{len(labels) + 1}>')
+
     def scrub(text):
         for name, replacement in names.items():
             if len(name) > 2:
                 text = re.sub(re.escape(name), replacement, text, flags=re.IGNORECASE)
-        return text
+        text = re.sub(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])', label_address, text)
+        return re.sub(r'(?<![\w:])[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}(?![\w:])', label_address, text)
 
     logs = sorted((ROOT / 'out' / 'logs').glob('run-*.log'))[-3:]
     files = [(log, f'logs/{log.name}') for log in logs] + [(LOG, 'last_run.log'), (INI, 'bbport.ini'),
