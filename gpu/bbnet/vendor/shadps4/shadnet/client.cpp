@@ -14,7 +14,13 @@
 #include "common/thread.h"
 #include "shadnet.pb.h"
 
+#include <cstdlib>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
 #ifdef _WIN32
+#include <wincrypt.h>
 #pragma comment(lib, "Ws2_32.lib")
 static void PlatformInit() {
     static bool done = false;
@@ -64,6 +70,82 @@ ShadNetClient::~ShadNetClient() {
     Stop();
 }
 
+// lbppc: the trusted roots: the system's (the Windows ROOT and CA stores; OpenSSL's own paths elsewhere)
+// and BB_SHADNET_CA, a certificate file a test server is signed with.
+static bool LoadTrustedRoots(SSL_CTX* ctx) {
+    bool loaded = false;
+#ifdef _WIN32
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+    for (const wchar_t* name : {L"ROOT", L"CA"}) {
+        HCERTSTORE system = CertOpenSystemStoreW(0, name);
+        if (!system)
+            continue;
+        PCCERT_CONTEXT cert = nullptr;
+        while ((cert = CertEnumCertificatesInStore(system, cert)) != nullptr) {
+            const unsigned char* data = cert->pbCertEncoded;
+            if (X509* x509 = d2i_X509(nullptr, &data, cert->cbCertEncoded)) {
+                loaded |= X509_STORE_add_cert(store, x509) == 1;
+                X509_free(x509);
+            }
+        }
+        CertCloseStore(system, 0);
+    }
+#else
+    loaded = SSL_CTX_set_default_verify_paths(ctx) == 1;
+#endif
+    if (const char* extra = std::getenv("BB_SHADNET_CA"); extra && *extra)
+        loaded |= SSL_CTX_load_verify_locations(ctx, extra, nullptr) == 1;
+    return loaded;
+}
+
+bool TlsWanted() {
+    static const bool wanted = [] {
+        const char* value = std::getenv("BB_SHADNET_TLS");
+        return value && *value == '1';
+    }();
+    return wanted;
+}
+
+// The handshake on a connected, blocking socket; the server's certificate must chain to a trusted root
+// and name host. The SSL holds the only reference to its context.
+ssl_st* TlsHandshake(ShadSocketHandle sock, const std::string& host, u16 port) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx)
+        return nullptr;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    // A read that only finds a TLS control message (a TLS 1.3 session ticket) returns, so the
+    // client's reader never waits for data while it holds the session's lock.
+    SSL_CTX_clear_mode(ctx, SSL_MODE_AUTO_RETRY);
+    if (!LoadTrustedRoots(ctx))
+        LOG_WARNING(ShadNet, "TLS: no trusted root certificates loaded");
+    SSL* tls = SSL_new(ctx);
+    SSL_CTX_free(ctx);
+    if (!tls)
+        return nullptr;
+    SSL_set_tlsext_host_name(tls, host.c_str());
+    SSL_set1_host(tls, host.c_str());
+    SSL_set_fd(tls, static_cast<int>(sock));
+    if (SSL_connect(tls) != 1) {
+        const long verify = SSL_get_verify_result(tls);
+        char reason[256] = {};
+        ERR_error_string_n(ERR_get_error(), reason, sizeof(reason));
+        LOG_ERROR(ShadNet, "TLS handshake with {}:{} failed: {}", host, port,
+                  verify != X509_V_OK ? X509_verify_cert_error_string(verify) : reason);
+        SSL_free(tls);
+        return nullptr;
+    }
+    LOG_INFO(ShadNet, "TLS: {} with {}", SSL_get_version(tls), host);
+    return tls;
+}
+
+void ShadNetClient::FreeTls() {
+    if (m_tls) {
+        SSL_free(m_tls);
+        m_tls = nullptr;
+    }
+}
+
 void ShadNetClient::Start(const std::string& host, u16 port, const std::string& npid,
                           const std::string& password, const std::string& token) {
     m_host = host;
@@ -96,6 +178,7 @@ void ShadNetClient::Stop() {
         m_thread_reader.join();
     if (m_thread_writer.joinable())
         m_thread_writer.join();
+    FreeTls();
 }
 
 ShadNetState ShadNetClient::WaitForConnection() {
@@ -300,6 +383,7 @@ void ShadNetClient::WriterThread() {
 
 bool ShadNetClient::DoConnect() {
     m_state = ShadNetState::Ok; // reset; this attempt sets a failure code only on error
+    FreeTls(); // the last attempt's session; no reader or writer runs yet
     struct addrinfo hints{}, *res_list = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -399,6 +483,12 @@ bool ShadNetClient::DoConnect() {
     ::setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&so_rcv),
                  sizeof(so_rcv));
 
+    if (TlsWanted() && !(m_tls = TlsHandshake(m_sock, m_host, m_port))) {
+        DoDisconnect();
+        m_state = ShadNetState::FailureConnect;
+        return false;
+    }
+
     // ServerInfo handshake
     u8 hdr[SHAD_HEADER_SIZE];
     if (!RecvN(hdr, SHAD_HEADER_SIZE)) {
@@ -489,6 +579,39 @@ bool ShadNetClient::RecvN(u8* buf, u32 n) {
     while (received < n) {
         if (m_terminate)
             return false;
+        if (m_tls) {
+            // Wait without the lock until data is there (the writer keeps sending meanwhile); before
+            // sign-in completes the wait has the connect timeout.
+            if (SSL_pending(m_tls) == 0) {
+                const ShadSocketHandle sock = m_sock;
+                if (sock == SHAD_INVALID_SOCK)
+                    return false;
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(sock, &rfds);
+                const long wait_ms = m_connected ? 250 : static_cast<long>(SHAD_CONNECT_TIMEOUT_MS);
+                struct timeval tv{wait_ms / 1000, (wait_ms % 1000) * 1000};
+                const int ready = ::select(static_cast<int>(sock) + 1, &rfds, nullptr, nullptr, &tv);
+                if (ready < 0 || (ready == 0 && !m_connected)) {
+                    m_last_recv_result = -1;
+                    return false;
+                }
+                if (ready == 0)
+                    continue;
+            }
+            std::lock_guard lock(m_mutex_tls);
+            const int r = SSL_read(m_tls, buf + received, static_cast<int>(n - received));
+            if (r <= 0) {
+                const int error = SSL_get_error(m_tls, r);
+                if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+                    continue; // a control message, no data
+                m_last_recv_result = error == SSL_ERROR_ZERO_RETURN ? 0 : -1;
+                m_last_recv_error = error;
+                return false;
+            }
+            received += static_cast<u32>(r);
+            continue;
+        }
         const int r = static_cast<int>(::recv(m_sock, reinterpret_cast<char*>(buf + received),
                                               static_cast<int>(n - received), 0));
         if (r <= 0) {
@@ -509,6 +632,21 @@ bool ShadNetClient::SendAll(const std::vector<u8>& data) {
     std::lock_guard lock(m_mutex_send_direct);
     int sent = 0;
     const int total = static_cast<int>(data.size());
+    if (m_tls) {
+        std::lock_guard tls_lock(m_mutex_tls);
+        while (sent < total) {
+            const int r = SSL_write(m_tls, data.data() + sent, total - sent);
+            if (r <= 0) {
+                const int error = SSL_get_error(m_tls, r);
+                if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+                    continue;
+                LOG_ERROR(ShadNet, "TLS send failed ({})", error);
+                return false;
+            }
+            sent += r;
+        }
+        return true;
+    }
     while (sent < total) {
         const int r = static_cast<int>(
             ::send(m_sock, reinterpret_cast<const char*>(data.data() + sent), total - sent, 0));

@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 #include "common/types.h"
+
+struct ssl_st; // OpenSSL's SSL (lbppc: BB_SHADNET_TLS)
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -313,6 +315,11 @@ struct NotifyRoomMessage {
 
 // ShadNetClient
 
+// lbppc: BB_SHADNET_TLS=1: the server is reached through a TLS proxy. TlsHandshake runs on a connected,
+// blocking socket and returns the session, or nullptr (logged) if the server could not be verified.
+bool TlsWanted();
+::ssl_st* TlsHandshake(ShadSocketHandle sock, const std::string& host, u16 port);
+
 class ShadNetClient {
 public:
     ShadNetClient();
@@ -418,6 +425,13 @@ private:
     static u64 GetLE64(const u8* p);
 
     ShadSocketHandle m_sock = SHAD_INVALID_SOCK;
+    // lbppc: BB_SHADNET_TLS=1: the connection runs over TLS (a proxy in front of the server), so the
+    // password and everything after it are encrypted. The reader and writer threads share one TLS
+    // session: m_mutex_tls is held for each SSL_read/SSL_write, and the reader only takes it once data
+    // is waiting. The session is freed at the next connect or once Stop() has joined the threads.
+    void FreeTls();
+    ::ssl_st* m_tls = nullptr;
+    std::mutex m_mutex_tls;
     // bbport: the last failed recv() (0: the server closed; -1 with the socket error), for the log.
     int m_last_recv_result = 0;
     int m_last_recv_error = 0;

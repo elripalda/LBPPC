@@ -7,6 +7,8 @@
 #include "shadnet/client.h" // socket platform typedefs + protocol constants
 #include "shadnet/server_probe.h"
 
+#include <openssl/ssl.h>
+
 #ifdef _WIN32
 #pragma comment(lib, "Ws2_32.lib")
 static void ProbePlatformInit() {
@@ -28,12 +30,18 @@ static u32 ProbeGetLE32(const u8* p) {
            (static_cast<u32>(p[3]) << 24);
 }
 
-// recv() exactly n bytes (blocking, bounded by the socket's SO_RCVTIMEO).
-static bool ProbeRecvN(ShadSocketHandle sock, u8* buf, u32 n) {
+// recv() exactly n bytes (blocking, bounded by the socket's SO_RCVTIMEO); through tls when set.
+static bool ProbeRecvN(ShadSocketHandle sock, SSL* tls, u8* buf, u32 n) {
     u32 got = 0;
     while (got < n) {
         const int r =
-            ::recv(sock, reinterpret_cast<char*>(buf) + got, static_cast<int>(n - got), 0);
+            tls ? SSL_read(tls, buf + got, static_cast<int>(n - got))
+                : ::recv(sock, reinterpret_cast<char*>(buf) + got, static_cast<int>(n - got), 0);
+        if (r <= 0 && tls) {
+            const int error = SSL_get_error(tls, r);
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+                continue; // a TLS control message, no data
+        }
         if (r <= 0)
             return false;
         got += static_cast<u32>(r);
@@ -130,16 +138,26 @@ ProbeInfo ProbeServer(const std::string& host, u16 port, u32 timeout_ms) {
                  sizeof(so_rcv));
 
     info.result = ProbeResult::ProtocolError;
+    SSL* tls = nullptr;
+    const auto close = [&] {
+        if (tls)
+            SSL_free(tls);
+        SHAD_CLOSE(sock);
+    };
+    if (TlsWanted() && !(tls = TlsHandshake(sock, host, port))) {
+        close();
+        return info;
+    }
 
     u8 hdr[SHAD_HEADER_SIZE];
-    if (!ProbeRecvN(sock, hdr, SHAD_HEADER_SIZE)) {
-        SHAD_CLOSE(sock);
+    if (!ProbeRecvN(sock, tls, hdr, SHAD_HEADER_SIZE)) {
+        close();
         LOG_WARNING(ShadNet, "probe: {}:{} reachable but no ServerInfo header received", host,
                     port);
         return info;
     }
     if (static_cast<PacketType>(hdr[0]) != PacketType::ServerInfo) {
-        SHAD_CLOSE(sock);
+        close();
         LOG_WARNING(ShadNet, "probe: {}:{} sent packet type {:02x} instead of ServerInfo", host,
                     port, hdr[0]);
         return info;
@@ -147,19 +165,19 @@ ProbeInfo ProbeServer(const std::string& host, u16 port, u32 timeout_ms) {
 
     const u32 total_sz = ProbeGetLE32(hdr + 3);
     if (total_sz < SHAD_HEADER_SIZE || total_sz > SHAD_MAX_PACKET_SIZE) {
-        SHAD_CLOSE(sock);
+        close();
         LOG_WARNING(ShadNet, "probe: {}:{} sent corrupt ServerInfo (total_sz={})", host, port,
                     total_sz);
         return info;
     }
     const u32 payload_sz = total_sz - SHAD_HEADER_SIZE;
     std::vector<u8> payload(payload_sz);
-    if (payload_sz > 0 && !ProbeRecvN(sock, payload.data(), payload_sz)) {
-        SHAD_CLOSE(sock);
+    if (payload_sz > 0 && !ProbeRecvN(sock, tls, payload.data(), payload_sz)) {
+        close();
         LOG_WARNING(ShadNet, "probe: {}:{} ServerInfo payload read failed", host, port);
         return info;
     }
-    SHAD_CLOSE(sock);
+    close();
 
     if (payload_sz < 4) {
         info.result = ProbeResult::Ok;
