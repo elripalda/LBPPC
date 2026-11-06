@@ -30,6 +30,8 @@ int bbgpu_handle_fault(void *ucontext, void *address);
 void bbgpu_dump_guest_writes(void *ucontext);
 /* lbppc: the main video port's flip rate (0: every vblank, 1: every other). */
 void bbgpu_set_flip_rate(int rate);
+/* lbppc: the frame limit (BB_FPS_LIMIT) while the game runs, in frames per second; 0 lifts it. */
+void bbgpu_set_frame_limit(unsigned fps);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);

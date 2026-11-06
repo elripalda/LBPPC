@@ -203,6 +203,12 @@ bool Wanted() {
     return setting == "on" || setting == "boost";
 }
 
+// lbppc: the frame limit changed while the game runs (LBPPC_UNCAP_TRIGGER: 30 FPS at the start, 60 once the world
+// update is divided; a limit of 60 from the start ran the world at 60 steps a second until then).
+extern "C" void bbgpu_set_frame_limit(unsigned fps) {
+    state.period = fps ? std::chrono::nanoseconds(1'000'000'000 / fps) : std::chrono::nanoseconds{0};
+}
+
 void Init(const Instance& instance) {
     state.log = Flag("BB_FRAME_STATS") || Flag("BB_LATENCY_LOG");
     state.device = instance.GetDevice();

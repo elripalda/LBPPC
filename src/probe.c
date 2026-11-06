@@ -351,16 +351,30 @@ static DWORD WINAPI watch_all_threads(LPVOID arg) {
             if (!image) { Sleep(50); continue; }
             watch_address=(uint64_t)(uintptr_t)image+strtoull(getenv("BB_WATCH_IMAGE"),NULL,0);
         }
+        /* Each thread is stopped only when it is new or the address changed: stopping every thread 20 times a second
+           changed the game's timing enough to hide a race being watched for. */
+        enum { ARMED_MAX=1024 };
+        static struct { DWORD tid; uint64_t address; } armed[ARMED_MAX];
+        static int armed_count;
         HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
         THREADENTRY32 entry={.dwSize=sizeof(entry)};
         for (BOOL more=Thread32First(snapshot,&entry); more; more=Thread32Next(snapshot,&entry)) {
             if (entry.th32OwnerProcessID!=GetCurrentProcessId() || entry.th32ThreadID==GetCurrentThreadId()) continue;
+            int at=0;
+            while (at<armed_count && armed[at].tid!=entry.th32ThreadID) ++at;
+            if (at<armed_count && armed[at].address==watch_address) continue;
+            if (at==armed_count && armed_count<ARMED_MAX) armed[armed_count++].tid=entry.th32ThreadID;
+            if (at<armed_count) armed[at].address=watch_address;
             HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_SET_CONTEXT,FALSE,entry.th32ThreadID);
             if (!thread) continue;
             if (SuspendThread(thread)!=(DWORD)-1) {
                 CONTEXT c={.ContextFlags=CONTEXT_DEBUG_REGISTERS};
                 if (GetThreadContext(thread,&c) && c.Dr0!=watch_address) {
                     c.Dr0=watch_address; c.Dr1=watch_address+8; c.Dr2=watch_address+16; c.Dr3=watch_address+24;
+                    /* BB_WATCH_ADDR2=address: the last two slots watch its first 16 bytes instead (two buffers). */
+                    static uint64_t second=1;
+                    if (second==1) second=getenv("BB_WATCH_ADDR2") ? strtoull(getenv("BB_WATCH_ADDR2"),NULL,0) : 0;
+                    if (second) { c.Dr2=second; c.Dr3=second+8; }
                     /* L0-L3, each: break on write (01), 8 bytes (10); BB_WATCH_RW=1: on reads too (11). */
                     static int rw=-1;
                     if (rw<0) rw=getenv("BB_WATCH_RW")!=NULL;
@@ -483,9 +497,42 @@ static void position_log(uint64_t game) {
         have[i]=1;
     }
 }
+/* lbppc: an SPU job in spu.prx (0x8f30) sorts a draw list: float sort keys with object indices, sorted in place by
+ * 0x4a60 (a sorting network of vcmpltps, padded with FLT_MAX), then padded to a multiple of 32 with the key 1e20 and
+ * the index 0x66666666 (0x9540). A comparison with NaN is false, so a NaN key leaves the order broken and a padding
+ * index takes a real place: the render preparation (0x2a972e) and another job (spu.prx 0x668ff) then use
+ * 0x66666666 as an object and fault. Above 30 FPS NaN keys turn up (LBPPC_SIM_DIVIDE). Just before the sort (0x9475:
+ * keys in r14, count in r12d) each NaN key becomes the largest float below FLT_MAX: those objects sort last, before
+ * the padding. LBPPC_SORT_KEYS_FIX=1, or with LBPPC_SIM_DIVIDE. */
+enum { SORT_KEYS_SITE=0x16c9475 };
+/* lbppc: the NaN keys' source. spu.prx's sweep job (0x95b0) reads each collision shape's 2D bounds (record fields
+ * 0x18-0x2c, record in rax at 0xa145) into sort keys; on frames without a world step some shapes' bounds are still
+ * unset (NaN). Each NaN bound becomes 0 there, so the keys stay numbers and the sort stays whole.
+ * LBPPC_SHAPE_FIX=1, or with LBPPC_SIM_DIVIDE. */
+enum { SHAPE_SITE=0x16ca145 };
+static void shape_fix(uint64_t record) {
+    uint32_t *f=(uint32_t *)(uintptr_t)(record+0x18);
+    int fixed=0;
+    for (int k=0;k<6;++k) if ((f[k]&0x7fffffffu)>0x7f800000u) { f[k]=0; fixed=1; }
+    static volatile LONG shown;
+    if (fixed && InterlockedIncrement(&shown)<=12) printf("Shape: unset bounds in record %p set to 0\n",(void *)(uintptr_t)record);
+}
+static void sort_keys_fix(uint64_t keys,uint64_t values,uint32_t count) {
+    static volatile LONG fixed;
+    uint32_t *key=(uint32_t *)(uintptr_t)keys;
+    const uint32_t *value=(const uint32_t *)(uintptr_t)values;
+    for (uint32_t i=0;i<count;++i)
+        if ((key[i]&0x7fffffffu)>0x7f800000u) {
+            if (InterlockedIncrement(&fixed)<=40)
+                printf("Sort: NaN key %u of %u (value 0x%x)\n",i,count,value[i]);
+            key[i]=0x7f7ffffeu;
+        }
+}
 static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot, uint64_t c, uint64_t *frame) {
     /* frame: the stub's saved registers, below its rbp: flags, rax rcx rdx rsi rdi r8-r11 rbx r12-r15. */
     if (offset==WORLD_UPDATE) { position_log(frame[-6]); return; }
+    if (offset==SORT_KEYS_SITE) { sort_keys_fix(frame[-14],frame[-15],(uint32_t)frame[-12]); return; }
+    if (offset==SHAPE_SITE) { shape_fix(frame[-2]); return; }
     if (offset==SYNC_SEND_SITE) { sync_log_send(frame[-11],frame[-14]); return; }
     if (offset==SYNC_RECEIVE_SITE) { sync_log_receive(frame[-14],(const SyncRecord *)(uintptr_t)frame[-15]); return; }
     uint64_t rax=frame[-2];
@@ -860,8 +907,29 @@ static void custom_server_install(void) {
 }
 /* Executable memory within 2 GiB of the image (for rel32 jumps and calls into stubs): any free 64 KiB, the space
    around the image being cut up by the GPU and network libraries. */
+/* Stub memory reserved at start (stub_pool_reserve), below the image's load address (LBPPC_LOW_BASE) while that
+   space is still free: later the graphics driver and other DLLs can take it, and the patches that found no block
+   were left out (LBPPC_SIM_DIVIDE among them: the game then ran 60 world steps a second). */
+enum { STUB_POOL=2u<<20 };
+static unsigned char *stub_pool;
+static size_t stub_pool_used;
+static void stub_pool_reserve(void) {
+    const char *base=getenv("LBPPC_LOW_BASE");
+    const uintptr_t load=base ? (uintptr_t)strtoull(base,NULL,0) : 0;
+    if (!load) return;
+    for (uintptr_t at=load>STUB_POOL ? load-STUB_POOL : 0x10000; !stub_pool && at>=0x10000; at-=0x10000)
+        stub_pool=VirtualAlloc((void *)at,STUB_POOL,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+}
 static unsigned char *near_image_alloc(void) {
     unsigned char *p=NULL;
+    if (stub_pool && stub_pool_used+65536<=STUB_POOL && (uintptr_t)stub_pool-(uintptr_t)image+0x70000000u<0xe0000000u) {
+        p=stub_pool+stub_pool_used;
+        stub_pool_used+=65536;
+        return p;
+    }
+    /* Then the runtime's low memory: it hands out the space above the image (LBPPC_LOW_BASE). */
+    void *low=runtime_low_map(65536,PROT_READ|PROT_WRITE|PROT_EXEC);
+    if (low && (uintptr_t)low-(uintptr_t)image<0x70000000) return (unsigned char *)low;
     const uintptr_t past=((uintptr_t)image+image_size_hint+0xffff)&~(uintptr_t)0xffff;
     for (uintptr_t at=past; !p && at<(uintptr_t)image+0x70000000; at+=0x10000)
         p=VirtualAlloc((void *)at,65536,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
@@ -891,6 +959,8 @@ static DWORD WINAPI uncap_thread(LPVOID arg) {
         uncapped=!uncapped;
         *(volatile int32_t *)(image+0x1060a10)=uncapped ? 0 : 2;
         bbgpu_set_flip_rate(uncapped ? 0 : 1);
+        /* LBPPC_UNCAP_LIMIT=fps (default 60): the frame limit once uncapped; 30 before and after. */
+        bbgpu_set_frame_limit(uncapped ? (getenv("LBPPC_UNCAP_LIMIT") ? (unsigned)atoi(getenv("LBPPC_UNCAP_LIMIT")) : 60u) : 30u);
         if (lbppc_sim_phase) *lbppc_sim_phase=1;
         if (lbppc_sim_active) *lbppc_sim_active=(unsigned char)uncapped;
         { extern volatile int lbppc_nan_armed; lbppc_nan_armed=uncapped; }
@@ -917,7 +987,52 @@ static DWORD WINAPI arena_monitor(LPVOID arg) {
     }
     return 0;
 }
+/* lbppc: spu.prx's job at 0x47960 places each point as its rest position plus a weighted average of up to four
+ * influences, divided by the sum of their weights (vrcpps at 0x481d4). On a frame without a world step
+ * (LBPPC_SIM_DIVIDE) a point can have no weight: 1/0, and the point, its object's sort key and then the draw list
+ * go NaN. As the game already does for NaN influences (0x4817e), a NaN result keeps the rest position (xmm6):
+ * 0x481fc vaddps xmm0,xmm6,xmm0 and 0x48200 vblendps $8,xmm6,xmm0,xmm0 move to a stub that adds
+ * vcmpunordps xmm1,xmm0,xmm0; vblendvps xmm0,xmm0,xmm6,xmm1 between them (xmm1 is free there).
+ * LBPPC_SPU_NAN_GUARD=1, or with LBPPC_SIM_DIVIDE. */
+static void spu_nan_guard_install(void) {
+    const char *spec=getenv("LBPPC_SPU_NAN_GUARD");
+    if (spec ? spec[0]!='1' : !getenv("LBPPC_SIM_DIVIDE")) return;
+    enum { SITE=0x17081fc, BACK=0x1708206 };
+    static const unsigned char original[]={0xc5,0xc8,0x58,0xc0, 0xc4,0xe3,0x79,0x0c,0xc6,0x08};
+    if (memcmp(image+SITE,original,sizeof(original))) { fprintf(stderr,"SPU NaN guard: unexpected game code, not applied\n"); return; }
+    unsigned char *s=near_image_alloc();
+    if (!s) { fputs("SPU NaN guard: no memory near the image\n",stderr); return; }
+    static const unsigned char guard[]={
+        0xc5,0xc8,0x58,0xc0,                    /* vaddps xmm0,xmm6,xmm0 */
+        0xc5,0xf8,0xc2,0xc8,0x03,               /* vcmpunordps xmm1,xmm0,xmm0 */
+        0xc4,0xe3,0x79,0x4a,0xc6,0x10,          /* vblendvps xmm0,xmm0,xmm6,xmm1 */
+        0xc4,0xe3,0x79,0x0c,0xc6,0x08,          /* vblendps xmm0,xmm0,xmm6,8 */
+        0xff,0x25,0x00,0x00,0x00,0x00};         /* jmp [rip+0] */
+    memcpy(s,guard,sizeof(guard));
+    const uint64_t back=(uint64_t)(uintptr_t)(image+BACK);
+    memcpy(s+sizeof(guard),&back,8);
+    const int32_t rel=(int32_t)((intptr_t)s-(intptr_t)(image+SITE+5));
+    image[SITE]=0xe9; memcpy(image+SITE+1,&rel,4);
+    memset(image+SITE+5,0x90,sizeof(original)-5);
+    printf("SPU NaN guard: on (stub at %p)\n",(void *)s);
+}
+/* lbppc: with LBPPC_SIM_DIVIDE=n the main loop runs n times per world step, but LBP3's animation clock (0x3e2970,
+ * reached once a frame) adds a fixed 1/30 s per frame: idle animations and most others ran n times too fast while
+ * the world kept its speed. Its step, the constant at 0xe7d3cc and the two stores of it (0x3e19d0, 0x3e2a8b),
+ * becomes 1/(30n). LBPPC_ANIM_STEP_FIX=0 leaves it. */
+static void anim_step_install(int32_t n) {
+    const char *spec=getenv("LBPPC_ANIM_STEP_FIX");
+    if (n<2 || (spec && spec[0]=='0')) return;
+    static const uint32_t at[]={0xe7d3cc,0x3e19d2,0x3e2a8f};
+    const uint32_t thirtieth=0x3d088889;
+    for (size_t i=0;i<sizeof(at)/sizeof(*at);++i)
+        if (memcmp(image+at[i],&thirtieth,4)) { fprintf(stderr,"Animation step: unexpected game code, not applied\n"); return; }
+    const float step=1.0f/(30.0f*(float)n);
+    for (size_t i=0;i<sizeof(at)/sizeof(*at);++i) memcpy(image+at[i],&step,4);
+    printf("Animation step: 1/%d s per frame\n",30*n);
+}
 static void sim_divide_install(void) {
+    spu_nan_guard_install();
     if (getenv("LBPPC_ARENA_MON")) CloseHandle(CreateThread(NULL,0,arena_monitor,NULL,0,NULL));
     const char *spec=getenv("LBPPC_SIM_DIVIDE");
     if (!spec) return;
@@ -949,6 +1064,7 @@ static void sim_divide_install(void) {
     const int32_t rel=(int32_t)((intptr_t)s-(intptr_t)(image+site+5));
     memcpy(image+site+1,&rel,4);
     printf("Runtime: world update every %d frames (stub at %p)\n",n,(void *)s);
+    if (!getenv("LBPPC_UNCAP_TRIGGER")) anim_step_install(n);
     if (getenv("LBPPC_UNCAP_TRIGGER")) CloseHandle(CreateThread(NULL,0,uncap_thread,NULL,0,NULL));
 }
 /* lbppc: online play runs both players' worlds in lockstep and compares them ("The game diverged"). rcpps and rsqrtps
@@ -1402,6 +1518,18 @@ static void sync_log_install(void) {
         profile_thread_id=GetCurrentThreadId();
         lbppc_slow_frame_hook=slow_frame_seen;
         CloseHandle(CreateThread(NULL,0,main_thread_profiler,NULL,0,NULL));
+    }
+    const char *sort_fix=getenv("LBPPC_SORT_KEYS_FIX");
+    if (sort_fix ? sort_fix[0]=='1' : getenv("LBPPC_SIM_DIVIDE")!=NULL) {
+        static const unsigned char site[]={0x4c,0x89,0xf7,0x4c,0x89,0xfe,0x44,0x89,0xe1};
+        if (memcmp(image+SORT_KEYS_SITE,site,sizeof(site))) fprintf(stderr,"Sort: unexpected game code, not applied\n");
+        else hooks_install("0x16c9475:9");
+    }
+    const char *shape_spec=getenv("LBPPC_SHAPE_FIX");
+    if (shape_spec ? shape_spec[0]=='1' : getenv("LBPPC_SIM_DIVIDE")!=NULL) {
+        static const unsigned char shape[]={0xc5,0xfa,0x10,0x40,0x18};
+        if (memcmp(image+SHAPE_SITE,shape,sizeof(shape))) fprintf(stderr,"Shape: unexpected game code, not applied\n");
+        else hooks_install("0x16ca145:5");
     }
     const char *positions=getenv("LBPPC_POS_LOG");
     static const unsigned char update[]={0x55,0x48,0x89,0xe5,0x41,0x57};
@@ -2014,6 +2142,9 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
+#ifdef _WIN32
+    stub_pool_reserve();
+#endif
     check_cpu();
 #ifdef _WIN32
     /* The PS4 user range must stay free of host allocations (GPU driver, heaps), and the guest
