@@ -113,7 +113,8 @@ def main(argv):
     # per thread ("Profile:" and "Threads:" lines). Measured to cost nothing visible: 80-86 slow frames with it on or
     # off in the same scripted run.
     env.setdefault('LBPPC_PROFILE', '1')
-    # Readback test (temporary): guest writes into GPU-written memory skip the copy back (buffer_cache.cpp).
+    # Guest writes into GPU-written memory skip the copy back (buffer_cache.cpp): faster in busy levels, nothing
+    # found wrong in testing. Debug page: "Skip GPU readbacks".
     env.setdefault('LBPPC_WRITE_FAULT_NO_READBACK', '1')
     # Climbing teleports (temporary): optimizations switched off while the game runs, by writing their mask
     # (gpu/shim/bbport_toggles.h, src/runtime_memory.c) to user/toggles.txt; read 4 times a second.
