@@ -428,10 +428,14 @@ void PresentEnd(u64 id) {
         state.parts_ms[3] += span(times.present, now);
         // lbppc: a frame shown more than 40 ms after the one before (a missed 30 FPS frame), with
         // where its time went: a late start is the game (or what it waits for before a frame),
-        // the rest this frame's own way to the screen.
+        // the rest this frame's own way to the screen. BB_SLOW_FRAME_MS changes the 40 ms.
+        static const double slow_ms = [] {
+            const char* value = std::getenv("BB_SLOW_FRAME_MS");
+            return value ? std::atof(value) : 40.0;
+        }();
         if (state.log && state.last_present_end != std::chrono::steady_clock::time_point{}) {
             const double since = span(state.last_present_end, now);
-            if (since > 40.0) {
+            if (since > slow_ms) {
                 std::printf("Slow frame: %.1f ms after the last one; started %.1f ms after the "
                             "previous frame; game %.1f, GPU thread %.1f, waiting to present %.1f, "
                             "present %.1f ms\n",
