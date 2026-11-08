@@ -14,6 +14,12 @@
 
 void mouse_touch_reset(MouseTouch *t) { memset(t,0,sizeof(*t)); }
 
+/* A new touch there: a new number (two, a gesture's second finger takes the next). */
+static void touch_down(MouseTouch *t, float x, float y) {
+    t->down=1; t->x=x; t->y=y;
+    t->id=(uint8_t)((t->id+2)&127);
+}
+
 static float clampf(float v, float lo, float hi) { return v<lo ? lo : v>hi ? hi : v; }
 static float toward(float v, float target, float step) {
     const float d=target-v;
@@ -38,14 +44,18 @@ void mouse_touch_update(MouseTouch *t, float dx, float dy, float scale, int clic
         if (kind==1) t->spacing_target=clampf(t->spacing_target+wheel_steps*MOUSE_TOUCH_PINCH_STEP,SPACING_MIN,SPACING_MAX);
         else t->angle_target+=wheel_steps*MOUSE_TOUCH_TWIST_STEP;
         t->gesture_us=now_us;
-        if (!t->down) { t->down=1; t->x=CENTRE_X; t->y=CENTRE_Y; }
+        t->relift=0;
+        if (!t->down) touch_down(t,CENTRE_X,CENTRE_Y);
     }
 
-    if (t->relift) { /* lifted at the edge last sample: down again across the pad */
+    if (t->relift && !click) { /* lifted at the edge: down again across the pad once it has been seen up */
+        if (now_us<t->relift_us) return;
         t->relift=0;
-        t->down=1; t->x=t->relift_x; t->y=t->relift_y;
+        touch_down(t,t->relift_x,t->relift_y);
+        t->moved_us=now_us;
     }
-    if ((moved || click) && !t->down) { t->down=1; t->x=CENTRE_X; t->y=CENTRE_Y; }
+    t->relift=0;
+    if ((moved || click) && !t->down) touch_down(t,CENTRE_X,CENTRE_Y);
     if (moved) {
         t->x+=dx*scale; t->y+=dy*scale;
         t->moved_us=now_us;
@@ -56,7 +66,7 @@ void mouse_touch_update(MouseTouch *t, float dx, float dy, float scale, int clic
             const float lo=2.0f*EDGE, hi_x=MOUSE_TOUCH_W-1-2.0f*EDGE, hi_y=MOUSE_TOUCH_H-1-2.0f*EDGE;
             t->relift_x=t->x<EDGE ? hi_x : t->x>MOUSE_TOUCH_W-1-EDGE ? lo : clampf(t->x,lo,hi_x);
             t->relift_y=t->y<EDGE ? hi_y : t->y>MOUSE_TOUCH_H-1-EDGE ? lo : clampf(t->y,lo,hi_y);
-            t->down=0; t->relift=1; /* this sample: no finger */
+            t->down=0; t->relift=1; t->relift_us=now_us+MOUSE_TOUCH_RELIFT_US; /* no finger until then */
             return;
         }
         t->x=clampf(t->x,0.0f,MOUSE_TOUCH_W-1.0f); t->y=clampf(t->y,0.0f,MOUSE_TOUCH_H-1.0f);
@@ -78,6 +88,7 @@ void mouse_touch_update(MouseTouch *t, float dx, float dy, float scale, int clic
         out->count=2;
         out->x[0]=(uint16_t)lroundf(mx-cx); out->y[0]=(uint16_t)lroundf(my-cy);
         out->x[1]=(uint16_t)lroundf(mx+cx); out->y[1]=(uint16_t)lroundf(my+cy);
+        out->id[0]=t->id; out->id[1]=(uint8_t)((t->id+1)&127);
         out->click=click;
         return;
     }
@@ -86,6 +97,7 @@ void mouse_touch_update(MouseTouch *t, float dx, float dy, float scale, int clic
     if (t->down) {
         out->count=1;
         out->x[0]=(uint16_t)lroundf(t->x); out->y[0]=(uint16_t)lroundf(t->y);
+        out->id[0]=t->id;
     }
     out->click=click;
 }

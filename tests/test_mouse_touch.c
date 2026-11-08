@@ -23,16 +23,20 @@ static void test_slide_and_lift(void) {
     assert(o.count==0); /* lifted */
 }
 
-/* At the pad's edge the finger is lifted for one sample and put down just inside the opposite
- * edge, the other axis where it was: the drag goes on with the whole pad ahead of it. */
+/* At the pad's edge the finger is lifted for MOUSE_TOUCH_RELIFT_US (longer than a game frame) and
+ * put down just inside the opposite edge, the other axis where it was, as a new touch (a new id):
+ * the drag goes on with the whole pad ahead of it. */
 static void test_edge_relift(void) {
     MouseTouch t; mouse_touch_reset(&t); MouseTouchOut o;
     mouse_touch_update(&t,400,0,1.5f,0,0,0,1000*MS,&o);
     assert(o.count==1 && o.x[0]==1560);
+    const uint8_t first=o.id[0];
     mouse_touch_update(&t,250,0,1.5f,0,0,0,1012*MS,&o); /* 1560 + 375: past the edge margin */
     assert(o.count==0); /* would pass the edge: lifted */
-    mouse_touch_update(&t,10,0,1.5f,0,0,0,1024*MS,&o);
-    assert(o.count==1 && o.x[0]==80+15 && o.y[0]==471);
+    mouse_touch_update(&t,10,0,1.5f,0,0,0,1030*MS,&o);
+    assert(o.count==0); /* still up: a game reading more often than it draws sees the lift */
+    mouse_touch_update(&t,10,0,1.5f,0,0,0,1070*MS,&o);
+    assert(o.count==1 && o.x[0]==80+15 && o.y[0]==471 && o.id[0]!=first);
 
     /* Upward: down again near the bottom. */
     mouse_touch_reset(&t);
@@ -40,8 +44,21 @@ static void test_edge_relift(void) {
     assert(o.count==1 && o.y[0]==471-300);
     mouse_touch_update(&t,0,-100,1.5f,0,0,0,2012*MS,&o); /* 171 - 150: past the top margin */
     assert(o.count==0);
-    mouse_touch_update(&t,0,-10,1.5f,0,0,0,2024*MS,&o);
+    mouse_touch_update(&t,0,-10,1.5f,0,0,0,2070*MS,&o);
     assert(o.count==1 && o.x[0]==960 && o.y[0]==862-15);
+}
+
+/* Each new touch has its own number, as on the DualShock 4; one touch keeps it while it moves. */
+static void test_touch_ids(void) {
+    MouseTouch t; mouse_touch_reset(&t); MouseTouchOut o;
+    mouse_touch_update(&t,10,0,1.5f,0,0,0,1000*MS,&o);
+    const uint8_t first=o.id[0];
+    mouse_touch_update(&t,10,0,1.5f,0,0,0,1012*MS,&o);
+    assert(o.count==1 && o.id[0]==first);
+    mouse_touch_update(&t,0,0,1.5f,0,0,0,1400*MS,&o); /* still: lifted */
+    assert(o.count==0);
+    mouse_touch_update(&t,10,0,1.5f,0,0,0,1412*MS,&o);
+    assert(o.count==1 && o.id[0]!=first && o.id[0]<128);
 }
 
 /* The left button pushes the touchpad in, with a finger down, for as long as it is held. */
@@ -93,6 +110,7 @@ static void test_twist(void) {
 int main(void) {
     test_slide_and_lift();
     test_edge_relift();
+    test_touch_ids();
     test_click();
     test_pinch();
     test_twist();

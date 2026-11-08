@@ -22,12 +22,16 @@
 #define MOUSE_TOUCH_PINCH_STEP 90.0f /* finger spacing per wheel step */
 #define MOUSE_TOUCH_TWIST_STEP 0.2618f /* 15 degrees per wheel step */
 #define MOUSE_TOUCH_GESTURE_US 200000 /* a gesture ends this long after its last step is done */
+#define MOUSE_TOUCH_RELIFT_US 50000   /* a finger lifted at the edge stays up this long: longer than a game
+                                         frame, so a game reading the pad more often than it draws sees it */
 
 typedef struct {
     float x, y;            /* the finger, while down */
     int down;
-    int relift;            /* lifted at the edge this sample: down at relift_x/y next time */
+    uint8_t id;            /* the touch's number: a new one for each touch, as the DualShock 4 counts them */
+    int relift;            /* lifted at the edge: down at relift_x/y once relift_us has passed */
     float relift_x, relift_y;
+    uint64_t relift_us;
     uint64_t last_us, moved_us;
     int gesture;           /* 0 none, 1 pinch, 2 twist */
     float spacing, spacing_target, angle, angle_target;
@@ -37,6 +41,7 @@ typedef struct {
 typedef struct {
     int count;             /* fingers down: 0..2 */
     uint16_t x[2], y[2];
+    uint8_t id[2];         /* each finger's touch number (0..127) */
     int click;             /* the touchpad pushed in */
 } MouseTouchOut;
 

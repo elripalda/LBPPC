@@ -680,7 +680,7 @@ static void sample_host(PadData *d) {
                            d->timestamp,&touch);
         if (!d->touch_count) {
             d->touch_count=(uint8_t)touch.count;
-            for (int i=0;i<touch.count;++i) d->touches[i]=(PadTouch){.x=touch.x[i],.y=touch.y[i],.id=0};
+            for (int i=0;i<touch.count;++i) d->touches[i]=(PadTouch){.x=touch.x[i],.y=touch.y[i],.id=touch.id[i]};
         }
         if (touch.click) d->buttons|=BTN_TOUCHPAD;
     } else {
