@@ -23,7 +23,8 @@ static void test_slide_and_lift(void) {
     assert(o.count==0); /* lifted */
 }
 
-/* At the pad's edge the finger is lifted for one sample and put down at the centre again. */
+/* At the pad's edge the finger is lifted for one sample and put down just inside the opposite
+ * edge, the other axis where it was: the drag goes on with the whole pad ahead of it. */
 static void test_edge_relift(void) {
     MouseTouch t; mouse_touch_reset(&t); MouseTouchOut o;
     mouse_touch_update(&t,400,0,1.5f,0,0,0,1000*MS,&o);
@@ -31,7 +32,16 @@ static void test_edge_relift(void) {
     mouse_touch_update(&t,250,0,1.5f,0,0,0,1012*MS,&o); /* 1560 + 375: past the edge margin */
     assert(o.count==0); /* would pass the edge: lifted */
     mouse_touch_update(&t,10,0,1.5f,0,0,0,1024*MS,&o);
-    assert(o.count==1 && o.x[0]==960+15 && o.y[0]==471);
+    assert(o.count==1 && o.x[0]==80+15 && o.y[0]==471);
+
+    /* Upward: down again near the bottom. */
+    mouse_touch_reset(&t);
+    mouse_touch_update(&t,0,-200,1.5f,0,0,0,2000*MS,&o);
+    assert(o.count==1 && o.y[0]==471-300);
+    mouse_touch_update(&t,0,-100,1.5f,0,0,0,2012*MS,&o); /* 171 - 150: past the top margin */
+    assert(o.count==0);
+    mouse_touch_update(&t,0,-10,1.5f,0,0,0,2024*MS,&o);
+    assert(o.count==1 && o.x[0]==960 && o.y[0]==862-15);
 }
 
 /* The left button pushes the touchpad in, with a finger down, for as long as it is held. */

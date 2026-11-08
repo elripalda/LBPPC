@@ -41,9 +41,9 @@ void mouse_touch_update(MouseTouch *t, float dx, float dy, float scale, int clic
         if (!t->down) { t->down=1; t->x=CENTRE_X; t->y=CENTRE_Y; }
     }
 
-    if (t->relift) { /* lifted at the edge last sample: down again at the centre */
+    if (t->relift) { /* lifted at the edge last sample: down again across the pad */
         t->relift=0;
-        t->down=1; t->x=CENTRE_X; t->y=CENTRE_Y;
+        t->down=1; t->x=t->relift_x; t->y=t->relift_y;
     }
     if ((moved || click) && !t->down) { t->down=1; t->x=CENTRE_X; t->y=CENTRE_Y; }
     if (moved) {
@@ -51,6 +51,11 @@ void mouse_touch_update(MouseTouch *t, float dx, float dy, float scale, int clic
         t->moved_us=now_us;
         if (!t->gesture && !click &&
             (t->x<EDGE || t->x>MOUSE_TOUCH_W-1-EDGE || t->y<EDGE || t->y>MOUSE_TOUCH_H-1-EDGE)) {
+            /* Down again just inside the opposite edge on each axis it left by (the other axis
+             * keeps its place): the drag goes on with the whole pad ahead of it. */
+            const float lo=2.0f*EDGE, hi_x=MOUSE_TOUCH_W-1-2.0f*EDGE, hi_y=MOUSE_TOUCH_H-1-2.0f*EDGE;
+            t->relift_x=t->x<EDGE ? hi_x : t->x>MOUSE_TOUCH_W-1-EDGE ? lo : clampf(t->x,lo,hi_x);
+            t->relift_y=t->y<EDGE ? hi_y : t->y>MOUSE_TOUCH_H-1-EDGE ? lo : clampf(t->y,lo,hi_y);
             t->down=0; t->relift=1; /* this sample: no finger */
             return;
         }

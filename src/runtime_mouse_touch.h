@@ -3,8 +3,10 @@
  * picked-up object, pushing the touchpad in selects (and opens the Popit), two fingers spread or
  * pinch to resize and twist to rotate; sticker painting is drawn with a finger. The mouse drives
  * a virtual finger, so all of that is the game's own code, nothing fabricated:
- *   move     one finger slides (lifted after a moment still, put down again at the centre when
- *            it would leave the pad: the game's touch input is relative, so nothing jumps)
+ *   move     one finger slides (lifted after a moment still; put down again at the opposite edge
+ *            when it would leave the pad, so a long drag gets the pad's whole width or height
+ *            between the pauses a new touch makes: the game's touch input is relative, so
+ *            nothing jumps)
  *   left     the touchpad pushed in, while held
  *   wheel    a two-finger spread (up) or pinch (down)
  *   ctrl+wheel  a two-finger twist, counterclockwise (up) or clockwise (down)
@@ -24,7 +26,8 @@
 typedef struct {
     float x, y;            /* the finger, while down */
     int down;
-    int relift;            /* lifted at the edge this sample: down at the centre next time */
+    int relift;            /* lifted at the edge this sample: down at relift_x/y next time */
+    float relift_x, relift_y;
     uint64_t last_us, moved_us;
     int gesture;           /* 0 none, 1 pinch, 2 twist */
     float spacing, spacing_target, angle, angle_target;
