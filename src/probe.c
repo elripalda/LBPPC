@@ -875,6 +875,28 @@ static void render_res_install(void) {
             canvas[0]=(int32_t)lroundf(720.0f*aspect);
             memcpy(image+0x1060a04,canvas,4);
             printf("Runtime: 2D canvas widened to %dx%d\n",canvas[0],canvas[1]);
+            /* Some of the layout doesn't read the canvas but has the 1280-wide screen's centre (640) or right edge
+               built in: the loading screen's text, button prompts. They move to the wide canvas's.
+               LBPPC_UI_CENTRE_FIX=0 leaves them (diagnostics). */
+            const char *fix=getenv("LBPPC_UI_CENTRE_FIX");
+            static const struct { uint32_t at; float value; } fixed[]={
+                {0xe675c0,640.0f},  /* the screen's centre, returned by 0x27eca0 */
+                {0xe8f668,640.0f},  /* a 1200-wide text box's centre (0x50879d) */
+                {0xe90394,640.0f},  /* 0x513298 and three more */
+                {0xe903b8,1280.0f}, /* 0x513831 */
+                {0xe90448,640.0f},  /* 0x5192c1 */
+                {0xe9046c,640.0f},  /* 0x5197a1 */
+            };
+            int ok=1;
+            for (size_t i=0;i<sizeof(fixed)/sizeof(*fixed);++i) if (memcmp(image+fixed[i].at,&fixed[i].value,4)) ok=0;
+            if (!ok) fprintf(stderr,"2D canvas: unexpected game data, centred layout not moved\n");
+            else if (!(fix && fix[0]=='0')) {
+                const float wide=(float)canvas[0];
+                for (size_t i=0;i<sizeof(fixed)/sizeof(*fixed);++i) {
+                    const float v=fixed[i].value*wide/1280.0f;
+                    memcpy(image+fixed[i].at,&v,4);
+                }
+            }
         }
     }
     region=(uint32_t)grown;
