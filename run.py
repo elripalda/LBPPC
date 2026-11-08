@@ -68,6 +68,35 @@ def system_summary():
             f'{os.cpu_count()} threads; {ram} RAM\n')
 
 
+KEY_NAMES = {'space': 'SPACE', 'lshift': 'SHIFT', 'rshift': 'SHIFT', 'lctrl': 'CTRL', 'rctrl': 'CTRL',
+             'lalt': 'ALT', 'ralt': 'ALT', 'enter': 'ENTER', 'backspace': 'BKSP', 'tab': 'TAB', 'escape': 'ESC',
+             'up': 'UP', 'down': 'DOWN', 'left': 'LEFT', 'right': 'RIGHT', 'leftbutton': 'LMB',
+             'rightbutton': 'RMB', 'middlebutton': 'MMB', 'sidebuttonback': 'M4', 'sidebuttonforward': 'M5'}
+MOUSE_KEYS = {'leftbutton', 'rightbutton', 'middlebutton', 'sidebuttonback', 'sidebuttonforward'}
+
+
+def key_labels(input_ini):
+    """LBPPC_KEY_LABELS for the keyboard button prompts (key_prompts.cpp): each face button's first keyboard key
+    in input.ini, or its first mouse button, as a short label: "cross=SPACE;square=E;..."."""
+    keys = {}
+    try:
+        lines = input_ini.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return ''
+    for line in lines:
+        button, sep, key = (part.strip().lower() for part in line.partition('='))
+        if not sep or button not in ('cross', 'circle', 'square', 'triangle') or key == button:
+            continue
+        keys.setdefault(button, []).append(key)
+    labels = []
+    for button, bound in keys.items():
+        key = next((k for k in bound if k not in MOUSE_KEYS), bound[0])
+        label = KEY_NAMES.get(key, key.upper().removeprefix('KP'))
+        if label.isascii() and len(label) <= 5:
+            labels.append(f'{button}={label}')
+    return ';'.join(labels)
+
+
 def main(argv):
     if not argv or argv[0].startswith('-'):
         sys.exit(__doc__)
@@ -119,6 +148,10 @@ def main(argv):
     # Climbing teleports (temporary): optimizations switched off while the game runs, by writing their mask
     # (gpu/shim/bbport_toggles.h, src/runtime_memory.c) to user/toggles.txt; read 4 times a second.
     env.setdefault('BB_TOGGLE_FILE', str(user / 'toggles.txt'))
+    # LBPPC_KEY_PROMPTS=1 (unfinished, off; key_prompts.h): the face button icons show the keys bound to them in
+    # input.ini.
+    if env.get('LBPPC_KEY_PROMPTS') == '1':
+        env.setdefault('LBPPC_KEY_LABELS', key_labels(HERE / 'input.ini'))
     # Online: LBPPC_NP_USER=<name> signs in locally as that player (no PSN or shadNet account) and
     # LBPPC_SERVER=<url> sends the game's server requests (Sony's, now closed) to a custom server, such as a
     # Refresh instance.

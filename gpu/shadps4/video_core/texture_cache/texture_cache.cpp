@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <boost/container/small_vector.hpp>
 #include <xxhash.h>
 
@@ -19,6 +20,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/texture_cache/key_prompts.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -1015,6 +1017,58 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    // lbppc test: LBPPC_TEX_SKIP=WxH:format: textures of that size and format are not uploaded (they stay
+    // empty), to find which texture something on screen comes from.
+    static const char* tex_skip = std::getenv("LBPPC_TEX_SKIP");
+    if (tex_skip && !image.usage.render_target && !image.usage.depth_target) {
+        u32 w = 0, h = 0;
+        int fmt = -1;
+        if (std::sscanf(tex_skip, "%ux%u:%d", &w, &h, &fmt) == 3 && image.info.size.width == w &&
+            image.info.size.height == h && int(image.info.pixel_format) == fmt) {
+            image.flags &= ~ImageFlagBits::Dirty;
+            return;
+        }
+    }
+
+    // lbppc: keyboard button prompts (key_prompts.h): a button icon texture (128x128 BC3) gets a keycap
+    // with the bound key instead of its guest data.
+    if (KeyPrompts::Enabled() && !image.usage.render_target && !image.usage.depth_target &&
+        image.info.pixel_format == vk::Format::eBc3UnormBlock && image.info.size.width == 128 &&
+        image.info.size.height == 128 && num_layers == 1 &&
+        Core::Memory::Instance()->ClampRangeSize(VAddr(image.info.guest_address), image.info.guest_size) ==
+            image.info.guest_size) {
+        std::vector<u32> mip_offsets;
+        const auto data = KeyPrompts::Replacement(
+            XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size),
+            image.info.size.width, image.info.size.height, num_mips, mip_offsets);
+        if (!data.empty()) {
+            scheduler.EndRendering();
+            auto& stream = buffer_cache.GetStreamBuffer();
+            const auto [mapped, base] = stream.Map(data.size(), 16);
+            std::memcpy(mapped, data.data(), data.size());
+            stream.Commit();
+            boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+            for (u32 m = 0; m < num_mips; ++m) {
+                const u32 size = std::max(image.info.size.width >> m, 1u);
+                copies.push_back({
+                    .bufferOffset = base + mip_offsets[m],
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource{
+                        .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                        .mipLevel = m,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {size, size, 1},
+                });
+            }
+            runtime.UploadImage(&image, &stream, copies);
+            return;
+        }
+    }
+
     // lbppc test: LBPPC_TEX_LOG: each texture upload (not targets), and whether its guest memory is all zeros.
     static const bool tex_log = std::getenv("LBPPC_TEX_LOG") != nullptr;
     if (tex_log && !image.usage.render_target && !image.usage.depth_target &&
@@ -1042,6 +1096,41 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+
+    // lbppc test: LBPPC_KEY_DUMP_DIR=dir: each icon sheet's first mip as uploaded (untiled BC3), to
+    // <hash>.bc3 there, once, to see which quarter is which button (key_prompts.cpp's table).
+    static const char* key_dump = std::getenv("LBPPC_KEY_DUMP_DIR");
+    if (key_dump && !image.usage.render_target && image.info.pixel_format == vk::Format::eBc3UnormBlock &&
+        image.info.size.width == 128 && image.info.size.height == 128 &&
+        Core::Memory::Instance()->ClampRangeSize(VAddr(image.info.guest_address), image.info.guest_size) ==
+            image.info.guest_size) {
+        const u64 hash =
+            XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
+        static std::mutex dumped_mutex;
+        static std::unordered_set<u64> dumped;
+        std::scoped_lock lock{dumped_mutex};
+        if (dumped.insert(hash).second) {
+            constexpr u32 bytes = 128 * 128; // BC3: 16 bytes a 4x4 block
+            const auto download = runtime.GetStagingPool().Request(bytes, MemoryType::HostCached, 16, false);
+            const vk::BufferImageCopy copy = {
+                .bufferOffset = download.offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                     .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {128, 128, 1},
+            };
+            runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+            scheduler.Finish();
+            download.Invalidate();
+            const std::string path = fmt::format("{}/{:016x}.bc3", key_dump, hash);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(download.mapped, 1, bytes, f);
+                std::fclose(f);
+            }
+        }
+    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
