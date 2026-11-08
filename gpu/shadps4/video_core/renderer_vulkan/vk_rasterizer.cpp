@@ -2917,14 +2917,20 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;
     // BB_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
-    const bool debug_pass = scene_debug_frame && scene_started;
+    // lbppc: BB_SCENE_DEBUG_ALL=1 lists every pass of that frame (the UI's too), with its viewport.
+    static const bool debug_all = std::getenv("BB_SCENE_DEBUG_ALL") != nullptr;
+    const bool debug_pass = scene_debug_frame && (scene_started || debug_all);
     std::string why;
     if (debug_pass) {
-        why = fmt::format("pass vs {:08x} ps {:08x} mrt {:#x} samples {} raster_scaling {}:",
+        const auto& vp = regs.viewports[0];
+        why = fmt::format("pass vs {:08x} ps {:08x} mrt {:#x} samples {} raster_scaling {} "
+                          "viewport {:.0f}x{:.0f} at {:.0f},{:.0f} clip {}:",
                           pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                           key.mrt_mask ? pipeline->GetStage(Shader::SwStage::Fragment).pgm_hash
                                        : 0,
-                          key.mrt_mask, u32(key.num_samples), upscaler->RasterScaling());
+                          key.mrt_mask, u32(key.num_samples), upscaler->RasterScaling(),
+                          vp.xscale * 2, vp.yscale * 2, vp.xoffset, vp.yoffset,
+                          regs.IsClipDisabled() ? "off" : "on");
     }
     // Only this pass's attachments: slots past the mask's width keep earlier passes' targets,
     // often the G-buffer images the lighting passes sample (bound), which kept those native.
