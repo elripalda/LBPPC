@@ -783,7 +783,7 @@ class Launcher(tk.Tk):
         else:
             env.update(BB_LOW_LATENCY=self.settings['latency'], BB_VBLANK_HZ='0', BB_FPS_LIMIT='30')
         for name in ('LBPPC_NP_USER', 'LBPPC_SERVER', 'BB_SHADNET_NPID', 'BB_SHADNET_PASSWORD', 'BB_SHADNET_SERVER',
-                     'LBPPC_JOIN_ALLOW', 'BB_SHADNET_WEBAPI'):
+                     'LBPPC_JOIN_ALLOW', 'BB_SHADNET_WEBAPI', 'BB_SHADNET_TLS'):
             env.pop(name, None)
         if self.settings['online']:
             name, password = self.settings['online_name'], self.settings['password']
@@ -793,8 +793,11 @@ class Launcher(tk.Tk):
             except online_accounts.AccountError as error:
                 self.set_state(f'Online: {error}', ERROR)
                 return
+            host, port, tls = online_accounts.shadnet_address(servers['shadnet'])
             env.update(LBPPC_SERVER=servers['refresh'], BB_SHADNET_NPID=name, BB_SHADNET_PASSWORD=password,
-                       BB_SHADNET_SERVER=servers['shadnet'], BB_SHADNET_WEBAPI=servers['webapi'])
+                       BB_SHADNET_SERVER=f'{host}:{port}', BB_SHADNET_WEBAPI=servers['webapi'])
+            if tls:
+                env['BB_SHADNET_TLS'] = '1'
         for key, variable, _title, _hint, _on in DIAGNOSTICS:
             env[variable] = '1' if self.settings['diagnostics'].get(key) else '0'
         env['PYTHONUNBUFFERED'] = '1'

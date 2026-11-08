@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import socket
+import ssl
 import struct
 import urllib.error
 import urllib.parse
@@ -65,13 +66,34 @@ def _read_packet(sock):
     return kind, command, packet_id, read(total - _HEADER)
 
 
+def shadnet_address(server):
+    """A shadNet address, "host[:port]" or "tls://host[:port]" (through the server's TLS proxy), as
+    (host, port, tls)."""
+    text = server.strip()
+    tls = text.lower().startswith('tls://')
+    host, _, port = text[6:].partition(':') if tls else text.partition(':')
+    return host, int(port or 31313), tls
+
+
+def _shadnet_connect(server):
+    """A connection to shadNet; over TLS the certificate must be trusted by the system and name the host."""
+    host, port, tls = shadnet_address(server)
+    sock = socket.create_connection((host, port), timeout=10)
+    if not tls:
+        return sock
+    try:
+        return ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except BaseException:
+        sock.close()
+        raise
+
+
 def create_shadnet_account(server, name, password, email):
-    """server: host[:port] (31313 by default)."""
-    host, _, port = server.strip().partition(':')
+    """server: host[:port] (31313 by default), or tls://host[:port]."""
     request = _proto_string(1, name) + _proto_string(2, password) + _proto_string(4, email)
     payload = struct.pack('<I', len(request)) + request
     try:
-        with socket.create_connection((host, int(port or 31313)), timeout=10) as sock:
+        with _shadnet_connect(server) as sock:
             kind, *_ = _read_packet(sock)  # the server's ServerInfo comes first
             if kind != _SERVER_INFO:
                 raise AccountError(f'{server} does not look like a shadNet server.')
@@ -138,9 +160,8 @@ class ShadnetSession:
 
     def __init__(self, server, name, password, client_version):
         self.server, self.name = server, name
-        host, _, port = server.strip().partition(':')
         try:
-            self.sock = socket.create_connection((host, int(port or 31313)), timeout=10)
+            self.sock = _shadnet_connect(server)
         except OSError as error:
             raise AccountError(f'Cannot reach the shadNet server {server}: {error}') from None
         self.next_id = 1
@@ -241,10 +262,10 @@ def create_refresh_account(server, name, password, email):
                            f'{settings.get("error", settings)}.')
 
 
-# The LBPPC server. Refresh and shadNet's web API are behind its HTTPS proxy; shadNet's own protocol (TCP 31313, and
-# UDP 31314 for matching) is not HTTP, so it is reached directly.
+# The LBPPC server. Refresh and shadNet's web API are behind its HTTPS proxy; shadNet's own protocol (TCP 31313) is
+# behind its TLS proxy, and UDP 31314 (matching) is reached directly.
 OFFICIAL_SERVER = 'play.lbppc.com'
-OFFICIAL = {'refresh': 'https://play.lbppc.com', 'shadnet': 'shadnet.lbppc.com:31313', 'webapi': 'https://api.lbppc.com'}
+OFFICIAL = {'refresh': 'https://play.lbppc.com', 'shadnet': 'tls://shadnet.lbppc.com:31313', 'webapi': 'https://api.lbppc.com'}
 
 
 def server_endpoints(server=OFFICIAL_SERVER):
