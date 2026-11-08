@@ -864,6 +864,19 @@ static void render_res_install(void) {
     if (aspect_bits!=0x3fe38e39) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
     const float aspect=(float)w/(float)h;
     memcpy(image+0x3fdbc3,&aspect,4);
+    /* The 2D layer's canvas (menus, button prompts, subtitles), 1280x720 at 0x1060a04/0x1060a08: its projection
+       (0x40ff8b) and the layout read it, so at the screen's aspect the layer widens instead of stretching. */
+    /* LBPPC_UI_STRETCH=1 keeps the stretched layer. */
+    const char *stretch=getenv("LBPPC_UI_STRETCH");
+    if (aspect>16.0f/9.0f+0.01f && !(stretch && stretch[0]=='1')) {
+        int32_t canvas[2]; memcpy(canvas,image+0x1060a04,8);
+        if (canvas[0]!=1280 || canvas[1]!=720) fprintf(stderr,"2D canvas: unexpected game data, not widened\n");
+        else {
+            canvas[0]=(int32_t)lroundf(720.0f*aspect);
+            memcpy(image+0x1060a04,canvas,4);
+            printf("Runtime: 2D canvas widened to %dx%d\n",canvas[0],canvas[1]);
+        }
+    }
     region=(uint32_t)grown;
     memcpy(image+0x15180,&region,4);
     const uint32_t pitch=w*4;
