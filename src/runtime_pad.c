@@ -558,10 +558,10 @@ static void sample_host(PadData *d) {
     const InputConfig *cfg=active_config();
     BbMouseInput mouse; bbgpu_mouse_take(&mouse); /* MOU-008: drains dx/dy; buttons/wheel persist */
     static HostState host; /* ~1 KB with the held-combo list: kept off the game thread's stack */
-    /* Mouse as the touchpad: its left button and wheel are the touchpad's, not their bindings'. */
+    /* Mouse as the touchpad: its left and middle buttons and wheel are the touchpad's, not their bindings'. */
     const int touch_mouse=mouse.captured && cfg->mouse.stick==3;
     host=(HostState){SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL, g,
-        mouse.captured ? mouse.buttons & (touch_mouse ? ~SDL_BUTTON_LMASK : ~0u) : 0,
+        mouse.captured ? mouse.buttons & (touch_mouse ? ~(SDL_BUTTON_LMASK|SDL_BUTTON_MMASK) : ~0u) : 0,
         mouse.captured && !touch_mouse ? mouse.wheel : 0, 0, 0, {0}, 0};
     host.back_combo=back_combo_wanted(g,cfg);
     host.back_down=host.back_combo && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK);
@@ -667,25 +667,35 @@ static void sample_host(PadData *d) {
 
     /* PC-02A: the mouse as a finger on the touchpad (runtime_mouse_touch.h), when no real finger is. */
     static MouseTouch mouse_touch;
-    static uint32_t last_wheel;
+    static MouseTouchOut touch;      /* the finger as of the last game frame */
+    static BbMouseFrame touch_frame; /* the mouse totals it was moved to */
+    static int touch_active;
     if (touch_mouse) {
-        /* The wheel bits are pulses: a step is a pulse starting. */
-        const uint32_t started=mouse.wheel & ~last_wheel;
-        const int steps=((started & 1u) ? 1 : 0)-((started & 2u) ? 1 : 0);
-        last_wheel=mouse.wheel;
-        const int ctrl=host.keys && (host.keys[SDL_SCANCODE_LCTRL] || host.keys[SDL_SCANCODE_RCTRL]);
-        MouseTouchOut touch;
-        mouse_touch_update(&mouse_touch,mouse.dx*input_mouse_scale_x(&cfg->mouse),mouse.dy*input_mouse_scale_y(&cfg->mouse),
-                           MOUSE_TOUCH_SCALE*cfg->mouse.speed,(mouse.buttons & SDL_BUTTON_LMASK)!=0,steps,ctrl,
-                           d->timestamp,&touch);
+        /* Left is Cross with the finger kept down: held, it keeps placing as Cross does (the
+         * touchpad pushed in is one tap to the game). Middle pushes the touchpad in. */
+        const int left=(mouse.buttons & SDL_BUTTON_LMASK)!=0, middle=(mouse.buttons & SDL_BUTTON_MMASK)!=0;
+        /* The finger moves once a game frame, by the mouse's motion and wheel steps between two
+         * flips (bbgpu_mouse_frame): moved at every read, frames got 2 or 3 reads' worth. */
+        BbMouseFrame frame; bbgpu_mouse_frame(&frame);
+        if (!touch_active) { touch_frame=frame; touch_active=1; }
+        if (frame.frame!=touch_frame.frame) {
+            const float dx=(float)(frame.dx-touch_frame.dx), dy=(float)(frame.dy-touch_frame.dy);
+            const int steps=frame.wheel-touch_frame.wheel;
+            touch_frame=frame;
+            const int ctrl=host.keys && (host.keys[SDL_SCANCODE_LCTRL] || host.keys[SDL_SCANCODE_RCTRL]);
+            mouse_touch_update(&mouse_touch,dx*input_mouse_scale_x(&cfg->mouse),dy*input_mouse_scale_y(&cfg->mouse),
+                               MOUSE_TOUCH_SCALE*cfg->mouse.speed,left || middle,steps,ctrl,d->timestamp,&touch);
+        }
         if (!d->touch_count) {
             d->touch_count=(uint8_t)touch.count;
             for (int i=0;i<touch.count;++i) d->touches[i]=(PadTouch){.x=touch.x[i],.y=touch.y[i],.id=touch.id[i]};
         }
-        if (touch.click) d->buttons|=BTN_TOUCHPAD;
+        if (left) d->buttons|=BTN_CROSS;
+        if (middle) d->buttons|=BTN_TOUCHPAD;
     } else {
         mouse_touch_reset(&mouse_touch);
-        last_wheel=0;
+        memset(&touch,0,sizeof(touch));
+        touch_active=0;
     }
 
     /* PC-03: motion. The sensors, then the virtual tilt (tilt_* bindings, or BB_PAD_FILE's

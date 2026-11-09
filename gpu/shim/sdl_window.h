@@ -58,6 +58,14 @@ public:
     /// wheel to zero (captured is left as-is: it reflects the window's current state, not
     /// something to drain). Safe to call with no window yet (default-constructed MouseInput).
     void TakeMouseInput(MouseInput& out);
+    /// bbgpu_mouse_frame: the running totals, copied at each game flip (SnapshotMouseFrame).
+    struct MouseTotals {
+        double dx = 0.0, dy = 0.0;
+        int32_t wheel = 0;
+        uint32_t frame = 0;
+    };
+    void SnapshotMouseFrame();
+    MouseTotals MouseFrame();
     /// Any thread, after loading input.ini (initial load or F8 reload): whether mouse-to-
     /// joystick mode exists at all (MOU-001) and the current toggle/reload hotkey scancodes
     /// (SDL_SCANCODE_UNKNOWN = none bound). Takes effect on the next PollEvents.
@@ -84,6 +92,7 @@ private:
     // the window thread (PollEvents and the constructor), so it needs no lock.
     std::mutex mouse_mutex;
     MouseInput mouse;
+    MouseTotals mouse_totals, mouse_frame; // under mouse_mutex: running, and as of the last flip
     std::atomic<bool> mouse_mode_available{false};  // MOU-001: mouse_to_joystick present in input.ini
     std::atomic<bool> mouse_mode_on{false};         // toggled by the hotkey (MOU-002); not saved
     std::atomic<bool> input_configured_once{false}; // MOU-002: turn mouse_mode_on on only on the

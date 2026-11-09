@@ -2,8 +2,14 @@
 #include <assert.h>
 #include <unistd.h>
 #include "../src/runtime_pad.c"
+#ifdef _WIN32
+static int setenv(const char *name, const char *value, int overwrite) { (void)overwrite; return _putenv_s(name,value); }
+static int unsetenv(const char *name) { return _putenv_s(name,""); }
+#endif
 
 static int capture;
+void bbgpu_input_note_read(void) {}
+void bbgpu_mouse_frame(BbMouseFrame *out) { memset(out,0,sizeof(*out)); }
 int bbgpu_overlay_captures_input(void) { return capture; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;

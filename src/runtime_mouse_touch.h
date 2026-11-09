@@ -7,7 +7,9 @@
  *            when it would leave the pad, so a long drag gets the pad's whole width or height
  *            between the pauses a new touch makes: the game's touch input is relative, so
  *            nothing jumps)
- *   left     the touchpad pushed in, while held
+ *   left     Cross, with the finger kept down, while held: it keeps placing as Cross does
+ *            (runtime_pad.c; the touchpad pushed in is a single tap to the game)
+ *   middle   the touchpad pushed in, while held
  *   wheel    a two-finger spread (up) or pinch (down)
  *   ctrl+wheel  a two-finger twist, counterclockwise (up) or clockwise (down)
  * Touchpad units: x 0..1919, y 0..942 (scePadGetControllerInformation's resolution). */
@@ -22,8 +24,9 @@
 #define MOUSE_TOUCH_PINCH_STEP 90.0f /* finger spacing per wheel step */
 #define MOUSE_TOUCH_TWIST_STEP 0.2618f /* 15 degrees per wheel step */
 #define MOUSE_TOUCH_GESTURE_US 200000 /* a gesture ends this long after its last step is done */
-#define MOUSE_TOUCH_RELIFT_US 50000   /* a finger lifted at the edge stays up this long: longer than a game
-                                         frame, so a game reading the pad more often than it draws sees it */
+#define MOUSE_TOUCH_RELIFT_US 20000   /* a finger lifted at the edge stays up this long: runtime_pad.c moves the
+                                         finger once a game frame, so this is one frame up, which the game sees;
+                                         each frame up is a frame the cursor stands still */
 
 typedef struct {
     float x, y;            /* the finger, while down */

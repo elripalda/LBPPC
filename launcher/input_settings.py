@@ -18,6 +18,9 @@ KEY_NAMES = (
     ['kpperiod', 'kpcomma', 'kpslash', 'kpasterisk', 'kpminus', 'kpplus', 'kpequals', 'kpenter',
      'grave', 'minus', 'equals', 'lbracket', 'rbracket', 'backslash', 'semicolon', 'apostrophe',
      'comma', 'period', 'slash', 'printscreen', 'scrolllock', 'pausebreak'])
+# The mouse isn't offered yet: as the touchpad it stutters (the finger runs out of pad), and the buttons do nothing
+# without it. Off, the page has no mouse settings, mouse buttons aren't bound and input.ini is saved with the mouse off.
+MOUSE_SUPPORTED = False
 MOUSE_NAMES = ['leftbutton', 'middlebutton', 'rightbutton', 'sidebuttonback', 'sidebuttonforward',
                'mousewheelup', 'mousewheeldown', 'mousewheelleft', 'mousewheelright']
 # Controller inputs a button-like action can take: kCButtonNames, the triggers, and the half sticks.
@@ -222,6 +225,9 @@ class InputSettings:
                 self.pad[output].append(value)
             else:
                 self.other.append(line.strip())
+        if not MOUSE_SUPPORTED:
+            self.mouse_mode = 'off'
+            self.keys = {output: [key for key in keys if key not in MOUSE_NAMES] for output, keys in self.keys.items()}
 
     @classmethod
     def load(cls, path):
