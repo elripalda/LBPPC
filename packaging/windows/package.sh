@@ -34,7 +34,8 @@ done
 out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name LBPPC \
     --distpath out/pyi-dist --workpath out/pyi-work --specpath out/pyi-work \
     --paths "$(cygpath -w "$PWD/scripts")" "${hidden[@]}" \
-    --add-data "$(cygpath -w "$PWD/launcher/fonts");fonts" "$(cygpath -w "$PWD/launcher/lbppc_launcher.py")"
+    --add-data "$(cygpath -w "$PWD/launcher/fonts");fonts" --add-data "$(cygpath -w "$PWD/launcher/assets");assets" \
+    --icon "$(cygpath -w "$PWD/launcher/assets/lbppc.ico")" "$(cygpath -w "$PWD/launcher/lbppc_launcher.py")"
 
 dest=out/stage/LBPPC
 rm -rf -- out/stage
@@ -59,6 +60,7 @@ fi
 cp -r scripts "$dest/"
 cp tools/shadnet_account.py tools/refresh_account.py "$dest/tools/"
 cp run.py input.ini LICENSE LICENSE-GPL-2.0 README.md "$dest/"
+mkdir -p "$dest/assets" && cp launcher/assets/logo-128.rgba "$dest/assets/"  # the game window's icon (run.py)
 cp docs/online.md docs/troubleshooting.md "$dest/docs/"
 cp gpu/third_party/wepoll/LICENSE "$dest/licenses/wepoll-LICENSE.txt"
 cp gpu/third_party/httplib/LICENSE "$dest/licenses/cpp-httplib-LICENSE.txt"

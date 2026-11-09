@@ -24,7 +24,7 @@ from tkinter import filedialog, font as tkfont, ttk
 
 from PIL import Image, ImageTk
 
-VERSION = '0.0.1'
+VERSION = '0.1.0'
 # Packaged (frozen with PyInstaller): LBPPC.exe sits in the package folder and runs run.py itself (--script).
 FROZEN = getattr(sys, 'frozen', False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
@@ -114,7 +114,7 @@ def read_sfo(path):
 def check_game(folder):
     """(ok, description) of a game folder."""
     if not folder:
-        return False, 'Choose the folder of your game dump (the one holding eboot.bin).'
+        return False, "Choose your game's folder (the one holding eboot.bin)."
     game = Path(folder)
     if not (game / 'eboot.bin').is_file():
         return False, 'No eboot.bin in this folder.'
@@ -296,7 +296,7 @@ class Tab:
     POP_OUT = ((1.04, 'blue'), (1.0, 'blue'))
     FRAME_MS = 35
 
-    def __init__(self, scene, text, command, x, y, anchor='w', size=15, pad=(18, 10), tilt=0.0, weight='SemiBold'):
+    def __init__(self, scene, text, command, x, y, anchor='w', size=15, pad=(12, 9), tilt=0.0, weight='Bold'):
         self.scene, self.command, self.enabled, self.hovered = scene, command, True, False
         Tab.count += 1
         self.key = f'tab{Tab.count}'
@@ -506,6 +506,7 @@ class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('LBPPC')
+        self.set_icon()
         self.configure(bg=BG)
         self.resizable(False, False)
         self.settings = load_settings()
@@ -525,13 +526,13 @@ class Launcher(tk.Tk):
         # The pages: Game (the panels built above), Controls and Debug, switched by the tabs on the banner.
         tab_y = TITLE_HEIGHT + BANNER_HEIGHT - 16
         self.page_tabs = {'debug': Tab(self.scene, 'Debug', lambda: self.show_page('debug'),
-                                       self.PANEL_X + self.PANEL_W - 4, tab_y, 'e', size=14, tilt=-2)}
+                                       self.PANEL_X + self.PANEL_W - 4, tab_y, 'e', size=14, tilt=-3)}
         self.page_tabs['controls'] = Tab(self.scene, 'Controls', lambda: self.show_page('controls'),
                                          self.page_tabs['debug'].cx - self.page_tabs['debug'].width / 2 - 14,
-                                         tab_y, 'e', size=14, tilt=2)
+                                         tab_y, 'e', size=14, tilt=3)
         self.page_tabs['game'] = Tab(self.scene, 'Game', lambda: self.show_page('game'),
                                      self.page_tabs['controls'].cx - self.page_tabs['controls'].width / 2 - 14,
-                                     tab_y, 'e', size=14, tilt=-2)
+                                     tab_y, 'e', size=14, tilt=-3)
         self.show_page('game')
         self.refresh_game()
         self.protocol('WM_DELETE_WINDOW', self.close)
@@ -558,7 +559,7 @@ class Launcher(tk.Tk):
         entry.bind('<FocusOut>', lambda _e: self.refresh_game())
         entry.bind('<Return>', lambda _e: self.refresh_game())
         scene.widget(entry, x + 20, y + 46, w - 180, 30)
-        Tab(scene, 'Browse...', self.browse, x + w - 20, y + 61, 'e', size=14, tilt=2)
+        Tab(scene, 'Browse...', self.browse, x + w - 20, y + 61, 'e', size=14, tilt=3)
         self.status_tag_y = y + 84
 
         # Graphics: the four choices in two columns
@@ -596,7 +597,7 @@ class Launcher(tk.Tk):
             scene.widget(entry, cx, y + 98, half, 30)
         self.text(x + 22, y + 134, '3 to 16 letters, digits, - or _, and a password of 8 or more characters. '
                                    'Only your friends can join your game.')
-        self.account_button = Tab(scene, 'Create account', self.create_account, x + 20, y + 174, size=15, tilt=-2)
+        self.account_button = Tab(scene, 'Create account', self.create_account, x + 20, y + 174, size=15, tilt=-3)
         self.account_status = self.text(self.account_button.right + 22, y + 174, 'New here? Choose a name and '
                                         'password, then Create account.', anchor='w', width=560)
 
@@ -604,10 +605,10 @@ class Launcher(tk.Tk):
 
         # The bar: Play (the lime tab, as LBP3's selected item), Stop, the state, the links
         y = self.BAR_Y
-        self.play_button = Tab(scene, 'Play', self.play, x + 6, y + 30, size=30, pad=(46, 16), tilt=-3,
+        self.play_button = Tab(scene, 'Play', self.play, x + 6, y + 30, size=30, pad=(30, 16), tilt=-4,
                                weight='Bold')
-        self.stop_button = Tab(scene, 'Stop', self.stop, self.play_button.right + 24, y + 30, size=17, pad=(22, 11),
-                               tilt=2)
+        self.stop_button = Tab(scene, 'Stop', self.stop, self.play_button.right + 24, y + 30, size=17, pad=(15, 10),
+                               tilt=3)
         self.stop_button.set_enabled(False)
         dot = self.stop_button.right + 26
         self.state_dot = scene.create_oval(dot, y + 24, dot + 12, y + 36, fill=MUTED, outline='')
@@ -783,8 +784,22 @@ class Launcher(tk.Tk):
         else:
             env.update(BB_LOW_LATENCY=self.settings['latency'], BB_VBLANK_HZ='0', BB_FPS_LIMIT='30')
         for name in ('LBPPC_NP_USER', 'LBPPC_SERVER', 'BB_SHADNET_NPID', 'BB_SHADNET_PASSWORD', 'BB_SHADNET_SERVER',
-                     'LBPPC_JOIN_ALLOW', 'BB_SHADNET_WEBAPI', 'BB_SHADNET_TLS'):
+                     'LBPPC_JOIN_ALLOW', 'BB_SHADNET_WEBAPI', 'BB_SHADNET_TLS', 'BB_USER_NAME'):
             env.pop(name, None)
+        # The mouse isn't offered yet (input_settings.MOUSE_SUPPORTED): input.ini from an earlier build that turned it
+        # on is saved again with it off.
+        try:
+            mouse_on = re.search(r'(?m)^\s*mouse_to_joystick\s*=', INPUT_INI.read_text(encoding='utf-8'))
+        except OSError:
+            mouse_on = None
+        if mouse_on and not input_settings.MOUSE_SUPPORTED:
+            try:
+                input_settings.InputSettings.load(INPUT_INI).save(INPUT_INI)
+            except OSError as error:
+                self.append([f'Launcher: input.ini could not be saved with the mouse off: {error}'])
+        # The player's name in the game (pressing the right stick shows it), offline too.
+        if re.fullmatch(online_accounts.NAME_PATTERN, self.settings['online_name']):
+            env['BB_USER_NAME'] = self.settings['online_name']
         if self.settings['online']:
             name, password = self.settings['online_name'], self.settings['password']
             try:
@@ -875,6 +890,22 @@ class Launcher(tk.Tk):
             if os.name == 'nt':
                 subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.process.pid)], capture_output=True)
             self.process.terminate()
+
+    def set_icon(self):
+        """The logo as the window's and taskbar button's icon. Its own app ID keeps the button from grouping under
+        Python's when run from source."""
+        if os.name == 'nt':
+            import ctypes
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('LBPPC.Launcher')
+            except (AttributeError, OSError):
+                pass
+            if (theme.ASSETS / 'lbppc.ico').is_file():
+                self.iconbitmap(default=str(theme.ASSETS / 'lbppc.ico'))
+        globe = theme.logo_image(64)
+        if globe:
+            self._icon = ImageTk.PhotoImage(globe)  # kept: Tk does not hold its own reference
+            self.iconphoto(True, self._icon)
 
     def close(self):
         self.stop()
@@ -1051,11 +1082,42 @@ class ControlsPage:
         self.items = []         # the page's canvas items, hidden with the page
         scene = self.scene
         before = set(scene.find_all())
-        mouse_h = 176
+        mouse_h = 176 if input_settings.MOUSE_SUPPORTED else -12
         half = (w - 40) // 2 - 10
         right = x + 20 + half + 20
+        if input_settings.MOUSE_SUPPORTED:
+            self.mouse_panel(x, y, w, mouse_h, half, right)
 
-        # Mouse
+        # Buttons
+        by = y + mouse_h + 12
+        bh = h - mouse_h - 12
+        scene.image('panel:buttons', theme.panel(w, bh, 'Buttons'), x, by)
+        self.reset_link = launcher.text(x + w - 20, by + 21, 'Reset to defaults', ('Segoe UI Semibold', 10),
+                                        theme.hex_colour((200, 225, 150)), 'e')
+        scene.tag_bind(self.reset_link, '<Button-1>', lambda _e: self.reset())
+        scene.tag_bind(self.reset_link, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
+        scene.tag_bind(self.reset_link, '<Leave>', lambda _e: scene.configure(cursor=''))
+        mouse = input_settings.MOUSE_SUPPORTED
+        for column, title in zip((x + 14 + 12,) + tuple(x + 14 + c for c in self.COLUMNS),
+                                 ('Game button', 'Key or mouse' if mouse else 'Key', 'Second key', 'Controller')):
+            launcher.text(column, by + 46, title, ('Segoe UI Semibold', 9), MUTED)
+        self.status = launcher.text(x + 20, by + bh - 22, f'Click a key, then press the new key'
+                                    f'{" or mouse button" if mouse else ""}. Right-click a key to clear it.',
+                                    HINT_FONT, MUTED, 'w', width=w - 40)
+        self.list = Scene(launcher, w - 28, bh - 104)
+        self.list.configure(bg=FriendsPanel.LIST_BG)
+        scene.widget(self.list, x + 14, by + 66, w - 28, bh - 104)
+        self.list.bind('<Enter>', lambda _e: self.list.bind_all('<MouseWheel>', self.wheel))
+        self.list.bind('<Leave>', lambda _e: self.list.unbind_all('<MouseWheel>'))
+        self.pad_boxes = {}
+        self.draw_list()
+        self.update_mouse_hint()
+        self.items = [item for item in scene.find_all() if item not in before]
+
+    # Mouse
+
+    def mouse_panel(self, x, y, w, mouse_h, half, right):
+        launcher, scene = self.launcher, self.scene
         scene.image('panel:mouse', theme.panel(w, mouse_h, 'Mouse'), x, y)
         launcher.label('label:mouse_mode', x + 20, y + 44, 'Mouse in the game')
         names = [name for _value, name in input_settings.MOUSE_MODES]
@@ -1076,33 +1138,9 @@ class ControlsPage:
         launcher.label('label:invert', right + 30, y + 131, 'Invert up and down')
         self.mouse_hint = launcher.text(right + 2, y + 156, '', HINT_FONT, MUTED, 'nw', width=half)
 
-        # Buttons
-        by = y + mouse_h + 12
-        bh = h - mouse_h - 12
-        scene.image('panel:buttons', theme.panel(w, bh, 'Buttons'), x, by)
-        self.reset_link = launcher.text(x + w - 20, by + 21, 'Reset to defaults', ('Segoe UI Semibold', 10),
-                                        theme.hex_colour((200, 225, 150)), 'e')
-        scene.tag_bind(self.reset_link, '<Button-1>', lambda _e: self.reset())
-        scene.tag_bind(self.reset_link, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
-        scene.tag_bind(self.reset_link, '<Leave>', lambda _e: scene.configure(cursor=''))
-        for column, title in zip((x + 14 + 12,) + tuple(x + 14 + c for c in self.COLUMNS),
-                                 ('Game button', 'Key or mouse', 'Second key', 'Controller')):
-            launcher.text(column, by + 46, title, ('Segoe UI Semibold', 9), MUTED)
-        self.status = launcher.text(x + 20, by + bh - 22, 'Click a key, then press the new key or mouse button. '
-                                    'Right-click a key to clear it.', HINT_FONT, MUTED, 'w', width=w - 40)
-        self.list = Scene(launcher, w - 28, bh - 104)
-        self.list.configure(bg=FriendsPanel.LIST_BG)
-        scene.widget(self.list, x + 14, by + 66, w - 28, bh - 104)
-        self.list.bind('<Enter>', lambda _e: self.list.bind_all('<MouseWheel>', self.wheel))
-        self.list.bind('<Leave>', lambda _e: self.list.unbind_all('<MouseWheel>'))
-        self.pad_boxes = {}
-        self.draw_list()
-        self.update_mouse_hint()
-        self.items = [item for item in scene.find_all() if item not in before]
-
-    # Mouse
-
     def update_mouse_hint(self):
+        if not input_settings.MOUSE_SUPPORTED:
+            return
         mode = self.model.mouse_mode
         text = {'off': 'The game does not use the mouse.',
                 'touchpad': 'F7 captures it. Wheel resizes, Ctrl + wheel rotates.'}.get(
@@ -1151,12 +1189,13 @@ class ControlsPage:
             return
         self.cancel_reset()
         self.model = input_settings.InputSettings()
-        self.mouse_mode.set(dict(input_settings.MOUSE_MODES)[self.model.mouse_mode])
-        self.speed.value, self.vertical.value = self.model.speed, self.model.vertical
-        self.speed.draw()
-        self.vertical.draw()
-        self.scene.image('invert:box', theme.checkbox(self.model.invert_y), *self.invert_at)
-        self.update_mouse_hint()
+        if input_settings.MOUSE_SUPPORTED:
+            self.mouse_mode.set(dict(input_settings.MOUSE_MODES)[self.model.mouse_mode])
+            self.speed.value, self.vertical.value = self.model.speed, self.model.vertical
+            self.speed.draw()
+            self.vertical.draw()
+            self.scene.image('invert:box', theme.checkbox(self.model.invert_y), *self.invert_at)
+            self.update_mouse_hint()
         self.draw_list()
         self.save('Controls reset to the defaults.')
 
@@ -1278,13 +1317,14 @@ class ControlsPage:
         return 'break'
 
     def mouse_pressed(self, event):
-        name = TK_MOUSE.get(event.num)
+        name = TK_MOUSE.get(event.num) if input_settings.MOUSE_SUPPORTED else None
         if name:
             self.assign(name)
         return 'break'
 
     def wheel_pressed(self, event):
-        self.assign('mousewheelup' if event.delta > 0 else 'mousewheeldown')
+        if input_settings.MOUSE_SUPPORTED:
+            self.assign('mousewheelup' if event.delta > 0 else 'mousewheeldown')
         return 'break'
 
     def assign(self, name):
@@ -1324,7 +1364,7 @@ class FriendsPanel:
         self.tabs, self.confirm = [], None
         self.scene.image('panel:friends', theme.panel(w, h, 'Friends'), x, y)
         self.add_name = tk.StringVar()
-        self.add_button = Tab(self.scene, 'Add', self.send_request, x + w - 18, y + 61, 'e', size=14, tilt=2)
+        self.add_button = Tab(self.scene, 'Add', self.send_request, x + w - 18, y + 61, 'e', size=14, tilt=3)
         entry = field(launcher, self.add_name)
         entry.bind('<Return>', lambda _e: self.send_request())
         self.scene.widget(entry, x + 20, y + 46, w - 40 - self.add_button.width - 14, 30)
@@ -1499,7 +1539,7 @@ class FriendsPanel:
                 right = w - 14
                 if key == 'received':
                     accept = Tab(view, 'Accept', lambda o=name: self.run(lambda s: s.add(o), f'You and {o} are friends.'),
-                                 right, cy, 'e', size=12, pad=(12, 6))
+                                 right, cy, 'e', size=12, pad=(9, 7))
                     self.tabs.append(accept)
                     self.link(accept.cx - accept.width / 2 - 12, cy, 'Decline',
                               lambda o=name: self.run(lambda s: s.remove(o), f'Declined {o}.'))

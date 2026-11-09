@@ -12,6 +12,16 @@ import sys
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 FONTS = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'fonts'
+# The logo (the stitched globe): logo.png, and lbppc.ico for the window's and LBPPC.exe's icon.
+ASSETS = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'assets'
+
+
+def logo_image(size):
+    """The logo, size pixels square, or None when the file is missing."""
+    try:
+        return Image.open(ASSETS / 'logo.png').convert('RGBA').resize((size, size), Image.LANCZOS)
+    except OSError:
+        return None
 S = 2  # drawing scale
 
 NIGHT = (22, 26, 42)
@@ -19,8 +29,8 @@ PANEL_FILL = (14, 18, 30, 210)
 FIELD = '#242a3e'
 FIELD_EDGE = '#4e5a78'
 LIME = (160, 210, 70)
-BLUE = (44, 108, 214)
-GREEN = (140, 196, 58)
+BLUE = (33, 99, 196)    # LBP3's menu blue and green (its Pod menu on PS4)
+GREEN = (135, 177, 42)
 GREY = (96, 104, 124)
 RED = (214, 72, 62)
 ORANGE = (242, 140, 40)
@@ -157,32 +167,48 @@ def panel(w, h, title, radius=20):
     return finish(img)
 
 
-def handcut_mask(w, h, seed, corner=0.30, jitter=0.16, bow=0.06):
-    """A hand-cut shape: four corners each moved a little, the edges bowed a little, the corners rounded (blurred
-    and cut at half). The same seed gives the same shape."""
+def handcut_mask(w, h, seed, corner=0.12, jitter=0.03, puff=0.05):
+    """LBP3's menu shape (its Pod menu on PS4): a rounded rectangle puffed out, every edge curving outwards from its
+    corners to its middle (top and bottom by `puff` x height, the sides by most of that), the corners rounded evenly
+    (radius about `corner` x height) and moved by up to `jitter` x height, so no two are quite alike. Drawn at 4x,
+    the corners rounded by blurring and cutting at half (the gentle curves keep their shape), and scaled down for
+    clean edges. The shape fills w x h; the same seed gives the same shape. Returns (mask, the margin around it)."""
     rng = random.Random(seed)
-    jx, jy = w * jitter * 0.35, h * jitter
-    corners = [(rng.uniform(0, jx), rng.uniform(0, jy)), (w - rng.uniform(0, jx), rng.uniform(0, jy)),
-               (w - rng.uniform(0, jx), h - rng.uniform(0, jy)), (rng.uniform(0, jx), h - rng.uniform(0, jy))]
+    k = 4
+    r = h * corner
+    tb, lr = puff * h, puff * h * 0.7  # how far the middle of each edge stands out past its corners
+
+    def nudge():
+        return rng.uniform(0, jitter * h)
+
+    # Clockwise from top left: the corners in by the puff (it brings each edge's middle back out to w x h), then
+    # nudged.
+    left, right, top, bottom = lr, w - lr, tb, h - tb
+    corners = [(left + nudge(), top + nudge()), (right - nudge(), top + nudge()),
+               (right - nudge(), bottom - nudge()), (left + nudge(), bottom - nudge())]
     pts = []
     for i in range(4):
         (x0, y0), (x1, y1) = corners[i], corners[(i + 1) % 4]
-        nx, ny = y1 - y0, x0 - x1
-        length = math.hypot(nx, ny) or 1
-        b = rng.uniform(-bow, bow) * h
-        for t in (0, 0.33, 0.66):
-            k = math.sin(math.pi * t) * b
-            pts.append((x0 + (x1 - x0) * t + nx / length * k, y0 + (y1 - y0) * t + ny / length * k))
+        length = math.hypot(x1 - x0, y1 - y0) or 1
+        nx, ny = (y1 - y0) / length, (x0 - x1) / length  # outwards, for a clockwise outline with y down
+        bulge = tb if i % 2 == 0 else lr
+        steps = 24
+        for j in range(steps):
+            t = j / steps
+            out = math.sin(math.pi * t) * bulge
+            pts.append((x0 + (x1 - x0) * t + nx * out, y0 + (y1 - y0) * t + ny * out))
     pad = int(h * 0.4)
-    mask = Image.new('L', (w + 2 * pad, h + 2 * pad), 0)
-    ImageDraw.Draw(mask).polygon([(x + pad, y + pad) for x, y in pts], fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(h * corner * 0.5)).point(lambda v: 255 if v > 128 else 0)
-    return mask.filter(ImageFilter.GaussianBlur(1.2)), pad
+    big = Image.new('L', ((w + 2 * pad) * k, (h + 2 * pad) * k), 0)
+    d = ImageDraw.Draw(big)
+    pts = [((x + pad) * k, (y + pad) * k) for x, y in pts]
+    d.polygon(pts, fill=255)
+    big = big.filter(ImageFilter.GaussianBlur(r * k * 0.55)).point(lambda v: 255 if v > 128 else 0)
+    return big.resize((w + 2 * pad, h + 2 * pad), Image.LANCZOS), pad
 
 
-def tab(text, fill, size=15, pad=(16, 7), tilt=0.0, weight='SemiBold', fg=(255, 255, 255), scale=1.0):
-    """LBP3's menu tab, the launcher's button: one flat colour in a hand-cut shape, bold white text, a small tilt,
-    a soft shadow; `scale` draws it larger (the hover pop). The same text gives the same shape at every scale.
+def tab(text, fill, size=15, pad=(12, 9), tilt=0.0, weight='Bold', fg=(255, 255, 255), scale=1.0):
+    """LBP3's menu tab, the launcher's button: one flat colour in its shape (handcut_mask), bold white text, a tilt,
+    a faint shadow; `scale` draws it larger (the hover pop). The same text gives the same shape at every scale.
     The text is centred on its capitals' height, not its full outline: a descender ("y" in Play) would push it up.
     Returns (image, the shadow margin around the shape in pixels)."""
     f = font(max(1, round(size * scale)), weight)
@@ -197,7 +223,7 @@ def tab(text, fill, size=15, pad=(16, 7), tilt=0.0, weight='SemiBold', fg=(255, 
     img = img.crop(img.getbbox())
     if tilt:
         img = img.rotate(tilt, resample=Image.BICUBIC, expand=True)
-    out, margin = shadowed(img)
+    out, margin = shadowed(img, blur=3, offset=(0, 2), alpha=90)
     return finish(out), margin
 
 
@@ -257,11 +283,16 @@ def title_bar(w, h, subtitle):
     img = felt(w * S, h * S, (14, 17, 30)).convert('RGBA')
     d = ImageDraw.Draw(img)
     d.line((0, h * S - 2 * S, w * S, h * S - 2 * S), fill=LIME, width=2 * S)
+    globe = logo_image(h - 10)
+    if globe:
+        globe = globe.resize((globe.width * S, globe.height * S), Image.LANCZOS)
+        img.alpha_composite(globe, (9 * S, (h * S - globe.height) // 2))
+    x = 9 * S + (globe.width + 5 * S if globe else 2 * S)
     f = font(17, 'Bold')
     logo = sticker_text('LBPPC', f, ORANGE, CREAM, 3 * S)
-    img.alpha_composite(logo, (11 * S, (h * S - logo.height) // 2))
+    img.alpha_composite(logo, (x, (h * S - logo.height) // 2))
     if subtitle:
-        x = 11 * S + logo.width + 6 * S
+        x += logo.width + 6 * S
         d.text((x, h // 2 * S + S), subtitle, font=font(12, 'Medium'), fill=(170, 178, 196), anchor='lm')
     return finish(img)
 
