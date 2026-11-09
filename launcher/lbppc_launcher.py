@@ -20,11 +20,14 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, font as tkfont, ttk
 
 from PIL import Image, ImageTk
 
 VERSION = '0.1.0'
+DISCORD = 'https://discord.gg/YqfBQCU4vc'  # the permanent invite: help, bug reports, finding co-op partners
+BLURPLE = (88, 101, 242)  # Discord's own colour, for its button
 # Packaged (frozen with PyInstaller): LBPPC.exe sits in the package folder and runs run.py itself (--script).
 FROZEN = getattr(sys, 'frozen', False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
@@ -296,18 +299,19 @@ class Tab:
     POP_OUT = ((1.04, 'blue'), (1.0, 'blue'))
     FRAME_MS = 35
 
-    def __init__(self, scene, text, command, x, y, anchor='w', size=15, pad=(12, 9), tilt=0.0, weight='Bold'):
+    def __init__(self, scene, text, command, x, y, anchor='w', size=15, pad=(12, 9), tilt=0.0, weight='Bold',
+                 fill=theme.BLUE):
         self.scene, self.command, self.enabled, self.hovered = scene, command, True, False
         Tab.count += 1
         self.key = f'tab{Tab.count}'
-        colours = {'blue': theme.BLUE, 'green': theme.GREEN, 'grey': theme.GREY}
+        colours = {'blue': fill, 'green': theme.GREEN, 'grey': theme.GREY}  # 'blue' is the resting colour
 
         def frame(scale, colour):
             return theme.tab(text, colours[colour], size, pad, tilt, weight, scale=scale)[0]
 
         self.frames = {frame_key: frame(*frame_key) for frame_key in
                        {(1.0, 'blue'), (1.0, 'grey'), *self.POP_IN, *self.POP_OUT}}
-        normal, margin = theme.tab(text, theme.BLUE, size, pad, tilt, weight)
+        normal, margin = theme.tab(text, fill, size, pad, tilt, weight)
         self.width, self.height = normal.width - 2 * margin, normal.height - 2 * margin
         self.pending = []
         self.item = scene.image(self.key, normal, 0, 0, anchor='center')
@@ -614,10 +618,12 @@ class Launcher(tk.Tk):
         self.state_dot = scene.create_oval(dot, y + 24, dot + 12, y + 36, fill=MUTED, outline='')
         self.state_label = self.text(dot + 20, y + 30, 'Ready', ('Segoe UI Semibold', 11), TEXT, 'w', width=200)
         lx = WIDTH - 28
-        for text, action in reversed((('Show log', self.toggle_log), ('Make a report', self.report),
+        for text, action in reversed((('Discord', lambda: webbrowser.open(DISCORD)),
+                                      ('Show log', self.toggle_log), ('Make a report', self.report),
                                       ('Log file', lambda: LOG.is_file() and open_path(LOG)),
                                       ('Saves', lambda: open_path(USER)))):
-            item = self.text(lx, y + 28, text, ('Segoe UI Semibold', 10), theme.hex_colour((200, 225, 150)), 'e')
+            colour = '#8c9eff' if text == 'Discord' else theme.hex_colour((200, 225, 150))  # Discord's blurple, lighter
+            item = self.text(lx, y + 28, text, ('Segoe UI Semibold', 10), colour, 'e')
             scene.tag_bind(item, '<Button-1>', lambda _e, act=action: act())
             scene.tag_bind(item, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
             scene.tag_bind(item, '<Leave>', lambda _e: scene.configure(cursor=''))
@@ -625,8 +631,8 @@ class Launcher(tk.Tk):
                 self.log_link = item
             box = scene.bbox(item)
             lx = box[0] - 18
-        self.text(WIDTH // 2, self.HEIGHT - 16, 'Play your own copy. LBPPC includes no game files.', ('Segoe UI', 8),
-                  '#6c7690', 'center')
+        self.text(WIDTH // 2, self.HEIGHT - 16, 'Play your own copy. LBPPC includes no game files. '
+                  'Help, news and co-op partners on the Discord.', ('Segoe UI', 8), '#6c7690', 'center')
 
         # The game's output, under the bar while shown
         self.log = tk.Text(self, bg='#0e111c', fg=MUTED, insertbackground=TEXT, relief='flat', font=('Consolas', 9),
@@ -1370,10 +1376,16 @@ class FriendsPanel:
         self.scene.widget(entry, x + 20, y + 46, w - 40 - self.add_button.width - 14, 30)
         self.status = self.scene.create_text(x + 21, y + 84, anchor='nw', font=HINT_FONT, fill=MUTED, width=w - 42,
                                              text='Add a friend by their online name.')
-        self.list = Scene(launcher, w - 28, h - 124)
+        self.list = Scene(launcher, w - 28, h - 206)
         self.list.configure(bg=self.LIST_BG)
         self.list_w = w - 28
-        self.scene.widget(self.list, x + 14, y + 112, w - 28, h - 124)
+        self.scene.widget(self.list, x + 14, y + 112, w - 28, h - 206)
+        # Under the list, for players with nobody to add yet
+        self.scene.create_text(x + 21, y + h - 72, anchor='w', font=HINT_FONT, fill=MUTED, width=w - 42,
+                               text='Find people to play with, get help and hear about updates:')
+        self.discord = Tab(self.scene, 'Join the Discord', lambda: webbrowser.open(DISCORD), x + w / 2, y + h - 34,
+                           size=17, pad=(18, 10), tilt=-3, fill=BLURPLE)
+        self.discord.move(x + w / 2 - self.discord.width / 2, y + h - 34)
         self.list.bind('<Enter>', lambda _e: self.list.bind_all('<MouseWheel>', self.wheel))
         self.list.bind('<Leave>', lambda _e: self.list.unbind_all('<MouseWheel>'))
         self.draw()
