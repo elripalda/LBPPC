@@ -35,7 +35,8 @@ public:
             return std::string{value && value[0] ? value : fallback};
         };
         user.user_id = RuntimeUserId;
-        user.user_name = text("BB_USER_NAME", "Hunter");
+        // runtime_services.c's player_name(): the launcher's name, else the shadNet account's.
+        user.user_name = text("BB_USER_NAME", text("BB_SHADNET_NPID", "Player").c_str());
         user.player_index = 1;
         user.logged_in = true;
         user.shadnet_npid = text("BB_SHADNET_NPID", "");
