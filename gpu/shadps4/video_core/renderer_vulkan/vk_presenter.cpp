@@ -690,12 +690,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             }
         }
     }
-    // lbppc: LBP3 draws its movies, loading and boot screens for 16:9 over the whole display buffer: on a
-    // wider one (LBPPC_RENDER_RES ultrawide) a frame without a 3D scene is shown in a centred 16:9 area
-    // instead of stretched. LBPPC_PILLARBOX=0 keeps them stretched.
+    // lbppc: LBPPC_PILLARBOX=1 shows a frame without a 3D scene (movies, loading and boot screens) in a centred
+    // 16:9 area of a wider display buffer. Off by default: since probe.c widens the game's 2D layout for
+    // ultrawide, those screens are laid out for the full width, and the 16:9 area squeezed them (a narrow
+    // loading badge between black bars).
     static const bool pillarbox = [] {
         const char* env = std::getenv("LBPPC_PILLARBOX");
-        return !env || env[0] != '0';
+        return env && env[0] == '1';
     }();
     const bool scene = rasterizer->TakeSceneDrawn();
     frame->pillarbox = pillarbox && !scene && frame->width * 9 > frame->height * 16 + 9;
