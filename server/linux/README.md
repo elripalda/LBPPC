@@ -75,6 +75,13 @@ sudo chown -R lbppc:lbppc /opt/lbppc/shadnet /opt/lbppc/qt
 
 `shadnet.cfg` listens on every interface (`Host=0.0.0.0`); its admin API stays on 127.0.0.1.
 
+The release build above lacks LBPPC's two changes (`shadnet/patches/lbppc-shadnet.patch`): a relay for players
+who can't reach each other directly (two players behind one router, or a router without UPnP), and LBP3 players
+counting as being in the same game, which the in-game friends list needs. Without them co-op works only between
+players who can connect directly, and the friends list stays empty. To have them, build shadNet from source at
+commit 75edbf0 with the patch applied (`git apply`), and use that `shadnet` binary instead. UDP 31314 must be open
+for the relay.
+
 ## 5. Services
 
 ```bash
