@@ -464,6 +464,26 @@ extern "C" void bbgpu_mouse_take(BbMouseInput* out) {
     out->captured = mouse.captured ? 1 : 0;
 }
 
+extern "C" void bbgpu_mouse_frame(BbMouseFrame* out) {
+    if (!out) return;
+    if (!g_window) { std::memset(out, 0, sizeof(*out)); return; }
+    const auto totals = g_window->MouseFrame();
+    out->dx = totals.dx;
+    out->dy = totals.dy;
+    out->wheel = totals.wheel;
+    out->frame = totals.frame;
+}
+
+extern "C" void bbgpu_note_game_frame(void) {
+    if (g_window) g_window->SnapshotMouseFrame();
+}
+
+extern "C" void bbgpu_request_quit(void) {
+    SDL_Event quit{};
+    quit.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&quit);
+}
+
 extern "C" void bbgpu_input_configure(int mouse_mode_available, int32_t toggle_scancode, int32_t reload_scancode) {
     if (!g_window) return;
     g_window->ConfigureInput(mouse_mode_available != 0, toggle_scancode, reload_scancode);

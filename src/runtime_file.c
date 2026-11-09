@@ -50,7 +50,15 @@ typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Li
 /* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
  * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file
  * (from bbport 0.5, deadinside28#64). */
-typedef struct { int used, host, dirty; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
+/* lbppc: game files shown changed without changing them (scripts/quit_menu.py writes out/file_edits.bin, which
+ * LBPPC_FILE_EDITS names): a file of the recorded size reads as its first `cut` bytes, then `tail`, with `patches`
+ * written over the result. Reads, seeks and stats all see that file (`total` bytes). */
+typedef struct { uint64_t at; uint32_t size; const unsigned char *bytes; } FilePatch;
+typedef struct { char path[128]; uint64_t original, cut, total; const unsigned char *tail; uint32_t patch_count; FilePatch *patches; } FileEdit;
+static FileEdit *edits;
+static size_t edit_count;
+typedef struct { int used, host, dirty; Listing *dir; size_t position; char path[512]; char *commit, *temp;
+                 const FileEdit *edit; uint64_t edit_position; } File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
@@ -105,10 +113,89 @@ void runtime_file_unmount(const char *guest) {
     }
     pthread_mutex_unlock(&lock);
 }
+static int take(const unsigned char **p,const unsigned char *end,void *out,size_t n) {
+    if ((size_t)(end-*p)<n) return 0;
+    if (out) memcpy(out,*p,n);
+    *p+=n;
+    return 1;
+}
+/* out/file_edits.bin: "LBPEDIT1", a count, then per file its path (relative to /app0), recorded size, cut, tail and
+ * patches, little-endian. Kept for the whole run: the edits point into it. */
+static void load_edits(void) {
+    const char *name=getenv("LBPPC_FILE_EDITS");
+    FILE *f=name && *name && !edits ? fopen(name,"rb") : NULL;
+    if (!f) return;
+    unsigned char *data=NULL;
+    long size=fseek(f,0,SEEK_END) ? -1 : ftell(f);
+    if (size>12 && !fseek(f,0,SEEK_SET) && (data=malloc((size_t)size)) && fread(data,1,(size_t)size,f)!=(size_t)size) { free(data); data=NULL; }
+    fclose(f);
+    if (!data || memcmp(data,"LBPEDIT1",8)) { free(data); fprintf(stderr,"Runtime: %s is not a file edit list\n",name); return; }
+    const unsigned char *p=data+8, *end=data+size;
+    uint32_t count=0;
+    take(&p,end,&count,4);
+    FileEdit *list=calloc(count ? count : 1,sizeof(*list));
+    size_t ok=0;
+    for (uint32_t i=0;list && i<count;++i,++ok) {
+        FileEdit *e=&list[i];
+        uint16_t length=0; uint64_t tail=0;
+        if (!take(&p,end,&length,2) || length>=sizeof(e->path) || !take(&p,end,e->path,length) ||
+            !take(&p,end,&e->original,8) || !take(&p,end,&e->cut,8) || !take(&p,end,&tail,8) ||
+            e->cut>e->original || (e->tail=p, !take(&p,end,NULL,tail)) || !take(&p,end,&e->patch_count,4)) break;
+        e->total=e->cut+tail;
+        if (!(e->patches=calloc(e->patch_count ? e->patch_count : 1,sizeof(FilePatch)))) break;
+        uint32_t j=0;
+        for (;j<e->patch_count;++j) {
+            FilePatch *patch=&e->patches[j];
+            if (!take(&p,end,&patch->at,8) || !take(&p,end,&patch->size,4) || patch->at+patch->size>e->total ||
+                (patch->bytes=p, !take(&p,end,NULL,patch->size))) break;
+        }
+        if (j<e->patch_count) break;
+    }
+    if (!list || ok<count) { fprintf(stderr,"Runtime: %s is damaged; game files are shown as they are\n",name); return; }
+    edits=list; edit_count=count;
+    for (size_t i=0;i<count;++i) printf("Runtime: %s shown edited (%llu bytes)\n",list[i].path,(unsigned long long)list[i].total);
+}
+/* The edit for a guest path, when the host file is the size it was made for (another version of the game is left
+ * alone). */
+static const FileEdit *edit_for(const char *guest,uint64_t host_size) {
+    if (!guest) return NULL;
+    if (!strncmp(guest,"/app0/",6)) guest+=6;
+    else if (!strncmp(guest,"/hostapp/",9)) guest+=9;
+    else if (guest[0]=='/') return NULL;
+    for (size_t i=0;i<edit_count;++i)
+        if (!strcasecmp(guest,edits[i].path) && host_size==edits[i].original) return &edits[i];
+    return NULL;
+}
+static int64_t edited_pread(const FileEdit *e,int h,void *buffer,uint64_t size,int64_t offset) {
+    if (offset<0) return -EINVAL;
+    if ((uint64_t)offset>=e->total) return 0;
+    if (size>e->total-(uint64_t)offset) size=e->total-(uint64_t)offset;
+    uint64_t done=0;
+    if ((uint64_t)offset<e->cut) {
+        const uint64_t own=size<e->cut-(uint64_t)offset ? size : e->cut-(uint64_t)offset;
+        while (done<own) {
+            ssize_t n=pread(h,(char *)buffer+done,own-done,offset+(int64_t)done);
+            if (n<0) return -errno;
+            if (!n) break;
+            done+=(uint64_t)n;
+        }
+        if (done<own) size=done;
+    }
+    if (done<size) { memcpy((char *)buffer+done,e->tail+((uint64_t)offset+done-e->cut),size-done); done=size; }
+    for (uint32_t i=0;i<e->patch_count;++i) {
+        const FilePatch *p=&e->patches[i];
+        const uint64_t from=p->at>(uint64_t)offset ? p->at : (uint64_t)offset;
+        const uint64_t to=p->at+p->size<(uint64_t)offset+done ? p->at+p->size : (uint64_t)offset+done;
+        if (from<to) memcpy((char *)buffer+(from-(uint64_t)offset),p->bytes+(from-p->at),to-from);
+    }
+    return (int64_t)done;
+}
+
 static char user_root[512]="user";
 const char *runtime_file_user_dir(void) { return user_root; }
 void runtime_file_configure(const char *app0,const char *user) {
     char path[600];
+    load_edits();
     snprintf(user_root,sizeof(user_root),"%s",user);
     runtime_file_mount("/app0",app0);
     runtime_file_mount("/hostapp",app0);
@@ -427,6 +514,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     Listing *dir=NULL;
     if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
 #endif
+    const FileEdit *edit=dir || (flags&3) ? NULL : edit_for(guest,(uint64_t)s.st_size);
     pthread_mutex_lock(&lock);
     int fd=-1;
     /* 960-1023 are sockets (runtime_extra.c): descriptors stay below 1024, the size of a game's fd_set. */
@@ -436,7 +524,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         if (temp) unlink(temp);
         free(commit); free(temp); return -EMFILE;
     }
-    files[fd]=(File){.used=1,.host=host,.dir=dir,.commit=commit,.temp=temp};
+    files[fd]=(File){.used=1,.host=host,.dir=dir,.commit=commit,.temp=temp,.edit=edit};
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
@@ -523,6 +611,12 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (h<0) return -EBADF;
     io_watch(fd,buffer,size,-1,"start");
     touch_for_write(buffer,size);
+    File *f=fd>=3 ? get(fd) : NULL;
+    if (f && f->edit) {
+        int64_t n=edited_pread(f->edit,h,buffer,size,(int64_t)f->edit_position);
+        if (n>0) { f->edit_position+=(uint64_t)n; __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED); }
+        return n;
+    }
     ssize_t n=host_read(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -533,7 +627,9 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (h<0) return -EBADF;
     io_watch(fd,buffer,size,offset,"start");
     touch_for_write(buffer,size);
-    ssize_t n=pread(h,buffer,size,offset);
+    File *f=fd>=3 ? get(fd) : NULL;
+    ssize_t n=f && f->edit ? (ssize_t)edited_pread(f->edit,h,buffer,size,offset) : pread(h,buffer,size,offset);
+    if (f && f->edit && n<0) { errno=(int)-n; n=-1; }
     io_watch(fd,buffer,size,offset,"end");
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -562,6 +658,12 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
         if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
         return -EINVAL;
     }
+    if (f->edit) {
+        const int64_t base=whence==0 ? 0 : whence==1 ? (int64_t)f->edit_position : (int64_t)f->edit->total;
+        if (offset>0 ? base>INT64_MAX-offset : base+offset<0) return -EINVAL;
+        f->edit_position=(uint64_t)(base+offset);
+        return base+offset;
+    }
     int64_t r=host_lseek(f->host,offset,whence);
     return r<0 ? -errno : r;
 }
@@ -581,7 +683,10 @@ static int64_t do_fstat(int fd,GuestStat *out) {
 #endif
     if (!out) return -EFAULT;
     if (host_fstat(h,&s)) return -errno;
-    convert_stat(&s,out); return 0;
+    convert_stat(&s,out);
+    File *f=fd>=3 ? get(fd) : NULL;
+    if (f && f->edit) out->size=(int64_t)f->edit->total;
+    return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
     char path[1024]; HostStat s;
@@ -590,7 +695,10 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     if (save_path(guest)) current_copy(path,sizeof(path),0);
     if (!out) return -EFAULT;
     if (host_stat(path,&s)) return -errno;
-    convert_stat(&s,out); return 0;
+    convert_stat(&s,out);
+    const FileEdit *edit=S_ISDIR(s.st_mode) ? NULL : edit_for(guest,(uint64_t)s.st_size);
+    if (edit) out->size=(int64_t)edit->total;
+    return 0;
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
     pthread_mutex_lock(&lock);

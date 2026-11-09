@@ -115,7 +115,16 @@ def main(argv):
     plugins = sorted(p.relative_to(game).as_posix() for p in game.glob('gamedata_orbis/spu/*.prx'))
     script('link_modules.py', game, '--out', OUT, '--modules', 'libc.prx', 'libSceFios2.prx', *plugins)
     script('content_profile.py', game, '--out', OUT)
+    # Quit Game in the pause menu: the game files it changes are shown changed by the runtime (out/file_edits.bin).
+    script('quit_menu.py', game, '--out', OUT)
     env = dict(os.environ)
+    if (OUT / 'file_edits.bin').is_file():
+        env.setdefault('LBPPC_FILE_EDITS', str(OUT / 'file_edits.bin'))
+    # The logo on the game window (launcher/assets in a checkout, assets/ in a release).
+    for icon in (HERE / 'launcher' / 'assets' / 'logo-128.rgba', HERE / 'assets' / 'logo-128.rgba'):
+        if icon.is_file():
+            env.setdefault('LBPPC_ICON', str(icon))
+            break
     # Bloodborne's parallel draw preparation (the draw pipeline and its workers) corrupts memory under LBP3
     # (random crashes in Rasterizer::RetireSubmission and heap frees); off until that is fixed.
     env.setdefault('BB_DRAW_PIPE', '0')
@@ -177,7 +186,11 @@ def main(argv):
         env.setdefault('BB_P2P_PORT', '0')
     if env.get('LBPPC_SERVER') and not env.get('SHADPS4_HTTP_HOST_OVERRIDES_JSON'):
         overrides = OUT / 'host_overrides.json'
-        overrides.write_text(json.dumps({'littlebigplanetps3.online.scee.com': env['LBPPC_SERVER']}), encoding='utf-8')
+        # Levels, icons and photos come from res0..resf.littlebigplanetps3.online.scee.com (picked by the file's
+        # hash): those go to the same server.
+        hosts = ['littlebigplanetps3.online.scee.com'] + [f'res{d}.littlebigplanetps3.online.scee.com'
+                                                          for d in '0123456789abcdef']
+        overrides.write_text(json.dumps({host: env['LBPPC_SERVER'] for host in hosts}), encoding='utf-8')
         env['SHADPS4_HTTP_HOST_OVERRIDES_JSON'] = str(overrides)
     if MSYS2_BIN.is_dir():
         env['PATH'] = f'{MSYS2_BIN}{os.pathsep}{env.get("PATH", "")}'

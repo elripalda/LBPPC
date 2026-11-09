@@ -805,6 +805,7 @@ static ABI void hook_log(uint64_t offset, uint64_t a, uint64_t b, uint64_t slot,
  * the display size and pitch, and its render target setup (0x424790, 0x426dc0, 0x427940) creates every
  * screen-sized target with immediate sizes: full, double height, 2/3, 1/3, 1/4 and 1/6 of 1920x1080. Each is
  * scaled to the requested size (CUSA00473 1.28; checked against the original bytes, else nothing changes). */
+static unsigned char *near_image_alloc(void);
 static void render_res_install(void) {
     const char *spec=getenv("LBPPC_RENDER_RES");
     if (!spec || !*spec) return;
@@ -863,7 +864,34 @@ static void render_res_install(void) {
     uint32_t aspect_bits; memcpy(&aspect_bits,image+0x3fdbc3,4);
     if (aspect_bits!=0x3fe38e39) { fprintf(stderr,"LBPPC_RENDER_RES: unexpected game code, not applied\n"); return; }
     const float aspect=(float)w/(float)h;
-    memcpy(image+0x3fdbc3,&aspect,4);
+    /* Online the game also steps by the camera's aspect (who is on screen, pulling in a player left behind), and players'
+       worlds must step alike ("The game diverged" when one was ultrawide). There the camera keeps 16:9 and only its
+       projection (0x3fe160, which reads the aspect at 0x3fe17f) gets the screen's, from a stub that also redoes the
+       comparison after the read. LBPPC_ASPECT_SPLIT=1/0 forces it on or off (tests). */
+    const char *split_env=getenv("LBPPC_ASPECT_SPLIT"), *npid=getenv("BB_SHADNET_NPID");
+    const int split=split_env ? split_env[0]=='1' : npid && *npid;
+    static const unsigned char aspect_read[]={0xc5,0xfa,0x10,0x53,0x08, 0xc5,0xf8,0x2e,0xd1}; /* vmovss xmm2,[rbx+8]; vucomiss xmm2,xmm1 */
+    unsigned char *stub=NULL;
+    if (split && aspect>16.0f/9.0f+0.01f) {
+        if (memcmp(image+0x3fe17f,aspect_read,sizeof(aspect_read))) fputs("LBPPC_RENDER_RES: unexpected camera code, the view stays 16:9 online\n",stderr);
+        else if (!(stub=near_image_alloc())) fputs("LBPPC_RENDER_RES: no memory near the image, the view stays 16:9 online\n",stderr);
+    }
+    if (stub) {
+        /* stub: vmovss xmm2,[rip+aspect]; vucomiss xmm2,xmm1; ret. Called in place of the read; ret leaves the flags. */
+        unsigned char *o=stub;
+        float *wide=(float *)(stub+32);
+        *wide=aspect;
+        *o++=0xc5; *o++=0xfa; *o++=0x10; *o++=0x15; { int32_t d=(int32_t)((unsigned char *)wide-(o+4)); memcpy(o,&d,4); o+=4; }
+        memcpy(o,aspect_read+5,4); o+=4;
+        *o++=0xc3;
+        const int32_t rel=(int32_t)((intptr_t)stub-(intptr_t)(image+0x3fe17f+5));
+        image[0x3fe17f]=0xe8; memcpy(image+0x3fe180,&rel,4);
+        static const unsigned char nop4[]={0x0f,0x1f,0x40,0x00};
+        memcpy(image+0x3fe184,nop4,4);
+        printf("Runtime: online, the game steps with a 16:9 camera and the view is drawn at %.3f\n",aspect);
+    } else {
+        memcpy(image+0x3fdbc3,&aspect,4);
+    }
     /* The 2D layer's canvas (menus, button prompts, subtitles), 1280x720 at 0x1060a04/0x1060a08: its projection
        (0x40ff8b) and the layout read it, so at the screen's aspect the layer widens instead of stretching. */
     /* LBPPC_UI_STRETCH=1 keeps the stretched layer. */
@@ -1101,6 +1129,79 @@ static void sim_divide_install(void) {
     printf("Runtime: world update every %d frames (stub at %p)\n",n,(void *)s);
     if (!getenv("LBPPC_UNCAP_TRIGGER")) anim_step_install(n);
     if (getenv("LBPPC_UNCAP_TRIGGER")) CloseHandle(CreateThread(NULL,0,uncap_thread,NULL,0,NULL));
+}
+/* lbppc: Quit Game in the pause menu. scripts/quit_menu.py makes the menu's Good Grief! button ask the script native
+ * LAMS.Translate (0x839aa0) for two keys of ours; its text lookup (0x7e3490, a key to UTF-16 text) answers them here.
+ * QUIT_LABEL is the button's text. QUIT_ACTION is a press: the first arms it ("Press again to quit", for 3 seconds), the
+ * second closes the game as the window's close button does, once no save data is mounted (a save being written is
+ * finished first, for up to 15 seconds). */
+#define QUIT_LABEL 0x4C425051
+#define QUIT_ACTION 0x4C425058
+static ABI const uint16_t *(*quit_menu_lookup)(int32_t key);
+static volatile LONG64 quit_armed_until;
+static volatile LONG quit_started;
+static DWORD WINAPI quit_menu_thread(void *unused) {
+    (void)unused;
+    for (int waited=0; runtime_savedata_mounted() && waited<1500; ++waited) Sleep(10);
+    puts("Runtime: Quit Game chosen in the pause menu");
+    fflush(stdout);
+    bbgpu_request_quit();
+    return 0;
+}
+static ABI const uint16_t *quit_menu_translate(int32_t key) {
+    static const uint16_t label[]=u"Quit Game", confirm[]=u"Press again to quit", empty[]=u"";
+    const LONG64 now=(LONG64)GetTickCount64();
+    if (key==QUIT_LABEL) return quit_armed_until>now ? confirm : label;
+    if (key!=QUIT_ACTION) return quit_menu_lookup(key);
+    if (quit_armed_until<=now) quit_armed_until=now+3000;
+    else if (!InterlockedExchange(&quit_started,1)) CloseHandle(CreateThread(NULL,0,quit_menu_thread,NULL,0,NULL));
+    return empty;
+}
+static void quit_menu_install(void) {
+    const uint64_t site=0x839ac3, lookup=0x7e3490;
+    int32_t rel;
+    memcpy(&rel,image+site+1,4);
+    if (image[site]!=0xe8 || site+5+(int64_t)rel!=lookup) { fputs("Quit Game: unexpected game code, not added\n",stderr); return; }
+    unsigned char *s=near_image_alloc();
+    if (!s) { fputs("Quit Game: no memory near the image\n",stderr); return; }
+    /* jmp [rip+0] to quit_menu_translate */
+    const uint64_t target=(uint64_t)(uintptr_t)quit_menu_translate;
+    s[0]=0xff; s[1]=0x25; memset(s+2,0,4); memcpy(s+6,&target,8);
+    quit_menu_lookup=(ABI const uint16_t *(*)(int32_t))(uintptr_t)(image+lookup);
+    rel=(int32_t)((intptr_t)s-(intptr_t)(image+site+5));
+    memcpy(image+site+1,&rel,4);
+}
+/* lbppc (diagnostics, online): the friends the pause menu's Friends page lists (PartyManagement.GatherFriendData): the
+ * game's friend array, 0x184-byte entries at [[0x130d5b8+0x38]+0x70], their count at +0x78. An entry is listed unless
+ * its state (+0xa4) is 3. Logged whenever it changes, with each entry's leading text, its state and the byte at +0xfc. */
+static DWORD WINAPI friend_log_thread(void *unused) {
+    (void)unused;
+    char last[2048]="";
+    for (;;) {
+        Sleep(5000);
+        uint64_t manager=0, array=0; int32_t count=0;
+        SIZE_T got=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),image+0x130d5b8+0x38,&manager,8,&got) || !manager) continue;
+        if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(manager+0x70),&array,8,&got) ||
+            !ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(manager+0x78),&count,4,&got)) continue;
+        char line[2048];
+        int n=snprintf(line,sizeof(line),"Friends (menu): %d", count);
+        for (int32_t i=0; i<count && i<16 && array && n<(int)sizeof(line)-80; ++i) {
+            unsigned char entry[0x184];
+            if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(array+(uint64_t)i*0x184),entry,sizeof(entry),&got)) break;
+            char text[24]; int t=0;
+            for (int k=0; k<64 && t<20; ++k) if (entry[k]>=0x20 && entry[k]<0x7f) text[t++]=(char)entry[k]; else if (t) break;
+            text[t]=0;
+            int32_t state; memcpy(&state,entry+0xa4,4);
+            n+=snprintf(line+n,sizeof(line)-n,"; '%s' state %d flag %u",text,state,entry[0xfc]);
+        }
+        if (strcmp(line,last)) { puts(line); fflush(stdout); snprintf(last,sizeof(last),"%s",line); }
+    }
+    return 0;
+}
+static void friend_log_install(void) {
+    const char *npid=getenv("BB_SHADNET_NPID");
+    if (npid && *npid) CloseHandle(CreateThread(NULL,0,friend_log_thread,NULL,0,NULL));
 }
 /* lbppc: online play runs both players' worlds in lockstep and compares them ("The game diverged"). rcpps and rsqrtps
  * are approximations whose results differ between CPU makers, harmless on a console where every machine is alike:
@@ -2454,6 +2555,8 @@ int main(int argc, char **argv) {
     { extern uintptr_t lbppc_image_base; lbppc_image_base=(uintptr_t)image; }
     render_res_install();
     custom_server_install();
+    quit_menu_install();
+    friend_log_install();
     sim_divide_install();
     hooks_install(getenv("BB_HOOK"));
     sync_log_install();

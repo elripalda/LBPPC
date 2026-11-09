@@ -67,6 +67,21 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         }
     }
 
+    // lbppc: the logo on the title bar and taskbar button: LBPPC_ICON names a 128x128 RGBA file (run.py).
+    if (const char* icon = std::getenv("LBPPC_ICON"); icon && *icon) {
+        if (std::FILE* f = std::fopen(icon, "rb")) {
+            static std::array<unsigned char, 128 * 128 * 4> pixels;
+            const bool whole = std::fread(pixels.data(), 1, pixels.size(), f) == pixels.size();
+            std::fclose(f);
+            SDL_Surface* surface =
+                whole ? SDL_CreateSurfaceFrom(128, 128, SDL_PIXELFORMAT_ABGR8888, pixels.data(), 128 * 4) : nullptr;
+            if (surface) {
+                SDL_SetWindowIcon(window, surface);
+                SDL_DestroySurface(surface);
+            }
+        }
+    }
+
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
 #ifdef _WIN32
@@ -225,6 +240,8 @@ bool WindowSDL::PollEvents() {
                 std::scoped_lock lock{mouse_mutex};
                 mouse.dx += event.motion.xrel;
                 mouse.dy += event.motion.yrel;
+                mouse_totals.dx += event.motion.xrel;
+                mouse_totals.dy += event.motion.yrel;
             } else if ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !pad_busy) ||
                        event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
                 std::scoped_lock lock{mouse_mutex};
@@ -233,6 +250,10 @@ bool WindowSDL::PollEvents() {
                 else mouse.buttons &= ~mask;
             } else if (event.type == SDL_EVENT_MOUSE_WHEEL && !pad_busy) {
                 const uint64_t expiry = SDL_GetTicks() + kWheelPulseMs;
+                {
+                    std::scoped_lock lock{mouse_mutex};
+                    mouse_totals.wheel += event.wheel.y > 0 ? 1 : event.wheel.y < 0 ? -1 : 0;
+                }
                 if (event.wheel.y > 0) g_wheel_expiry_ms[0] = expiry; // WHEEL_UP
                 else if (event.wheel.y < 0) g_wheel_expiry_ms[1] = expiry; // WHEEL_DOWN
                 if (event.wheel.x > 0) g_wheel_expiry_ms[3] = expiry; // WHEEL_RIGHT
@@ -375,6 +396,18 @@ void WindowSDL::TakeMouseInput(MouseInput& out) {
     // BUTTON_UP, same as SDL_GetMouseState would report. UpdateMouseCapture() is what clears
     // buttons/wheel on the capture->uncaptured transition (MOU-005/MOU-007), not this function.
     mouse.dx = mouse.dy = 0.0f;
+}
+
+void WindowSDL::SnapshotMouseFrame() {
+    std::scoped_lock lock{mouse_mutex};
+    const uint32_t frame = mouse_frame.frame + 1;
+    mouse_frame = mouse_totals;
+    mouse_frame.frame = frame;
+}
+
+WindowSDL::MouseTotals WindowSDL::MouseFrame() {
+    std::scoped_lock lock{mouse_mutex};
+    return mouse_frame;
 }
 
 void WindowSDL::ConfigureInput(bool mouse_mode_available_, int32_t toggle_scancode_, int32_t reload_scancode_) {

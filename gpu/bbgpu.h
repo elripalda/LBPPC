@@ -60,6 +60,20 @@ typedef struct {
     int32_t captured;
 } BbMouseInput;
 void bbgpu_mouse_take(BbMouseInput *out);
+/* The mouse's running totals as they were at the game's last frame (taken at each flip): the
+ * mouse as the touchpad moves its finger once a game frame by the motion between two of these,
+ * so every frame gets one frame's motion. Reading the motion at each pad read instead gave
+ * frames 2 or 3 reads' worth (83 reads/s against 30 frames/s): a cursor speeding up and slowing
+ * down. Totals only grow while capture is active; wheel counts up steps minus down steps. */
+typedef struct {
+    double dx, dy;
+    int32_t wheel;
+    uint32_t frame;
+} BbMouseFrame;
+void bbgpu_mouse_frame(BbMouseFrame *out);
+void bbgpu_note_game_frame(void); /* the GPU thread, at each game flip */
+/* Closes the game as the window's close button does (Quit Game in the pause menu). Any thread. */
+void bbgpu_request_quit(void);
 /* Applies a just-(re)loaded input.ini to the window thread: whether mouse-to-joystick mode
  * exists at all (mouse_mode_available; MOU-001), and the current toggle/reload hotkey
  * scancodes (SDL_SCANCODE_UNKNOWN = none bound; HOT-002). Safe from any thread; takes effect
