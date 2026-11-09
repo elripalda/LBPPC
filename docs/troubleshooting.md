@@ -62,9 +62,13 @@ A single long frame when a level starts is normal: the level's textures are uplo
 | `Watchdog: N s passed; threads:` | A test run reached its time limit (`--timeout`), or the game hung. |
 | `(STUBBED) called` | The game used a PS4 function the port does not implement yet. One-off lines are harmless; send a report if one repeats constantly. |
 | `DLSS: ... missing` / `frame generation uses FSR 3.1` | The DLSS files are not installed; FSR 3.1 frame generation is used instead. |
+| `Quit Game: not added (...)` | The pause menu's Quit Game couldn't be added to this copy of the game. Everything else works; close the window to quit. |
+| `Online: refused a connection from <name>` | Someone who isn't your friend tried to join (see [join protection](online.md#join-protection)). |
+| `Sync: received frame ... (DIFFERENT)` | Online, the two players' worlds stopped matching, and the game will say it diverged. Please send reports from **both** players, made right after it happens. |
 
 ## Tips
 
+- **Quitting:** the pause menu has **Quit Game**; press it twice. It waits for a save in progress to finish.
 - **Display: Borderless.** In windowed mode at your screen's own size, Windows shrinks the window
   slightly and the picture is scaled down.
 - **The first time you see something new** the game may hitch briefly while its shaders are built;

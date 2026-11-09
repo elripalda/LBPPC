@@ -1173,7 +1173,10 @@ static void quit_menu_install(void) {
 }
 /* lbppc (diagnostics, online): the friends the pause menu's Friends page lists (PartyManagement.GatherFriendData): the
  * game's friend array, 0x184-byte entries at [[0x130d5b8+0x38]+0x70], their count at +0x78. An entry is listed unless
- * its state (+0xa4) is 3. Logged whenever it changes, with each entry's leading text, its state and the byte at +0xfc. */
+ * its state (+0xa4) is 3. The Friends page (Start_Menu.GetFriendStatus) shows only state 2 (in LBP3) and 1 (online), and
+ * hides state 2 when the wrong-version byte (+0xfc) is set: 0x38b9d0 sets it when the friend's presence gameData (copied
+ * to +0x104, 128 bytes) does not start with 0x9?. Logged whenever it changes: each entry's leading text, state, the
+ * wrong-version byte and gameData's first bytes. */
 static DWORD WINAPI friend_log_thread(void *unused) {
     (void)unused;
     char last[2048]="";
@@ -1193,7 +1196,8 @@ static DWORD WINAPI friend_log_thread(void *unused) {
             for (int k=0; k<64 && t<20; ++k) if (entry[k]>=0x20 && entry[k]<0x7f) text[t++]=(char)entry[k]; else if (t) break;
             text[t]=0;
             int32_t state; memcpy(&state,entry+0xa4,4);
-            n+=snprintf(line+n,sizeof(line)-n,"; '%s' state %d flag %u",text,state,entry[0xfc]);
+            n+=snprintf(line+n,sizeof(line)-n,"; '%s' state %d flag %u data %02x%02x%02x%02x",text,state,entry[0xfc],
+                        entry[0x104],entry[0x105],entry[0x106],entry[0x107]);
         }
         if (strcmp(line,last)) { puts(line); fflush(stdout); snprintf(last,sizeof(last),"%s",line); }
     }

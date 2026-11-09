@@ -34,6 +34,10 @@ After its first start, in `shadnet.cfg`:
 
 Copy `worlds.cfg` and `scoreboards.cfg` from the shadNet repository next to `shadnet.exe`.
 
+A release build of shadNet lacks LBPPC's patch (`server/linux/shadnet/patches/lbppc-shadnet.patch`): the relay for
+players who can't reach each other, and LBP3 players counting as being in the same game, which the in-game friends
+list needs. `server/linux/README.md` says how to build it with the patch.
+
 Accounts: the launcher's **Create account**, or `python tools/shadnet_account.py <online name> --server <host>:31313` (prints the password).
 
 ## Playing
@@ -45,8 +49,15 @@ In the launcher, tick **Play online** and fill in:
 - **Server**: the server's address, such as `play.lbppc.com`. Refresh is reached at `https://<server>` (a server on
   this PC: `http://127.0.0.1:10061`) and shadNet on the same host, port 31313.
 
-**Friends...** opens the player's friends list: send a request by online name, accept or decline the ones they got,
-remove friends. Friends are who may join the player's game.
+The friends list beside the settings: send a request by online name, accept or decline the ones you got, remove
+friends. Friends are who may join your game. Friends playing LBPPC show in the game's own friends list too (the
+pause menu's Friends page), where you can join or invite them.
+
+Two players connect to each other directly when they can. When they can't (both behind one router, or a router
+without UPnP), the server relays their game traffic over UDP 31314 instead, so co-op still works.
+
+A screen wider than 16:9 stays wide online: the game steps with a 16:9 camera, so both players' worlds stay the
+same, and the picture is drawn at your screen's shape.
 
 Or from a shell: `LBPPC_SERVER=https://<server> BB_SHADNET_SERVER=<server>:31313 BB_SHADNET_NPID=<name> BB_SHADNET_PASSWORD=<password> python run.py <game folder>`.
 
@@ -54,7 +65,7 @@ Or from a shell: `LBPPC_SERVER=https://<server> BB_SHADNET_SERVER=<server>:31313
 
 LittleBigPlanet's community servers were closed by a "force join" exploit: a forged invite made the game accept a stranger into the player's session. LBPPC accepts a connection from another player only if:
 
-- they are your shadNet friend (the launcher's **Friends...**),
+- they are your shadNet friend (the launcher's friends list),
 - they are named in `LBPPC_JOIN_ALLOW` (comma separated; for tests started from a shell), or
 - your game connected to them first (you joined them).
 

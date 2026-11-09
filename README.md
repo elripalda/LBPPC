@@ -2,14 +2,15 @@
 
 LittleBigPlanet 3 running natively on PC, with community servers so creating and sharing levels can live on.
 
-**Status:** 0.0.1 beta. LittleBigPlanet 3 (US, CUSA00473 version 1.28) boots, plays and goes online on community servers:
+**Status:** 0.1.0 beta. LittleBigPlanet 3 (US, CUSA00473 version 1.28) boots, plays and goes online on community servers:
 
-- 1080p to 4K and ultrawide (the menus lay themselves out for it; movies and loading screens stay 16:9).
+- 720p to 4K and ultrawide, online too (the menus lay themselves out for it; movies and loading screens stay 16:9).
 - 60 FPS with frame generation (DLSS or FSR 3.1); the game itself steps 30 times a second, as on PS4.
 - NVIDIA Reflex / AMD Anti-Lag 2.
-- Online on [Refresh](https://github.com/LittleBigRefresh/Refresh) (levels, profiles) with [shadNet](https://github.com/shadps4-emu/shadNet) for sign-in and multiplayer, with a join protection against the exploit that closed LittleBigPlanet's community servers: see [docs/online.md](docs/online.md).
+- Online on [Refresh](https://github.com/LittleBigRefresh/Refresh) (levels, profiles) with [shadNet](https://github.com/shadps4-emu/shadNet) for sign-in, friends and co-op, with a join protection against the exploit that closed LittleBigPlanet's community servers: see [docs/online.md](docs/online.md).
+- **Quit Game** in the pause menu.
 
-Multiplayer between players is new in this release and only lightly tested.
+Online co-op is new in this release and only lightly tested.
 
 ## Playing
 
@@ -19,10 +20,10 @@ If something goes wrong, click **Make a report** in the launcher and attach the 
 
 ### Controls
 
-A controller works out of the box. The launcher's **Controls** page sets the keys, mouse buttons and controller buttons, the mouse mode and its sensitivity; it writes `input.ini` (next to `LBPPC.exe`), which F8 reloads in game. Lines the page does not edit (combos, dead zones) are kept.
+A controller works out of the box. The launcher's **Controls** page sets the keys and controller buttons; it writes `input.ini` (next to `LBPPC.exe`), which F8 reloads in game. Lines the page does not edit (combos, dead zones) are kept.
 
 - **Motion:** a controller with motion sensors (DualShock 4, DualSense, Switch Pro) tilts Sackboy's head as on a PS4. Without one, the number pad tilts it (4 left, 6 right, 8 forward, 2 back), or bind `tilt_left`, `tilt_right`, `tilt_forward` and `tilt_back` to anything.
-- **Mouse as the touchpad**, for LBP3's touch Create Mode: choose **Touchpad (Create Mode)** under Controls, Mouse, and press F7 in the game to capture the mouse. Moving is a finger on the pad, the left button pushes the pad in (it opens the Popit and selects), the wheel spreads or pinches (resizes) and Ctrl + wheel twists (rotates).
+- **Mouse:** off in 0.1.0. The mouse as the touchpad (for touch Create Mode) wasn't reliable enough yet and is planned for a later release.
 
 ## How it works
 
