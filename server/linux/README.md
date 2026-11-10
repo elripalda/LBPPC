@@ -52,6 +52,11 @@ sudo chmod +x /opt/lbppc/refresh/Refresh.GameServer
 sudo chown -R lbppc:lbppc /opt/lbppc/refresh
 ```
 
+play.lbppc.com runs Refresh built from source instead (commit `4060ec4`, in `/opt/refresh-src` on the VPS) with
+two changes: `refresh/lbppc-refresh.patch` (archived levels' files fetched from the archive's mirrors, and level
+and user lists that stay fast with the archive's millions of levels) and `refresh/lbppc-refresh-asset-types.patch` (those files are served only when
+they are a type the game itself shares, the rule `BlockedAssetFlags` applies to uploads). Apply them in that order.
+
 The configuration here keeps the digest key LBPPC's game is patched to (`CustomServerDigest`), and uses
 `https://play.lbppc.com` as the public address: change `ExternalUrl`, `WebExternalUrl` and `GameConfigStorageUrl`
 for another domain. Refresh listens on port 10061 on every interface so the proxy can reach it; the router does

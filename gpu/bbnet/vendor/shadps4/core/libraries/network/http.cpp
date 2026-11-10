@@ -864,6 +864,83 @@ static std::optional<std::vector<u8>> InflateGzipBody(const std::string& compres
     return out;
 }
 
+// lbppc: what the game downloads from the server (GET .../r/<sha1>: levels, objects, photos, textures) reaches it
+// only when the bytes hash to the name it asked for and are a type the game itself makes and shares. On PC the
+// game's code is not in the PS4's sandbox, so a script or another type only mods produce (Refresh's AssetFlags:
+// Dangerous or Modded) is refused here even if a server or archive mirror serves it. The game sees a missing file.
+static std::string_view RequestedAssetHash(std::string_view path) {
+    const auto at = path.rfind("/r/");
+    if (at == std::string_view::npos || path.size() < at + 3 + 40) {
+        return {};
+    }
+    const auto hash = path.substr(at + 3, 40);
+    const auto rest = path.substr(at + 3 + 40);
+    if ((!rest.empty() && rest.front() != '?') || !std::all_of(hash.begin(), hash.end(), [](char c) {
+            return std::isxdigit(static_cast<unsigned char>(c));
+        })) {
+        return {};
+    }
+    return hash;
+}
+
+// Why a downloaded asset is refused, or null when it may reach the game.
+static const char* RefusedAsset(std::string_view hash, const std::vector<u8>& body) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_size = 0;
+    if (!EVP_Digest(body.data(), body.size(), digest, &digest_size, EVP_sha1(), nullptr)) {
+        return "could not be checked";
+    }
+    std::string actual;
+    for (unsigned int i = 0; i < digest_size; ++i) {
+        actual += fmt::format("{:02x}", digest[i]);
+    }
+    if (hash.size() != actual.size() ||
+        !std::equal(hash.begin(), hash.end(), actual.begin(),
+                    [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; })) {
+        return "its contents do not match its name";
+    }
+    const auto starts = [&](std::string_view magic) {
+        return body.size() >= magic.size() && std::memcmp(body.data(), magic.data(), magic.size()) == 0;
+    };
+    if (starts("\xff\xd8\xff") || starts("\x89PNG\r\n\x1a\n") || starts("MATT") || starts("<ghost>")) {
+        return nullptr; // photos, grief reports, challenge ghosts
+    }
+    if (body.size() < 4) {
+        return "unknown type";
+    }
+    // Types the game creates and uploads itself (Refresh: neither Dangerous nor Modded). Not GMT: a graphics
+    // material carries compiled shaders, which would reach the shader recompiler; the game's own are in its files.
+    static constexpr std::string_view shared[] = {"LVL", "PLN", "REC", "PRF", "QST", "ADS", "ADC", "CHK",
+                                                  "VOP", "PTG", "TEX", "MAT", "BEV"};
+    const std::string_view type(reinterpret_cast<const char*>(body.data()), 3);
+    const char format = static_cast<char>(body[3]);
+    if (std::find(std::begin(shared), std::end(shared), type) == std::end(shared)) {
+        return type == "FSH"   ? "a script"
+               : type == "GMT" ? "a graphics material (shaders)"
+                               : "a type only mods make";
+    }
+    if (format != 'b' && format != 't' && format != 'e' && format != ' ' && format != 's' && format != 'S') {
+        return "unknown type";
+    }
+    return nullptr;
+}
+
+static void RefuseAsset(std::string_view hash, const std::vector<u8>& body, const char* reason,
+                        HttpResponse& res) {
+    std::string type;
+    for (size_t i = 0; i < std::min<size_t>(body.size(), 4); ++i) {
+        type += std::isprint(body[i]) ? static_cast<char>(body[i]) : '.';
+    }
+    std::printf("Online: refused a download (%.*s, '%s'): %s\n", static_cast<int>(hash.size()), hash.data(),
+                type.c_str(), reason);
+    res.status_code = 404;
+    res.body.clear();
+    res.content_length = 0;
+    res.content_length_result = 0;
+    res.read_cursor = 0;
+    res.all_headers_blob = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+}
+
 static s32 RunRealHttpRequest(const SendRequestPlan& plan_in, HttpResponse& out_res,
                               u32& out_event_bits) {
     out_event_bits = 0;
@@ -1176,6 +1253,14 @@ static s32 RunRealHttpRequest(const SendRequestPlan& plan_in, HttpResponse& out_
         LOG_INFO(Lib_Http, "redirect: depth={} status={} {} -> {} {}://{}:{}{}", depth, prev_status,
                  HttpMethodName(prev_method), HttpMethodName(next_method), plan.scheme, plan.host,
                  plan.port, plan.path);
+    }
+
+    if (plan_in.method == ORBIS_HTTP_METHOD_GET && out_res.status_code == 200) {
+        if (const auto hash = RequestedAssetHash(plan_in.path); !hash.empty()) {
+            if (const char* reason = RefusedAsset(hash, out_res.body)) {
+                RefuseAsset(hash, out_res.body, reason, out_res);
+            }
+        }
     }
 
     out_event_bits =

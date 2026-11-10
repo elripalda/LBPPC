@@ -1,0 +1,333 @@
+diff --git a/Refresh.Core/Configuration/DryArchiveConfig.cs b/Refresh.Core/Configuration/DryArchiveConfig.cs
+index 8dd7f35..93b34bd 100644
+--- a/Refresh.Core/Configuration/DryArchiveConfig.cs
++++ b/Refresh.Core/Configuration/DryArchiveConfig.cs
+@@ -15,6 +15,11 @@ public class DryArchiveConfig : Config
+     public bool Enabled { get; set; }
+     public string Location { get; set; } = "/var/dry/";
+     public bool UseFolderNames { get; set; } = true;
++    /// <summary>
++    /// LBPPC: where to fetch files missing from Location, tried in order; {hash}, {h0} (its first character),
++    /// {h01} and {h23} (its first and second pair) are filled in. Fetched files are kept in Location.
++    /// </summary>
++    public List<string> RemoteUrls { get; set; } = [];
+     
+ #if DEBUG
+     // ReSharper disable once InconsistentNaming
+diff --git a/Refresh.Core/Refresh.Core.csproj b/Refresh.Core/Refresh.Core.csproj
+index adab77b..6342ae9 100644
+--- a/Refresh.Core/Refresh.Core.csproj
++++ b/Refresh.Core/Refresh.Core.csproj
+@@ -22,11 +22,11 @@
+         <PackageReference Include="CommandLineParser" Version="2.9.1" />
+         <PackageReference Include="Discord.Net.Webhook" Version="3.18.0" />
+         <PackageReference Include="DnsClient" Version="1.8.0" />
+-        <PackageReference Include="MailKit" Version="4.14.1" />
++        <PackageReference Include="MailKit" Version="4.18.2" />
+         <PackageReference Include="NPTicket" Version="3.1.1" />
+         <PackageReference Include="Pfim" Version="0.11.3" />
+         <PackageReference Include="SharpZipLib" Version="1.4.2" />
+-        <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
++        <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" NoWarn="NU1902;NU1903" />
+         <PackageReference Include="EasyHotReload" Version="1.0.0" />
+     </ItemGroup>
+ 
+diff --git a/Refresh.Core/Storage/DryDataStore.cs b/Refresh.Core/Storage/DryDataStore.cs
+index 5b3ea15..ea71441 100644
+--- a/Refresh.Core/Storage/DryDataStore.cs
++++ b/Refresh.Core/Storage/DryDataStore.cs
+@@ -1,4 +1,6 @@
++using System.Collections.Concurrent;
+ using System.Diagnostics;
++using System.Security.Cryptography;
+ using System.Text;
+ using Bunkum.Core.Storage;
+ using JetBrains.Annotations;
+@@ -11,31 +13,39 @@ namespace Refresh.Core.Storage;
+ public class DryDataStore : IDataStore
+ {
+     private readonly DryArchiveConfig _config;
+-    
++
+     private const string WriteError = $"{nameof(DryDataStore)} is an archive, and cannot be written to.";
+-    
++
++    // LBPPC: files missing from Location are fetched from RemoteUrls (mirrors of the archive) and kept in
++    // Location, so the archive doesn't have to be stored whole. A hash no mirror has is not asked for again
++    // for a while: new uploads are checked against this store too.
++    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(20) };
++    private static readonly TimeSpan MissFor = TimeSpan.FromMinutes(30);
++    private readonly ConcurrentDictionary<string, DateTimeOffset> _misses = new();
++    private readonly ConcurrentDictionary<string, Lazy<bool>> _fetching = new();
++
+     public DryDataStore(DryArchiveConfig config)
+     {
+         this._config = config;
+     }
+-    
++
+     private readonly ThreadLocal<Stopwatch> _sw = new(() => new Stopwatch());
+-    
++
+     [Pure]
+     private string? GetPath(ReadOnlySpan<char> hash)
+     {
+         if (!CommonPatterns.Sha1Regex().IsMatch(hash))
+             return null;
+-        
++
+         StringBuilder builder = new();
+-        
++
+         // /var/dry
+         builder.Append(this._config.Location);
+-        
++
+         // /var/dry/
+         if (!this._config.Location.EndsWith('/'))
+             builder.Append('/');
+-        
++
+         // /var/dry/dry23r0/
+         if (this._config.UseFolderNames)
+         {
+@@ -43,72 +53,139 @@ public class DryDataStore : IDataStore
+             builder.Append(hash[0]);
+             builder.Append('/');
+         }
+-        
++
+         // /var/dry/dry23r0/01/
+         builder.Append(hash.Slice(0, 2));
+         builder.Append('/');
+-        
++
+         // /var/dry/dry23r0/01/02/
+         builder.Append(hash.Slice(2, 2));
+         builder.Append('/');
+-        
++
+         // /var/dry/dry2er0/01/02/010220123644c8e53d4054bf0d30d0e2bd0786ff8
+         builder.Append(hash);
+-        
++
+         return builder.ToString();
+     }
+-    
+-    public bool ExistsInStore(string key) => File.Exists(this.GetPath(key));
+-    
++
++    /// <summary>
++    /// Fetches a file from the first mirror that has it, checks it is the file the hash names, and keeps it
++    /// at its path. One fetch per hash at a time; false if no mirror has it.
++    /// </summary>
++    private bool Fetch(string key, string path)
++    {
++        if (this._config.RemoteUrls.Count == 0)
++            return false;
++        if (this._misses.TryGetValue(key, out DateTimeOffset missed) && DateTimeOffset.UtcNow - missed < MissFor)
++            return false;
++
++        Lazy<bool> fetch = this._fetching.GetOrAdd(key, _ => new Lazy<bool>(() => this.FetchNow(key, path)));
++        try
++        {
++            return fetch.Value;
++        }
++        finally
++        {
++            this._fetching.TryRemove(key, out _);
++        }
++    }
++
++    private bool FetchNow(string key, string path)
++    {
++        string hash = key.ToLowerInvariant();
++        foreach (string template in this._config.RemoteUrls)
++        {
++            string url = template
++                .Replace("{hash}", hash)
++                .Replace("{h0}", hash[..1])
++                .Replace("{h01}", hash[..2])
++                .Replace("{h23}", hash.Substring(2, 2));
++            try
++            {
++                using HttpResponseMessage response = Http.GetAsync(url).GetAwaiter().GetResult();
++                if (!response.IsSuccessStatusCode)
++                    continue;
++                byte[] data = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
++                if (!Convert.ToHexString(SHA1.HashData(data)).Equals(hash, StringComparison.OrdinalIgnoreCase))
++                    continue;
++
++                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
++                string temporary = path + ".part";
++                File.WriteAllBytes(temporary, data);
++                File.Move(temporary, path, true);
++                return true;
++            }
++            catch (Exception)
++            {
++                // The next mirror.
++            }
++        }
++
++        this._misses[key] = DateTimeOffset.UtcNow;
++        return false;
++    }
++
++    public bool ExistsInStore(string key)
++    {
++        string? path = this.GetPath(key);
++        if (path == null)
++            return false;
++        return File.Exists(path) || this.Fetch(key, path);
++    }
++
+     public bool WriteToStore(string key, byte[] data)
+     {
+         throw new InvalidOperationException(WriteError);
+     }
+-    
++
+     public byte[] GetDataFromStore(string key)
+     {
+         string? path = this.GetPath(key);
+-        
++
+         if (path == null)
+             throw new FormatException("The key was invalid.");
+-        
++
+         this._sw.Value!.Restart();
++        if (!File.Exists(path))
++            this.Fetch(key, path);
+         byte[] data = File.ReadAllBytes(path);
+         this._sw.Value!.Stop();
+         DataStoreMetrics.RecordDry(this._sw.Value);
+ 
+         return data;
+     }
+-    
++
+     public bool RemoveFromStore(string key)
+     {
+         throw new InvalidOperationException(WriteError);
+     }
+-    
++
+     public string[] GetKeysFromStore() => []; // TODO: Implement when we want to store these as GameAssets
+-    
++
+     public bool WriteToStoreFromStream(string key, Stream data)
+     {
+         throw new InvalidOperationException(WriteError);
+     }
+-    
++
+     public Stream GetStreamFromStore(string key)
+     {
+         string? path = this.GetPath(key);
+-        
++
+         if (path == null)
+             throw new FormatException("The key was invalid.");
+-        
++
+         this._sw.Value!.Restart();
++        if (!File.Exists(path))
++            this.Fetch(key, path);
+         Stream data = File.OpenRead(path);
+         this._sw.Value!.Stop();
+         DataStoreMetrics.RecordDry(this._sw.Value);
+ 
+         return data;
+     }
+-    
++
+     public Stream OpenWriteStream(string key)
+     {
+         throw new InvalidOperationException(WriteError);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Refresh.Database/DatabaseList.cs b/Refresh.Database/DatabaseList.cs
+index 30ebb33..861177b 100644
+--- a/Refresh.Database/DatabaseList.cs
++++ b/Refresh.Database/DatabaseList.cs
+@@ -2,11 +2,17 @@ namespace Refresh.Database;
+ 
+ public class DatabaseList<TObject> where TObject : class
+ {
++    /// <summary>
++    /// LBPPC: how far past the requested page a database list counts. Counting all of the archive's millions of
++    /// levels took seconds on every list; this is plenty for paging.
++    /// </summary>
++    public const int CountBeyondPage = 10_000;
++
+     // ReSharper disable once ParameterTypeCanBeEnumerable.Local
+     public DatabaseList(IQueryable<TObject> items, int skip, int count)
+     {
+         this.Items = items.AsEnumerableIfRealm().Skip(skip).Take(count);
+-        this.TotalItems = items.Count();
++        this.TotalItems = items.Take(skip + count + CountBeyondPage).Count();
+         this.NextPageIndex = skip + count + 1;
+ 
+         if (this.NextPageIndex > this.TotalItems)
+diff --git a/Refresh.Database/GameDatabaseContext.Levels.cs b/Refresh.Database/GameDatabaseContext.Levels.cs
+index 6bc9e3c..541de23 100644
+--- a/Refresh.Database/GameDatabaseContext.Levels.cs
++++ b/Refresh.Database/GameDatabaseContext.Levels.cs
+@@ -341,7 +341,9 @@ public partial class GameDatabaseContext // Levels
+     public DatabaseList<GameLevel> GetUserLevelsChunk(int skip, int count)
+         => new(this.GameLevelsIncluded
+             .OrderByDescending(l => l.LevelId)
+-            .Where(l => l.StoryId == 0), skip, count);
++            // LBPPC: not the millions of archived levels (re-uploads with no publisher here), which the
++            // Cool Levels job would otherwise score one by one every 10 minutes.
++            .Where(l => l.StoryId == 0 && !(l.IsReUpload && l.PublisherUserId == null)), skip, count);
+ 
+     [Pure]
+     public IQueryable<GameLevel> GetAllUserLevels()
+@@ -385,13 +387,16 @@ public partial class GameDatabaseContext // Levels
+ 
+         return new DatabaseList<GameLevel>(list, skip, count);
+ #else
+-        Random random = new(levelFilterSettings.Seed ?? 0);
+-        
+-        return new DatabaseList<GameLevel>(this.GetLevelsByGameVersion(levelFilterSettings.GameVersion)
+-            .FilterByLevelFilterSettings(user, levelFilterSettings)
+-            .AsEnumerable()
+-            .OrderBy(_ => random.Next())
+-            , skip, count);
++        // LBPPC: shuffling every level in memory doesnt scale to the archives millions. The seed picks a place
++        // among the level IDs instead and the list goes on in ID order from there: neighbouring IDs are unrelated
++        // levels, and the same seed pages the same way.
++        int maxId = this.GameLevels.Max(l => (int?)l.LevelId) ?? 0;
++        int start = maxId <= 0 ? 0 : (int)((uint)((levelFilterSettings.Seed ?? 0) * 2654435761u) % (uint)maxId);
++        IQueryable<GameLevel> fromStart = this.GetLevelsByGameVersion(levelFilterSettings.GameVersion)
++            .FilterByLevelFilterSettings(user, levelFilterSettings);
++        if (fromStart.Any(l => l.LevelId >= start))
++            fromStart = fromStart.Where(l => l.LevelId >= start);
++        return new DatabaseList<GameLevel>(fromStart.OrderBy(l => l.LevelId), skip, count);
+ #endif
+     }
+ 
+diff --git a/Refresh.Database/GameDatabaseContext.Users.cs b/Refresh.Database/GameDatabaseContext.Users.cs
+index 92b0b27..9779ac5 100644
+--- a/Refresh.Database/GameDatabaseContext.Users.cs
++++ b/Refresh.Database/GameDatabaseContext.Users.cs
+@@ -303,7 +303,13 @@ public partial class GameDatabaseContext // Users
+     }
+ 
+     [Pure]
+-    public int GetTotalUserCount() => this.GameUsers.Count();
++    // LBPPC: real accounts only, not the placeholder users ("!name") that stand in for the creators of
++    // re-uploaded levels (thousands, with the archive) or the deleted user.
++    public int GetTotalUserCount()
++    {
++        string prefix = SystemUsers.SystemPrefix.ToString(); // a string: StartsWith(char) has no SQL translation
++        return this.GameUsers.Count(u => !u.Username.StartsWith(prefix));
++    }
+     
+     [Pure]
+     public int GetActiveUserCount()
