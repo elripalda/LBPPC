@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <set>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -519,6 +520,8 @@ private:
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
+    /// lbppc: render targets whose memory a compute shader overwrote since their last pass.
+    std::set<VAddr> pending_target_clears;
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {

@@ -133,8 +133,9 @@ def main(argv):
     # executable's globals in 32 bits (a job counter at 0x8012a4d00 was truncated, its jobs' output grew
     # without bound, and every increment corrupted host memory).
     env.setdefault('LBPPC_LOW_BASE', '0x400000')
-    # LBP3's compute lighting binds its output image also as a written storage buffer; invalidating the
-    # image for that write re-uploaded it from memory the GPU never wrote (black 3D scenes).
+    # A compute shader of LBP3's overwrites render targets' memory as a storage buffer; invalidating the
+    # image for that write blacks out the 3D scene. The images are kept, and the write counts as a clear only
+    # for targets drawn additively next (vk_rasterizer.cpp), which would otherwise pile up into orange shapes.
     env.setdefault('LBPPC_NO_BUFFER_IMAGE_INVALIDATE', '1')
     # LBP3 steps its world once per frame (30 per second), so 60 FPS comes from frame generation; its
     # camera, which frame generation needs, is recovered from the draws' matrices (lbp_camera.h).

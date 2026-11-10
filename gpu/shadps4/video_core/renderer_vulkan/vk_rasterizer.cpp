@@ -2348,6 +2348,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 static const bool keep_images = std::getenv("LBPPC_NO_BUFFER_IMAGE_INVALIDATE") != nullptr;
+                // lbppc: LBP3 overwrites render targets' memory with a compute shader that binds no images (run.py).
+                // The images are kept, so remember it: BeginRenderingFull applies it as a clear where it matters.
+                if (keep_images && desc.is_written && stage.images.empty() &&
+                    texture_cache.FindImageFromRange(vsharp.base_address, size, false)) {
+                    pending_target_clears.insert(vsharp.base_address);
+                }
+                // A shader that also binds images isn't taken for a clear: said once, for reports.
+                if (keep_images && desc.is_written && !stage.images.empty()) {
+                    static std::set<std::pair<u64, VAddr>> reported;
+                    if (reported.insert({stage.pgm_hash, vsharp.base_address}).second &&
+                        texture_cache.FindImageFromRange(vsharp.base_address, size, false)) {
+                        std::printf("Clear warning: shader %016llx with images writes over the image at %llx "
+                                    "(size %llx); not taken for a clear\n",
+                                    (unsigned long long)stage.pgm_hash,
+                                    (unsigned long long)vsharp.base_address, (unsigned long long)size);
+                    }
+                }
                 if (desc.is_written && !keep_images) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
@@ -3004,7 +3021,30 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const auto mip = image_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
-        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+        // lbppc: a compute clear counts only for a target whose next draw adds to it, where a lost clear piles up
+        // from frame to frame (huge orange shapes in effects). The same shader also runs over targets, such as the
+        // scene, whose contents must stay.
+        const auto& target_blend = regs.blend_control[cb];
+        const bool clear_requested = pending_target_clears.erase(col_buf.Address()) != 0;
+        const bool pending_clear =
+            clear_requested && target_blend.enable &&
+            target_blend.color_src_factor == AmdGpu::BlendControl::BlendFactor::One &&
+            target_blend.color_dst_factor == AmdGpu::BlendControl::BlendFactor::One &&
+            target_blend.color_func == AmdGpu::BlendControl::BlendFunc::Add;
+        if (clear_requested) {
+            // Each decision once, for reports: a dropped clear on a blended target could also pile up.
+            static std::set<std::pair<VAddr, bool>> reported;
+            if (reported.insert({col_buf.Address(), pending_clear}).second) {
+                std::printf("Clear: target %llx next draw blend %u src %u dst %u func %u: %s\n",
+                            (unsigned long long)col_buf.Address(), u32(target_blend.enable),
+                            u32(target_blend.color_src_factor), u32(target_blend.color_dst_factor),
+                            u32(target_blend.color_func),
+                            pending_clear ? "applied"
+                                          : (target_blend.enable ? "dropped (blended: check this one)" : "dropped"));
+            }
+        }
+        const bool is_clear =
+            pending_clear || texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
 
         if (reduced) {
@@ -3035,7 +3075,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
         const auto clear_value =
-            is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
+            is_clear && !pending_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image->backing->state.layout;
