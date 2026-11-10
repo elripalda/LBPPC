@@ -427,10 +427,49 @@ static void sync_log_send(uint64_t world, uint64_t frame) {
         printf("\n");
     }
 }
+/* lbppc: the game ends the session on the first difference. One right after a level change can be a moment where the
+ * worlds aren't aligned yet, so it takes SYNC_DIFFERENCES_TO_END in a row (one check every 2 s). Worlds that have really
+ * split keep differing and end the session as before. Returns the flag the game reads: nonzero carries on past a difference. */
+enum { SYNC_DIFFERENCES_TO_END=3 };
+typedef struct { unsigned differences; int set_flag; } SyncTolerance;
+/* outcome: 1 the same frame differs, 0 it matches, -1 no record of that frame yet. */
+static unsigned char sync_tolerance_step(SyncTolerance *t, int outcome, unsigned char flag, unsigned frame) {
+    if (outcome>0) {
+        ++t->differences;
+        printf("Sync: DIFFERENCE %u of %u at frame %u\n",t->differences,(unsigned)SYNC_DIFFERENCES_TO_END,frame);
+        if (t->differences<SYNC_DIFFERENCES_TO_END) {
+            if (!flag) { flag=1; t->set_flag=1; }
+        } else {
+            printf("Sync: worlds still differ after %u checks, ending the session\n",t->differences);
+            if (t->set_flag) { flag=0; t->set_flag=0; }
+        }
+    } else if (outcome==0) {
+        if (t->differences) printf("Sync: worlds match again after %u difference(s), at frame %u\n",t->differences,frame);
+        t->differences=0;
+        if (t->set_flag) { flag=0; t->set_flag=0; }
+    }
+    return flag;
+}
 static void sync_log_receive(uint64_t game, const SyncRecord *message) {
     static int kick=-1;
+    static SyncTolerance tolerance;
     if (kick<0) { const char *v=getenv("LBPPC_DIVERGE_KICK"); kick=!(v && v[0]=='0'); }
     if (!kick) *(unsigned char *)(uintptr_t)(game+0x5e8)=1;
+    else {
+        /* As the game compares (0x269f10): the same frame, player and place, in this session. */
+        const SyncRecord *records=*(const SyncRecord **)(uintptr_t)(game+0x550);
+        const uint32_t records_count=*(uint32_t *)(uintptr_t)(game+0x558), session=*(uint32_t *)(uintptr_t)(game+0x564);
+        static uint32_t last_session;
+        if (session!=last_session) { tolerance=(SyncTolerance){0,0}; last_session=session; }
+        int outcome=-1;
+        if (!message->session || !session || message->session==session)
+            for (uint32_t i=0;i<records_count && records;++i)
+                if (records[i].frame==message->frame && !strncmp((const char *)records[i].id,(const char *)message->id,16) &&
+                    records[i].where_a==message->where_a && records[i].where_b==message->where_b)
+                    outcome=records[i].hash!=message->hash;
+        unsigned char *flag=(unsigned char *)(uintptr_t)(game+0x5e8);
+        *flag=sync_tolerance_step(&tolerance,outcome,*flag,message->frame);
+    }
     printf("Sync: received frame %u hash %08x (where %x %x, session %u, id %.16s); ours:",message->frame,message->hash,
            message->where_a,message->where_b,message->session,(const char *)message->id);
     const SyncRecord *held=*(const SyncRecord **)(uintptr_t)(game+0x550);
