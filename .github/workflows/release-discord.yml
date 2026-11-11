@@ -1,0 +1,40 @@
+# Posts a published release to the Discord announcements channel through a webhook.
+# The webhook URL is the repository secret DISCORD_RELEASE_WEBHOOK (Settings > Secrets and variables > Actions).
+# The message: a line with the version and the download link, then the release notes as an embed in LBPPC's lime.
+name: Release announcement
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  discord:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          TAG: ${{ github.event.release.tag_name }}
+          NAME: ${{ github.event.release.name }}
+          URL: ${{ github.event.release.html_url }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          # Discord allows 4096 characters in an embed's description; longer notes end with a link to the rest.
+          notes=$(printf '%s' "$BODY" | head -c 3800)
+          if [ "${#BODY}" -gt 3800 ]; then notes="$notes"$'\n\n'"[Read the full release notes]($URL)"; fi
+          jq -n --arg tag "$TAG" --arg name "${NAME:-LBPPC $TAG}" --arg url "$URL" --arg notes "$notes" '{
+            username: "LBPPC",
+            avatar_url: "https://lbppc.com/assets/icon.png?v=6",
+            content: ("**LBPPC " + $tag + " is out!** Download it from the website or GitHub: <https://lbppc.com/download>"),
+            allowed_mentions: { parse: [] },
+            embeds: [{
+              title: $name,
+              url: $url,
+              description: $notes,
+              color: 10539590,
+              thumbnail: { url: "https://lbppc.com/assets/icon.png?v=6" },
+              footer: { text: "You need your own copy of LittleBigPlanet 3. LBPPC includes no game files." }
+            }]
+          }' > message.json
+          curl -sS --fail-with-body -H 'Content-Type: application/json' -d @message.json "$WEBHOOK"

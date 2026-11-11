@@ -15,8 +15,8 @@ own copy, dumped from your PS4.
 ## What you get
 
 **The game, on PC**
-- **60 FPS** with frame generation: DLSS on NVIDIA RTX, FSR 3.1 on everything else. The game still steps 30 times a
-  second, as on PS4, so physics and timing feel the same.
+- **60 FPS** with frame generation: DLSS on GeForce RTX 40 and 50 series cards, FSR 3.1 on any other. The game still
+  steps 30 times a second, as on PS4, so physics and timing feel the same.
 - **720p to 4K, and ultrawide.** The menus lay themselves out for wide screens, online too. Movies and loading screens
   stay 16:9.
 - **FSR 1 upscaling** with adjustable sharpening, for playing below your screen's resolution.
@@ -36,7 +36,9 @@ own copy, dumped from your PS4.
 
 **The launcher**
 - Settings for resolution, frame generation, upscaling, controls and online play, all in one window.
-- **Make a report** packs everything a bug report needs into one zip, without your passwords or user name.
+- **Make a report** packs everything a bug report needs into one zip, without your password or Windows user name.
+- **An in-game menu** (Insert, or L3 + R3 on a controller): the frame rate counter and other overlays, and frame
+  generation, without leaving the game.
 
 ## Getting started
 
@@ -47,9 +49,10 @@ LittleBigPlanet 3 (CUSA00473, version 1.28).
 2. Start `LBPPC.exe`. If Windows SmartScreen warns about a new app, click **More info**, then **Run anyway**.
 3. Choose your game dump's folder and press **Play**. The first start prepares the game, which takes about a minute.
    The first time you see something new, it may hitch once while its shaders are built.
-4. To play online, tick **Play online**, choose a name and password, press **Create account**, and add your friends.
+4. To play online, choose a name and password under Online, press **Create account**, tick **Play online on the LBPPC
+   server**, and add your friends by their online names.
 
-The full guide is at [lbppc.com/download](https://lbppc.com/download), and online play is covered in
+The full guide is at [lbppc.com/getting-started](https://lbppc.com/getting-started), and online play is covered in
 [docs/online.md](docs/online.md).
 
 ### Controls
@@ -65,6 +68,18 @@ The full guide is at [lbppc.com/download](https://lbppc.com/download), and onlin
 
 - **Online co-op is new.** If the game says the players' worlds diverged, make a report on both PCs.
 - **Some effects or materials draw wrongly in some levels.**
+- **With a keyboard, the game shows PlayStation buttons.** The launcher's Controls page shows which key is which.
+- **An archived level's first load can be slow**, while the server fetches it for the first time.
+
+## What's coming
+
+Being worked on for later updates, with no dates yet:
+
+- **Native 60 and 120 FPS:** the game itself running faster, rather than frame generation filling in between 30.
+- **Better upscaling:** DLSS and FSR temporal upscaling fitted to LBP3.
+- **Mouse and keyboard:** the mouse as the PS4's touchpad (for Create mode), and keyboard keys shown in place of
+  PlayStation buttons.
+- **Linux and Steam Deck**, once tested on more hardware.
 
 ## Found a problem?
 

@@ -1111,7 +1111,16 @@ class Launcher(tk.Tk):
 
     def close(self):
         self.stop()
+        try:
+            self.store()  # a field still being typed in has not lost focus, which is when it saves
+        except Exception:  # noqa: BLE001 - closing must not fail
+            pass
         self.destroy()
+        # Leave without Python's shutdown: it freed the remaining Tk images after Tcl had gone, and with the log
+        # reader and friends threads still running, which ended in "alloc: invalid block" on every close.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 class Slider:
