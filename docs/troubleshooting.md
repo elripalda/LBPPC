@@ -66,7 +66,8 @@ A single long frame when a level starts is normal: the level's textures are uplo
 | `Online: refused a connection from <name>` | Someone who isn't your friend tried to join (see [join protection](online.md#join-protection)). |
 | `Sync: DIFFERENCE 1 of 3` | Online, the two players' worlds didn't match at one check (every 2 seconds). The game carries on; `worlds match again` means it was only a moment. |
 | `Sync: worlds still differ after 3 checks` | The worlds have really split, and the game says it diverged. Please send reports from **both** players, made right after it happens. |
-| `Clear: target ... dropped (blended: check this one)` | Normal on its own. If effects build up or leave trails, send a report: this line shows where to look. |
+| `Image sync in the last 30 s: ...` | Normal. The game wrote over memory that also holds pictures, and the pictures were updated to match, as on the PS4. |
+| `Clear: target ... dropped (blended: check this one)` | Only appears with the image sync switched off for testing. If effects build up or leave trails, send a report. |
 | `Clear warning: shader ...` | The same: only worth a look if something draws wrongly. |
 
 ## Tips

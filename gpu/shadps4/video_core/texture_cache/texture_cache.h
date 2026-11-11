@@ -111,6 +111,20 @@ public:
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
+    /// lbppc (BbToggle::BufferWriteImageSync): images in [address, address + size) that a shader's
+    /// buffer write reaches: those whose GPU-drawn data is not in the buffer cache, oldest write first
+    /// (to be written back before the write), or all of them (to reload after it). Images the buffer
+    /// cannot represent (depth, MSAA, scene proxies) are left out of both, as before.
+    void ImagesUnderBufferWrite(VAddr address, size_t size, bool not_in_buffer_only,
+                                boost::container::small_vector<ImageId, 16>& out);
+    /// lbppc: the images reload from the buffer cache before their next use.
+    void MarkImagesGpuDirty(std::span<const ImageId> ids);
+    /// lbppc: whether the image's memory can be written back to the buffer cache and reloaded from it.
+    static bool BufferCanHoldImage(const Image& image) {
+        return !image.info.props.is_depth && image.info.num_samples == 1 && !image.scene_proxy &&
+               image.info.guest_address != 0 && !image.allocation_failed;
+    }
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 

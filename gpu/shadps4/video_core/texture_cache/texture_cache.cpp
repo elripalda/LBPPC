@@ -202,6 +202,36 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     });
 }
 
+void TextureCache::ImagesUnderBufferWrite(VAddr address, size_t size, bool not_in_buffer_only,
+                                          boost::container::small_vector<ImageId, 16>& out) {
+    std::scoped_lock lock{mutex};
+    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+        if (!BufferCanHoldImage(image)) {
+            return;
+        }
+        if (not_in_buffer_only && (False(image.flags & ImageFlagBits::NotInBuffer) ||
+                                   True(image.flags & ImageFlagBits::Dirty))) {
+            return;
+        }
+        out.push_back(image_id);
+    });
+    if (not_in_buffer_only) {
+        std::sort(out.begin(), out.end(), [&](ImageId a, ImageId b) {
+            return slot_images[a].gpu_write_seq < slot_images[b].gpu_write_seq;
+        });
+    }
+}
+
+void TextureCache::MarkImagesGpuDirty(std::span<const ImageId> ids) {
+    std::scoped_lock lock{mutex};
+    for (const ImageId id : ids) {
+        Image& image = slot_images[id];
+        if (True(image.flags & ImageFlagBits::Registered)) {
+            image.flags |= ImageFlagBits::GpuDirty;
+        }
+    }
+}
+
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
 
@@ -820,6 +850,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
                         (unsigned long long)image.info.guest_size);
         }
         image.flags |= ImageFlagBits::GpuModified;
+        image.MarkGpuWritten();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
@@ -863,6 +894,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         }
     }
     image.flags |= ImageFlagBits::GpuModified;
+    image.MarkGpuWritten();
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
@@ -889,6 +921,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
+    image.MarkGpuWritten();
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -961,6 +994,10 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    if (is_gpu_dirty) {
+        gpu_dirty_uploads.fetch_add(1, std::memory_order_relaxed);
+        gpu_dirty_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    }
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
@@ -987,7 +1024,10 @@ void TextureCache::RefreshImage(Image& image) {
                             image.usage.depth_target) &&
                            Core::Memory::Instance()->ClampRangeSize(VAddr(mip_addr), mip_size) ==
                                mip_size;
-        if (track) {
+        // lbppc: not for a reload from the buffer cache (GpuDirty): the GPU's write left guest
+        // memory as it was, so the hash of the last upload still describes it. Hashing here cost
+        // the GPU thread ~4 ms a frame once buffer writes reached images (BufferWriteImageSync).
+        if (track && !is_gpu_dirty) {
             const u64 mip_hash = XXH3_64bits(mip_addr, mip_size);
             if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
                 continue;

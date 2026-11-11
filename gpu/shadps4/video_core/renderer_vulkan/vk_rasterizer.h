@@ -4,7 +4,9 @@
 #pragma once
 
 #include <chrono>
+#include <map>
 #include <set>
+#include <string>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -520,8 +522,24 @@ private:
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
-    /// lbppc: render targets whose memory a compute shader overwrote since their last pass.
-    std::set<VAddr> pending_target_clears;
+    /// lbppc: render targets a compute shader wrote over, by address: the shader and the size it wrote.
+    struct PendingClear {
+        u64 shader;
+        u64 size;
+    };
+    std::map<VAddr, PendingClear> pending_target_clears;
+    /// lbppc (BbToggle::BufferWriteImageSync): images under a buffer write of the draw or dispatch being
+    /// recorded; they reload from the buffer cache once it is recorded (ApplyImageReloads).
+    boost::container::small_vector<VideoCore::ImageId, 16> image_reloads;
+    u64 image_sync_written_back = 0;
+    u64 image_sync_reloaded = 0;
+    void ApplyImageReloads();
+    struct ImageReloadGuard {
+        Rasterizer& rasterizer;
+        ~ImageReloadGuard() {
+            rasterizer.ApplyImageReloads();
+        }
+    };
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {

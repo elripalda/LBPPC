@@ -37,6 +37,7 @@ class StagingBufferPool;
 namespace VideoCore {
 
 class TextureCache;
+struct Image;
 class MemoryTracker;
 class PageManager;
 
@@ -132,7 +133,16 @@ public:
     /// seen here, so its game memory is not released again.
     void KeepFaultedRange(VAddr device_addr, u64 size);
 
+    /// lbppc (BbToggle::BufferWriteImageSync): before a shader writes [device_addr, +size) as a buffer,
+    /// the images there with GPU-drawn data the buffer lacks are written into it, oldest first, so the
+    /// write lands on the same bytes as on the PS4. Returns the number of images written back.
+    u32 WriteBackImages(VAddr device_addr, u64 size);
+
 private:
+    /// lbppc: copies of each mip of the image for TileImage / DownloadImage, at offsets from its start.
+    static boost::container::small_vector<vk::BufferImageCopy, 8> ImageToBufferCopies(
+        const Image& image, u64 limit);
+
     /// bbport: game memory backing comes in pieces of one block from slabs, so a released piece
     /// is taken again and a slab without pieces in use goes back to the driver.
     struct Slab {

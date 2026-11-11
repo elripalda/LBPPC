@@ -75,6 +75,15 @@ enum : std::uint64_t {
     // Game memory backing the GPU has not used for a while is released when VRAM runs short
     // (BufferCache::RunArenaCollector); set: it is kept for good, as before.
     ArenaRelease = 1ull << 60,
+    // lbppc: the orange flare fix (vk_rasterizer.cpp): a compute shader's write over a render target taken as a
+    // clear of it. Set: never (as before the fix). In user/toggles.txt: 2305843009213693952.
+    TargetClears = 1ull << 61,
+    // lbppc: a shader's write to buffer memory under cached images reaches them (vk_rasterizer.cpp
+    // SyncImagesForBufferWrite): their GPU-drawn data is written back to the buffer first, and they reload
+    // from it after, as on the PS4, where both are the same memory. Set: the write is ignored as before
+    // (LBPPC_NO_BUFFER_IMAGE_INVALIDATE) and only the TargetClears guess applies. In user/toggles.txt:
+    // 4611686018427387904.
+    BufferWriteImageSync = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

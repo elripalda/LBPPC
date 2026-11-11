@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include <atomic>
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
@@ -34,7 +35,12 @@ enum ImageFlagBits : u32 {
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
+    /// lbppc: the GPU has drawn into the image since its data was last in the buffer cache
+    /// (uploaded from it or written back to it).
+    NotInBuffer = 1 << 8,
 };
+/// lbppc: uploads of images marked GpuDirty (reloads after buffer writes), for the Image sync log.
+inline std::atomic<u64> gpu_dirty_uploads{0}, gpu_dirty_upload_bytes{0};
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
 struct UniqueImage {
@@ -118,6 +124,14 @@ struct Image {
         return track_addr != 0 && track_addr_end != 0;
     }
 
+    /// lbppc: the GPU writes the image from now on (target, storage image, copy, clear): its data is no
+    /// longer the buffer cache's.
+    void MarkGpuWritten() {
+        static std::atomic<u64> seq{0};
+        flags |= ImageFlagBits::NotInBuffer;
+        gpu_write_seq = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
     bool SafeToDownload() const {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
     }
@@ -168,6 +182,9 @@ public:
     /// bbport: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
+    /// lbppc: order of the last binding that let the GPU write the image (NotInBuffer), so images
+    /// sharing memory are written back oldest first.
+    u64 gpu_write_seq{};
     ImageId depth_id{};
     u64 depth_uid{};
     u64 image_uid{};

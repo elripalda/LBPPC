@@ -968,6 +968,37 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             return;
         }
     }
+    // lbppc diagnostics: LBPPC_SKIP_SHADERS=<file> lists shader hashes (16 hex digits, any separators);
+    // draws using any of them are skipped. Re-read 4 times a second, for finding a bad pass live.
+    static const char* skip_shaders = std::getenv("LBPPC_SKIP_SHADERS");
+    if (skip_shaders) {
+        static std::vector<u64> skipped;
+        static auto next_read = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_read) {
+            next_read = now + std::chrono::milliseconds(250);
+            std::vector<u64> list;
+            if (FILE* f = std::fopen(skip_shaders, "r")) {
+                char token[64];
+                while (std::fscanf(f, "%63s", token) == 1) {
+                    if (std::strlen(token) == 16) list.push_back(std::strtoull(token, nullptr, 16));
+                }
+                std::fclose(f);
+            }
+            if (list != skipped) {
+                std::printf("Runtime: skipping draws of %zu shaders\n", list.size());
+                std::fflush(stdout);
+                skipped = std::move(list);
+            }
+        }
+        if (!skipped.empty()) {
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage && std::find(skipped.begin(), skipped.end(), stage->pgm_hash) != skipped.end()) {
+                    return;
+                }
+            }
+        }
+    }
     if (pipelined && FilterDrawPasses()) {
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
@@ -977,6 +1008,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    const ImageReloadGuard image_reload_guard{*this};
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1241,6 +1273,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
+    const ImageReloadGuard image_reload_guard{*this};
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
@@ -1351,6 +1384,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+    const ImageReloadGuard image_reload_guard{*this};
     FrameCapture::Poll();
     gbuffer_draw = false;
 
@@ -1423,6 +1457,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
                                         u32 size) {
+    const ImageReloadGuard image_reload_guard{*this};
     scheduler.PopPendingOperations();
     const u32 offset = 0;
 
@@ -2336,8 +2371,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                // lbppc: a write over images' memory reaches them (BbToggle::BufferWriteImageSync): what
+                // the GPU drew into them goes into the buffer first, and they reload from it after the
+                // draw or dispatch (ApplyImageReloads).
+                const bool image_sync =
+                    desc.is_written && !BbToggle::Disabled(BbToggle::BufferWriteImageSync);
+                if (image_sync) {
+                    image_sync_written_back += buffer_cache.WriteBackImages(vsharp.base_address, size);
+                }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                if (image_sync) {
+                    texture_cache.ImagesUnderBufferWrite(vsharp.base_address, size, false,
+                                                         image_reloads);
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -2350,12 +2397,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 static const bool keep_images = std::getenv("LBPPC_NO_BUFFER_IMAGE_INVALIDATE") != nullptr;
                 // lbppc: LBP3 overwrites render targets' memory with a compute shader that binds no images (run.py).
                 // The images are kept, so remember it: BeginRenderingFull applies it as a clear where it matters.
-                if (keep_images && desc.is_written && stage.images.empty() &&
+                if (keep_images && !image_sync && desc.is_written && stage.images.empty() &&
                     texture_cache.FindImageFromRange(vsharp.base_address, size, false)) {
-                    pending_target_clears.insert(vsharp.base_address);
+                    pending_target_clears[vsharp.base_address] = {stage.pgm_hash, size};
                 }
                 // A shader that also binds images isn't taken for a clear: said once, for reports.
-                if (keep_images && desc.is_written && !stage.images.empty()) {
+                if (keep_images && !image_sync && desc.is_written && !stage.images.empty()) {
                     static std::set<std::pair<u64, VAddr>> reported;
                     if (reported.insert({stage.pgm_hash, vsharp.base_address}).second &&
                         texture_cache.FindImageFromRange(vsharp.base_address, size, false)) {
@@ -2365,7 +2412,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                     (unsigned long long)vsharp.base_address, (unsigned long long)size);
                     }
                 }
-                if (desc.is_written && !keep_images) {
+                if (desc.is_written && !keep_images && !image_sync) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
@@ -2381,6 +2428,27 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
+    }
+}
+
+void Rasterizer::ApplyImageReloads() {
+    if (!image_reloads.empty()) {
+        std::sort(image_reloads.begin(), image_reloads.end());
+        image_reloads.erase(std::unique(image_reloads.begin(), image_reloads.end()), image_reloads.end());
+        texture_cache.MarkImagesGpuDirty(image_reloads);
+        image_sync_reloaded += image_reloads.size();
+        image_reloads.clear();
+    }
+    // Every 30 s while it happens: how many images buffer writes reached.
+    static auto window = std::chrono::steady_clock::now();
+    if (image_sync_reloaded && std::chrono::steady_clock::now() - window > std::chrono::seconds(30)) {
+        std::printf("Image sync in the last 30 s: %llu images written back before buffer writes, %llu "
+                    "marked to reload after, %llu reloaded (%llu MB)\n",
+                    (unsigned long long)image_sync_written_back, (unsigned long long)image_sync_reloaded,
+                    (unsigned long long)VideoCore::gpu_dirty_uploads.exchange(0),
+                    (unsigned long long)(VideoCore::gpu_dirty_upload_bytes.exchange(0) >> 20));
+        image_sync_written_back = image_sync_reloaded = 0;
+        window = std::chrono::steady_clock::now();
     }
 }
 
@@ -3025,22 +3093,53 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         // from frame to frame (huge orange shapes in effects). The same shader also runs over targets, such as the
         // scene, whose contents must stay.
         const auto& target_blend = regs.blend_control[cb];
-        const bool clear_requested = pending_target_clears.erase(col_buf.Address()) != 0;
+        const auto pending_it = pending_target_clears.find(col_buf.Address());
+        const bool clear_requested = pending_it != pending_target_clears.end();
+        const PendingClear pending_write = clear_requested ? pending_it->second : PendingClear{};
+        if (clear_requested) {
+            pending_target_clears.erase(pending_it);
+        }
+        // Only a write that covers the target as drawn: one into memory where a smaller picture lay before
+        // (e60000 bytes, 2560x1440) said nothing about a 256x8192 image drawn there now.
+        const bool write_covers = pending_write.size >= image->info.guest_size;
         const bool pending_clear =
-            clear_requested && target_blend.enable &&
+            clear_requested && write_covers && !BbToggle::Disabled(BbToggle::TargetClears) && target_blend.enable &&
             target_blend.color_src_factor == AmdGpu::BlendControl::BlendFactor::One &&
             target_blend.color_dst_factor == AmdGpu::BlendControl::BlendFactor::One &&
             target_blend.color_func == AmdGpu::BlendControl::BlendFunc::Add;
         if (clear_requested) {
             // Each decision once, for reports: a dropped clear on a blended target could also pile up.
-            static std::set<std::pair<VAddr, bool>> reported;
-            if (reported.insert({col_buf.Address(), pending_clear}).second) {
-                std::printf("Clear: target %llx next draw blend %u src %u dst %u func %u: %s\n",
-                            (unsigned long long)col_buf.Address(), u32(target_blend.enable),
+            // (per target, shader and decision; with the shader, the size it wrote and the target's size)
+            static std::set<std::tuple<VAddr, u64, bool>> reported;
+            if (reported.insert({col_buf.Address(), pending_write.shader, pending_clear}).second) {
+                std::printf("Clear: target %llx %ux%u next draw blend %u src %u dst %u func %u, written by %016llx "
+                            "(%llx bytes): %s\n",
+                            (unsigned long long)col_buf.Address(), image->info.size.width,
+                            image->info.size.height, u32(target_blend.enable),
                             u32(target_blend.color_src_factor), u32(target_blend.color_dst_factor),
-                            u32(target_blend.color_func),
-                            pending_clear ? "applied"
-                                          : (target_blend.enable ? "dropped (blended: check this one)" : "dropped"));
+                            u32(target_blend.color_func), (unsigned long long)pending_write.shader,
+                            (unsigned long long)pending_write.size,
+                            pending_clear   ? "applied"
+                            : !write_covers ? "dropped (the write does not cover it)"
+                            : (target_blend.enable ? "dropped (blended: check this one)" : "dropped"));
+            }
+            // How often each target is cleared, every 30 s: a live log shows which ones are being cleared now.
+            static std::map<VAddr, u64> applied;
+            static auto window = std::chrono::steady_clock::now();
+            if (pending_clear) {
+                ++applied[col_buf.Address()];
+            }
+            if (std::chrono::steady_clock::now() - window > std::chrono::seconds(30) && !applied.empty()) {
+                std::string line = "Clears in the last 30 s:";
+                for (const auto& [address, count] : applied) {
+                    char item[48];
+                    std::snprintf(item, sizeof(item), " %llx x%llu", (unsigned long long)address,
+                                  (unsigned long long)count);
+                    line += item;
+                }
+                std::printf("%s\n", line.c_str());
+                applied.clear();
+                window = std::chrono::steady_clock::now();
             }
         }
         const bool is_clear =

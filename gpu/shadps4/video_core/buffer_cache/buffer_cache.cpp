@@ -801,13 +801,25 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);
     const u64 arena_offset = arena->Offset(device_addr);
+    auto buffer_copies = ImageToBufferCopies(image, arena->size_bytes - arena_offset);
+    if (buffer_copies.empty()) {
+        return false;
+    }
+    auto& tile_manager = texture_cache.GetTileManager();
+    tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
+    image.flags &= ~ImageFlagBits::NotInBuffer;
+    return true;
+}
+
+boost::container::small_vector<vk::BufferImageCopy, 8> BufferCache::ImageToBufferCopies(
+    const Image& image, u64 limit) {
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
         const auto& mip_info = image.info.mips_layout[mip];
         const u32 width = std::max(image.info.size.width >> mip, 1u);
         const u32 height = std::max(image.info.size.height >> mip, 1u);
         const u32 depth = std::max(image.info.size.depth >> mip, 1u);
-        if (arena_offset + mip_info.offset + mip_info.size > arena->size_bytes) {
+        if (mip_info.offset + mip_info.size > limit) {
             break;
         }
         buffer_copies.push_back(vk::BufferImageCopy{
@@ -824,12 +836,39 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             .imageExtent = {width, height, depth},
         });
     }
-    if (buffer_copies.empty()) {
-        return false;
+    return buffer_copies;
+}
+
+u32 BufferCache::WriteBackImages(VAddr device_addr, u64 size) {
+    boost::container::small_vector<ImageId, 16> images;
+    texture_cache.ImagesUnderBufferWrite(device_addr, size, true, images);
+    if (images.empty()) {
+        return 0;
     }
+    // The copies below change image state: the texture binding helper finishes first.
+    runtime.BeforeImageAccess();
     auto& tile_manager = texture_cache.GetTileManager();
-    tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
-    return true;
+    u32 written = 0;
+    for (const ImageId id : images) {
+        Image& image = texture_cache.GetImage(id);
+        const VAddr address = image.info.guest_address;
+        const u64 image_size = image.info.guest_size;
+        if (image_size == 0 || image_size > u64{UINT32_MAX} ||
+            memory->ClampRangeSize(address, image_size) != image_size) {
+            continue;
+        }
+        // Resident, guest writes taken in, and marked as the GPU's: later reads of this memory (an
+        // image reloading, a CPU read) take what is written here.
+        const auto [arena, offset] = ObtainBuffer(address, static_cast<u32>(image_size), true);
+        auto copies = ImageToBufferCopies(image, arena->size_bytes - offset);
+        if (copies.empty()) {
+            continue;
+        }
+        tile_manager.TileImage(image, copies, arena, offset);
+        image.flags &= ~ImageFlagBits::NotInBuffer;
+        ++written;
+    }
+    return written;
 }
 
 void BufferCache::NoteChunkUse(VAddr device_addr, u64 size) {
