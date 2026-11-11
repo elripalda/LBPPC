@@ -2,18 +2,17 @@
 
 Before tagging a release.
 
-## Temporary diagnostics to switch off
+## Diagnostics
 
-| What | Where | Why it's there |
-|---|---|---|
-| `LBPPC_PROFILE` on by default ("Profile:" and "Threads:" lines) | `run.py`, `env.setdefault('LBPPC_PROFILE', '1')` | Performance work. Measured as free, but makes logs larger. |
-| `BB_TOGGLE_FILE` (`user/toggles.txt`) | `run.py` | Climbing teleport hunt: optimizations switched off at run time. |
-| Friends log ("Friends (menu):" lines every 5 s, online only) | `src/probe.c`, `friend_log_install()` | Friends menu investigation. Remove once the menu lists friends. |
+The temporary diagnostics are Debug page switches, off by default (`DIAGNOSTICS` in `launcher/lbppc_launcher.py`):
+the slow-frame profiler (`LBPPC_PROFILE`), optimization switches (`LBPPC_TOGGLES`, which sets `BB_TOGGLE_FILE` in
+`run.py`) and the friends menu log (`LBPPC_FRIENDS_LOG`, `src/probe.c`). Check they are still off by default.
 
-Keep:
+Keep on:
 
 - The "Sync:" lines (`src/probe.c`). `docs/troubleshooting.md` tells players to send them when the game diverges.
 - `BB_FRAME_STATS`, the 5-second performance lines `docs/troubleshooting.md` explains.
+- The "Clear:" lines (`docs/rendering-fixes.md`).
 
 ## Tests
 

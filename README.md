@@ -1,54 +1,128 @@
 # LBPPC
 
-LittleBigPlanet 3 running natively on PC, with community servers so creating and sharing levels can live on.
+**LittleBigPlanet 3, running natively on PC, with its online world back.**
 
-**Status:** 0.1.0 beta. LittleBigPlanet 3 (US, CUSA00473 version 1.28) boots, plays and goes online on community servers:
+LBPPC runs the PS4 game's own code directly on your PC's processor. It is a native port, not an emulator. The
+community servers bring back creating, sharing and playing levels together, which ended when the original servers
+shut down.
 
-- 720p to 4K and ultrawide, online too (the menus lay themselves out for it; movies and loading screens stay 16:9).
-- 60 FPS with frame generation (DLSS or FSR 3.1); the game itself steps 30 times a second, as on PS4.
-- NVIDIA Reflex / AMD Anti-Lag 2.
-- Online on [Refresh](https://github.com/LittleBigRefresh/Refresh) (levels, profiles) with [shadNet](https://github.com/shadps4-emu/shadNet) for sign-in, friends and co-op, with a join protection against the exploit that closed LittleBigPlanet's community servers: see [docs/online.md](docs/online.md).
+**Status:** 0.1.0, the first public beta. It supports LittleBigPlanet 3 US (CUSA00473), version 1.28. You need your
+own copy, dumped from your PS4.
+
+[Download and guide](https://lbppc.com/download) · [Discord](https://discord.gg/YqfBQCU4vc) ·
+[Release notes](docs/releases/0.1.0.md)
+
+## What you get
+
+**The game, on PC**
+- **60 FPS** with frame generation: DLSS on NVIDIA RTX, FSR 3.1 on everything else. The game still steps 30 times a
+  second, as on PS4, so physics and timing feel the same.
+- **720p to 4K, and ultrawide.** The menus lay themselves out for wide screens, online too. Movies and loading screens
+  stay 16:9.
+- **FSR 1 upscaling** with adjustable sharpening, for playing below your screen's resolution.
+- **NVIDIA Reflex and AMD Anti-Lag 2** for lower input latency.
+- **Controllers out of the box**, motion sensors included. Keyboard controls can be rebound in the launcher.
 - **Quit Game** in the pause menu.
 
-Online co-op is new in this release and only lightly tested.
+**Online**
+- **One account** for everything, created in the launcher. The server is `play.lbppc.com`.
+- **Ten million archived levels.** The community levels saved from LittleBigPlanet's original servers can be played
+  again.
+- **Online co-op** with your friends, through a relay when your connections can't reach each other directly.
+- **Join protection.** Only your friends can join your game. This closes the "force join" exploit that ended
+  LittleBigPlanet's community servers.
+- **Friends in the launcher:** send and accept requests, and see who's online. Friends playing LBPPC show in the
+  Pod's friends list too.
 
-## Playing
+**The launcher**
+- Settings for resolution, frame generation, upscaling, controls and online play, all in one window.
+- **Make a report** packs everything a bug report needs into one zip, without your passwords or user name.
 
-Unzip a release, start `LBPPC.exe`, choose the folder of your game dump and press Play. For online play, see [docs/online.md](docs/online.md).
+## Getting started
 
-If something goes wrong, click **Make a report** in the launcher and attach the zip to your bug report; [docs/troubleshooting.md](docs/troubleshooting.md) explains what the log says.
+You need 64-bit Windows 10 (1903 or later) or Windows 11, a graphics card with Vulkan support, and your own dump of
+LittleBigPlanet 3 (CUSA00473, version 1.28).
+
+1. Unzip a release anywhere except Program Files, for example `C:\Games\LBPPC`.
+2. Start `LBPPC.exe`. If Windows SmartScreen warns about a new app, click **More info**, then **Run anyway**.
+3. Choose your game dump's folder and press **Play**. The first start prepares the game, which takes about a minute.
+   The first time you see something new, it may hitch once while its shaders are built.
+4. To play online, tick **Play online**, choose a name and password, press **Create account**, and add your friends.
+
+The full guide is at [lbppc.com/download](https://lbppc.com/download), and online play is covered in
+[docs/online.md](docs/online.md).
 
 ### Controls
 
-A controller works out of the box. The launcher's **Controls** page sets the keys and controller buttons; it writes `input.ini` (next to `LBPPC.exe`), which F8 reloads in game. Lines the page does not edit (combos, dead zones) are kept.
+- **Controller:** works out of the box.
+- **Keyboard:** the launcher's **Controls** page sets keys and controller buttons. It writes `input.ini` next to
+  `LBPPC.exe`, and F8 reloads it in game.
+- **Motion:** a DualShock 4, DualSense or Switch Pro controller tilts Sackboy's head as on PS4. Without one, the
+  number pad tilts it (4 left, 6 right, 8 forward, 2 back).
+- **Mouse:** off in 0.1.0. Using the mouse as the touchpad, for touch Create Mode, is planned.
 
-- **Motion:** a controller with motion sensors (DualShock 4, DualSense, Switch Pro) tilts Sackboy's head as on a PS4. Without one, the number pad tilts it (4 left, 6 right, 8 forward, 2 back), or bind `tilt_left`, `tilt_right`, `tilt_forward` and `tilt_back` to anything.
-- **Mouse:** off in 0.1.0. The mouse as the touchpad (for touch Create Mode) wasn't reliable enough yet and is planned for a later release.
+## Known issues
 
-## How it works
+- **Online co-op is new.** If the game says the players' worlds diverged, make a report on both PCs.
+- **Some effects or materials draw wrongly in some levels.**
 
-As in the Bloodborne PC port, the game's own PS4 code runs natively on the PC's CPU, a runtime stands in for the PS4 system libraries, and a GPU layer derived from shadPS4 translates its graphics to Vulkan. Online play goes to community servers instead of the original ones, which are gone.
+## Found a problem?
+
+1. Close the game after the problem happens.
+2. In the launcher, click **Make a report**.
+3. Attach the zip to a [GitHub issue](../../issues) or post it on Discord. Say what you were doing and which level you
+   were in.
+
+[docs/troubleshooting.md](docs/troubleshooting.md) explains what the log says.
 
 ## You need your own copy of the game
 
-This repository contains no game files and never will. To play, you dump LittleBigPlanet 3 from your own PS4. Please don't open issues or pull requests containing game files, and don't ask for them.
+This repository contains no game files and never will. To play, dump LittleBigPlanet 3 from your own PS4. Please
+don't post game files in issues or pull requests, and don't ask for them.
 
-## Layout
+## How it works
 
-| Folder | What goes there |
+- **The game's code runs natively.** The PS4 and the PC share the same processor architecture (x86-64), so the game's
+  executable runs on the CPU as it is, with no translation.
+- **A runtime stands in for the PS4 system.** It provides the system libraries the game calls: files, threads,
+  memory, audio, input, save data and the network.
+- **A graphics layer translates PS4 GPU work to Vulkan.** It is derived from shadPS4.
+- **Online play goes to community servers.**
+  - [Refresh](https://github.com/LittleBigRefresh/Refresh) handles levels, profiles and photos.
+  - [shadNet](https://github.com/shadps4-emu/shadNet), with LBPPC's patch, handles sign-in, friends, presence, the
+    co-op relay and invites.
+- **Online stays in sync.** Both players' worlds step in lockstep, so CPU-specific maths shortcuts are replaced with
+  exact versions that give the same results on every PC.
+- **Small game changes are made in memory.** Changes such as Quit Game edit the game's files as they're read; the
+  files on disk are never touched.
+
+## Building
+
+Windows, with MSYS2 CLANG64: `./build.sh`. The packages it needs are listed in
+[packaging/windows/README.md](packaging/windows/README.md). The launcher is Python; `run.py` starts the game from a
+checkout.
+
+| Folder | What's there |
 |---|---|
-| `src/` | The runtime: loads and runs the game's code; stands in for the PS4 system libraries |
-| `gpu/` | The graphics layer: PS4 GPU commands and shaders to Vulkan (from shadPS4) |
-| `scripts/` | Reads the game's executable and links it with its bundled modules before a start |
-| `tools/` | Development tools: import list, GPU capability check |
-| `tests/` | Tests of the GPU layer |
-| `docs/` | Research notes and design documents |
+| `src/` | The runtime: loads and runs the game's code and stands in for the PS4 system libraries |
+| `gpu/` | The graphics layer (PS4 GPU commands and shaders to Vulkan) and the online layer |
+| `launcher/` | The launcher: settings, controls, accounts, friends and reports |
+| `scripts/` | Prepares the game before a start: links its modules and makes the in-memory game changes |
+| `server/` | Building and running the community servers, with LBPPC's shadNet patch |
+| `packaging/` | Release packaging |
+| `tools/` | Development tools |
+| `tests/` | Tests of the runtime, graphics layer and input |
+| `docs/` | Player guides, research notes and design documents |
 
-The runtime and graphics layer come from the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) 1.9.5 (see [Credits](#credits)); the Bloodborne-only features (its patches, menus, mouse camera, Discord status and online backend) have been removed. Build on Windows with MSYS2 CLANG64: `./build.sh` (packages in `packaging/windows/README.md`).
+Useful reading: [docs/troubleshooting.md](docs/troubleshooting.md) (the log, line by line),
+[docs/rendering-fixes.md](docs/rendering-fixes.md) (how graphics bugs were tracked down) and
+[docs/release-checklist.md](docs/release-checklist.md).
 
 ## Credits
 
-LBPPC is built on the work of the Bloodborne PC port and the projects behind it. Its full history is in [that repository](https://github.com/Supermedo/bloodborne_pc), and this code was imported from version 1.9.5 at commit `ff42e28`.
+LBPPC is built on the work of the Bloodborne PC port and the projects behind it. Its runtime and graphics layer were
+imported from version 1.9.5 of the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc), at commit
+`ff42e28`, where the full history is.
 
 - [bbport](https://github.com/deadinside28/bloodborne_pc), the native port of Bloodborne by deadinside28, and the [Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc) by Supermedo, nick24051998 and their contributors.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), whose renderer and network, NP and shadNet code are at the heart of the graphics and online layers, and the [shadNet](https://github.com/shadps4-emu/shadNet) server by the shadPS4 team.
@@ -64,4 +138,5 @@ Also used: [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD Fide
 
 GPL-3.0-or-later; see [LICENSE](LICENSE). Code taken from shadPS4 and the Bloodborne PC port keeps its own notices.
 
-This is an unofficial fan project, not affiliated with or endorsed by Sony Interactive Entertainment or Sumo Digital. LittleBigPlanet is a trademark of its owners.
+This is an unofficial fan project, not affiliated with or endorsed by Sony Interactive Entertainment or Sumo Digital.
+LittleBigPlanet is a trademark of its owners.

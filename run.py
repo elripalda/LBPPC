@@ -97,6 +97,34 @@ def key_labels(input_ini):
     return ';'.join(labels)
 
 
+# The game keeps what it downloads (levels, their pictures and sounds) in its temporary data, and reads it from
+# there again without downloading it. When the check on downloads changes (http.cpp, RefusedAsset), what an earlier
+# build let in must not stay: the cache is cleared once per value of CACHE_EPOCH. The game rebuilds it, as it does
+# on a PS4, where the system may clear temporary data at any time.
+CACHE_EPOCH = '1'  # 1: 0.1.0, downloads checked for their hash and type
+
+
+def clear_download_cache(user):
+    marker = user / 'temp0' / 'lbppc-cache-epoch'
+    try:
+        if marker.read_text(encoding='ascii').strip() == CACHE_EPOCH:
+            return
+    except OSError:
+        pass
+    for drive in ('hdd0', 'hdd1'):
+        for title in (user / 'temp0' / drive).glob('*'):
+            for name in ('dl_orbis', 'temp_orbis'):
+                cache = title / 'output' / name
+                try:
+                    cache.unlink(missing_ok=True)
+                except OSError as error:  # in use or read-only: the next start tries again
+                    print(f'LBPPC: could not clear {cache}: {error}', file=sys.stderr)
+                    return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(CACHE_EPOCH, encoding='ascii')
+    print('LBPPC: download cache cleared (downloads are checked again)')
+
+
 def main(argv):
     if not argv or argv[0].startswith('-'):
         sys.exit(__doc__)
@@ -110,6 +138,7 @@ def main(argv):
     # LBPPC_USER_DIR (tests): saves and settings somewhere other than user/.
     user = Path(os.environ['LBPPC_USER_DIR']) if os.environ.get('LBPPC_USER_DIR') else HERE / 'user'
     user.mkdir(exist_ok=True)
+    clear_download_cache(user)
     script('prepare.py', game, '--out', OUT)
     # The game's own modules (LBP3's FMOD plugins) are linked too; sceKernelLoadStartModule hands them out.
     plugins = sorted(p.relative_to(game).as_posix() for p in game.glob('gamedata_orbis/spu/*.prx'))
@@ -151,16 +180,16 @@ def main(argv):
     # Beta: frame rate, pacing and where each frame's time went, every 5 s in the log (a few KB a minute), so a
     # player's slow level can be told apart (the game's own work, the GPU, shader compiles, stalls).
     env.setdefault('BB_FRAME_STATS', '1')
-    # Performance work (temporary, before release): where the game's main thread was during each slow frame, and CPU
-    # per thread ("Profile:" and "Threads:" lines). Measured to cost nothing visible: 80-86 slow frames with it on or
-    # off in the same scripted run.
-    env.setdefault('LBPPC_PROFILE', '1')
+    # LBPPC_PROFILE=1 (Debug page: "Slow-frame profiler", off by default): where the game's main thread was during
+    # each slow frame, and CPU per thread ("Profile:" and "Threads:" lines). Measured to cost nothing visible.
     # Guest writes into GPU-written memory skip the copy back (buffer_cache.cpp): faster in busy levels, nothing
     # found wrong in testing. Debug page: "Skip GPU readbacks".
     env.setdefault('LBPPC_WRITE_FAULT_NO_READBACK', '1')
-    # Climbing teleports (temporary): optimizations switched off while the game runs, by writing their mask
-    # (gpu/shim/bbport_toggles.h, src/runtime_memory.c) to user/toggles.txt; read 4 times a second.
-    env.setdefault('BB_TOGGLE_FILE', str(user / 'toggles.txt'))
+    # LBPPC_TOGGLES=1 (Debug page: "Optimization switches", off by default): optimizations switched off while the
+    # game runs, by writing their mask (gpu/shim/bbport_toggles.h, src/runtime_memory.c) to user/toggles.txt; read 4
+    # times a second. Found the climbing teleports.
+    if env.get('LBPPC_TOGGLES') == '1':
+        env.setdefault('BB_TOGGLE_FILE', str(user / 'toggles.txt'))
     # LBPPC_KEY_PROMPTS=1 (unfinished, off; key_prompts.h): the face button icons show the keys bound to them in
     # input.ini.
     if env.get('LBPPC_KEY_PROMPTS') == '1':

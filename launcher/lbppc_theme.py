@@ -308,3 +308,47 @@ def card(w, h, accent):
     ImageDraw.Draw(bar).rectangle((0, 0, 5 * S, h * S), fill=255)
     img.paste(Image.new('RGBA', img.size, accent + (255,)), (0, 0), ImageChops.multiply(stripe, bar))
     return finish(img)
+
+
+def paragraph(text, size, width, colour=TEXT, weight='Regular', spacing=1.35):
+    """`text` in Fredoka, wrapped to `width` pixels (lines kept apart by `spacing` x size)."""
+    f = font(size, weight)
+    lines, line = [], ''
+    for word in text.split():
+        trial = f'{line} {word}'.strip()
+        if line and f.getlength(trial) > width * S:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    if line:
+        lines.append(line)
+    step = round(size * spacing * S)
+    img = Image.new('RGBA', (width * S, max(1, step * len(lines) + size * S // 2)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for i, text_line in enumerate(lines):
+        draw.text((0, i * step), text_line, font=f, fill=colour)
+    return finish(img)
+
+
+def badge(number, size=26):
+    """A round lime badge with a number on it, for numbered steps."""
+    d = size * S
+    img = Image.new('RGBA', (d, d), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((0, 0, d - 1, d - 1), fill=LIME + (255,))
+    f = font(int(size * 0.58), 'Bold')
+    draw.text((d / 2, d / 2 + S), str(number), font=f, fill=NIGHT, anchor='mm')
+    return finish(img)
+
+
+def notice_card(w, h, title, radius=20):
+    """A panel (as on the launcher) on felt, cut to its rounded shape: corners transparent."""
+    base = felt(w, h).convert('RGBA')
+    mask = Image.new('L', (w * 4, h * 4), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * 4 - 1, h * 4 - 1), radius * 4, fill=255)
+    mask = mask.resize((w, h), Image.LANCZOS)
+    out = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    out.paste(base, (0, 0), mask)
+    out.alpha_composite(panel(w, h, title, radius))
+    return out

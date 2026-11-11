@@ -388,6 +388,26 @@ void Hint(const char* text) {
 /// The presented frame rate; with frame generation adding frames also the game's own rate,
 /// which is what the GPU's load (resolution, upscaler) changes. The total follows the game's
 /// FPS cap times the multiplier while the GPU keeps up.
+extern u32 output_width, output_height; // the presented size (defined below)
+// lbppc: the size LBP3 draws at (LBPPC_RENDER_RES, run.py; 1920x1080 without it) and whether FSR 1 scales it
+// to the window (BB_FSR1: the launcher's Upscaling; only when the window is larger).
+void GameSize(u32& w, u32& h) {
+    static const auto size = [] {
+        unsigned gw = 1920, gh = 1080;
+        if (const char* spec = std::getenv("LBPPC_RENDER_RES")) std::sscanf(spec, "%ux%u", &gw, &gh);
+        return std::pair<u32, u32>{gw, gh};
+    }();
+    w = size.first;
+    h = size.second;
+}
+bool Fsr1On() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_FSR1");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 std::string FpsText() {
     const auto& s = BbSettings::Get();
     const float shown = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
@@ -494,6 +514,26 @@ void Menu() {
     }
     ImGui::Text("%s", FpsText().c_str());
 
+    // lbppc: the temporal upscalers (FSR 3/4, DLSS, TAA) need a frame layout they know (Bloodborne's); none works
+    // with LBP3's yet, so their section is left out. LBPPC_UPSCALER_MENU=1 (development) shows it.
+    ImGui::SeparatorText("Picture");
+    {
+        u32 game_w, game_h;
+        GameSize(game_w, game_h);
+        if (output_width && (output_width > game_w || output_height > game_h)) {
+            ImGui::Text("Drawn at %u x %u, shown at %u x %u: %s", game_w, game_h, output_width, output_height,
+                        Fsr1On() ? "upscaled with FSR 1" : "stretched");
+        } else {
+            ImGui::Text("Drawn at %u x %u", game_w, game_h);
+        }
+        Hint("Resolution, Upscaling (FSR 1) and Sharpening are in the launcher's Game page. Upscaling only does "
+             "something when the resolution is below the window's.");
+    }
+    static const bool upscaler_menu = [] {
+        const char* env = std::getenv("LBPPC_UPSCALER_MENU");
+        return env && env[0] == '1';
+    }();
+    if (upscaler_menu) {
     ImGui::SeparatorText("Temporal upscaling");
     static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (experimental)",
                                      "TAA (native anti-aliasing)", "DLSS (NVIDIA RTX)", "FSR 4.1.2 (experimental)"};
@@ -692,6 +732,8 @@ void Menu() {
     Hint("Red/green: horizontal/vertical motion (8 pixels = full brightness). Blue: the pixel has accurate object motion, beyond camera motion. A moving object with no blue or red/green is treated as stationary and may leave trails.");
     ImGui::EndDisabled(); // upscaler off
 
+    }
+
     ImGui::SeparatorText("Frame generation");
     static const char* frame_gens[] = {"Off", "FSR 3.1 (any GPU)", "DLSS (NVIDIA RTX 40/50)",
         "AMD ML-FG 4.0.1 (RX 9000, 2x SDR, experimental)",
@@ -700,6 +742,9 @@ void Menu() {
     const int frame_gen = s.frame_gen;
     if (ImGui::BeginCombo("Frame generation", frame_gens[frame_gen])) {
         for (int i = 0; i < BbSettings::FrameGenCount; ++i) {
+            if (BbSettings::IsMlFrameGen(i) && !upscaler_menu) {
+                continue; // lbppc: not offered (the launcher's choices: off, FSR 3.1, DLSS)
+            }
             const bool supported = (i != BbSettings::FrameGenDlss || s.dlssg_max_multiplier > 1) &&
                 (!BbSettings::IsMlFrameGen(i) || s.MlFgSupported(i));
             ImGui::BeginDisabled(!supported);
@@ -717,7 +762,7 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
-    Hint("Generates frames between two of the game's frames: 60 FPS on screen becomes 120. Needs a display with that refresh rate (120 Hz or more at 60 FPS); it pauses when the display cannot show the extra frames, and 3x/4x drop to what it can. Adds a little input latency. Menus and movies are not generated.");
+    Hint("Generates frames between two of the game's: it runs 30 steps a second, so 2x shows 60 FPS (3x and 4x, with DLSS on GeForce RTX 50 cards: 90 and 120). Needs a display with that refresh rate; it pauses when the display cannot show the extra frames. Adds a little input latency. Menus and movies are not generated.");
     const int max_multiplier =
         s.frame_gen == BbSettings::FrameGenDlss ? s.dlssg_max_multiplier.load() : 2;
     ImGui::BeginDisabled(s.frame_gen == BbSettings::FrameGenOff || max_multiplier <= 2);
@@ -1052,13 +1097,17 @@ void FpsCounter() {
         ImGui::Text("%.1f", double(rate));
         ImGui::PopStyleColor();
         ImGui::SameLine(0.0f, model_gap);
-        const int out = s.output_res;
-        ImGui::TextDisabled("|  %ux%u", output_width ? output_width : u32(BbSettings::OutputWidths[out]),
-                            output_height ? output_height : u32(BbSettings::OutputHeights[out]));
-        if (UpscalerLabel(s.upscaler)[0] != '\0') {
+        // lbppc: the size the game draws at; the window's after it when that differs (scaled up).
+        u32 game_w, game_h;
+        GameSize(game_w, game_h);
+        const bool scaled = output_width && (output_width > game_w || output_height > game_h);
+        if (scaled) {
+            ImGui::TextDisabled("|  %ux%u > %ux%u", game_w, game_h, output_width, output_height);
             ImGui::SameLine(0.0f, 6.0f * base_scale);
-            ImGui::TextColored(PlainCounter() ? PlainValue : UpscalerColor(s.upscaler), "%s",
-                               UpscalerLabel(s.upscaler));
+            ImGui::TextColored(PlainCounter() ? PlainValue : ImVec4(0.93f, 0.33f, 0.24f, 1.0f), "%s",
+                               Fsr1On() ? "FSR 1" : "stretched");
+        } else {
+            ImGui::TextDisabled("|  %ux%u", game_w, game_h);
         }
         const int generated = s.frame_gen != BbSettings::FrameGenOff ? s.frame_gen_now.load() : 0;
         if (generated > 0 && s.game_fps > 0.0f) {
@@ -1430,11 +1479,11 @@ bool ReadoutsOn() {
 
 bool Visible() {
     return initialized &&
-           (menu_open || text_entry_active || BbInvite::Shown() || WarningActive() || ReadoutsOn());
+           (menu_open || text_entry_active || BbInvite::BoxShown() || WarningActive() || ReadoutsOn());
 }
 
 bool CapturesInput() {
-    return menu_open || text_entry_active || BbInvite::Shown();
+    return menu_open || text_entry_active || BbInvite::BoxShown();
 }
 
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {

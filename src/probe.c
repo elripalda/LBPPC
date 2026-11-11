@@ -412,7 +412,9 @@ static void watch_slot(uint64_t entry_rsp) {
  * flag at +0x5e8 the game has for this, so that a test collects more than one. */
 enum { SYNC_SEND_SITE=0x256d9a, SYNC_RECEIVE_SITE=0x269ed6 };
 typedef struct { unsigned char id[0x24]; uint32_t where_a, where_b, frame, hash, session; } SyncRecord;
+static volatile uint64_t sync_last_frame; /* the world frame of the last sync check (net log) */
 static void sync_log_send(uint64_t world, uint64_t frame) {
+    sync_last_frame=frame;
     const uint32_t count=*(uint32_t *)(uintptr_t)(world+0x128);
     const uint64_t *players=*(const uint64_t **)(uintptr_t)(world+0x120);
     printf("Sync: frame %llu, %u players\n",(unsigned long long)frame,count);
@@ -428,25 +430,36 @@ static void sync_log_send(uint64_t world, uint64_t frame) {
     }
 }
 /* lbppc: the game ends the session on the first difference. One right after a level change can be a moment where the
- * worlds aren't aligned yet, so it takes SYNC_DIFFERENCES_TO_END in a row (one check every 2 s). Worlds that have really
- * split keep differing and end the session as before. Returns the flag the game reads: nonzero carries on past a difference. */
+ * worlds aren't aligned yet, so it takes SYNC_DIFFERENCES_TO_END checks in a row that differ (one every 2 s). Worlds that
+ * have really split keep differing and end the session as before. Counted per check (frame), not per message: each game
+ * also receives a report holding its own state, which always matches, and counting that as "match again" kept two split
+ * worlds frozen in one session (2026-11-11). A check counts as matching only once a later check arrives with no
+ * difference at it. Returns the flag the game reads: nonzero carries on past a difference. */
 enum { SYNC_DIFFERENCES_TO_END=3 };
-typedef struct { unsigned differences; int set_flag; } SyncTolerance;
+typedef struct { unsigned differences; int set_flag; unsigned frame; int frame_seen, frame_differs; } SyncTolerance;
 /* outcome: 1 the same frame differs, 0 it matches, -1 no record of that frame yet. */
 static unsigned char sync_tolerance_step(SyncTolerance *t, int outcome, unsigned char flag, unsigned frame) {
-    if (outcome>0) {
-        ++t->differences;
-        printf("Sync: DIFFERENCE %u of %u at frame %u\n",t->differences,(unsigned)SYNC_DIFFERENCES_TO_END,frame);
-        if (t->differences<SYNC_DIFFERENCES_TO_END) {
-            if (!flag) { flag=1; t->set_flag=1; }
-        } else {
-            printf("Sync: worlds still differ after %u checks, ending the session\n",t->differences);
+    if (outcome<0) return flag;
+    if (!t->frame_seen || frame!=t->frame) {
+        /* A new check: the last one, if nothing differed at it, means the worlds match again. */
+        if (t->frame_seen && !t->frame_differs && t->differences) {
+            printf("Sync: worlds match again after %u difference(s), at frame %u\n",t->differences,t->frame);
+            t->differences=0;
             if (t->set_flag) { flag=0; t->set_flag=0; }
         }
-    } else if (outcome==0) {
-        if (t->differences) printf("Sync: worlds match again after %u difference(s), at frame %u\n",t->differences,frame);
-        t->differences=0;
-        if (t->set_flag) { flag=0; t->set_flag=0; }
+        t->frame=frame; t->frame_seen=1; t->frame_differs=0;
+    }
+    if (outcome>0) {
+        if (!t->frame_differs) {
+            t->frame_differs=1;
+            ++t->differences;
+            printf("Sync: DIFFERENCE %u of %u at frame %u\n",t->differences,(unsigned)SYNC_DIFFERENCES_TO_END,frame);
+            if (t->differences>=SYNC_DIFFERENCES_TO_END)
+                printf("Sync: worlds still differ after %u checks, ending the session\n",t->differences);
+        }
+        if (t->differences<SYNC_DIFFERENCES_TO_END) {
+            if (!flag) { flag=1; t->set_flag=1; }
+        } else if (t->set_flag) { flag=0; t->set_flag=0; }
     }
     return flag;
 }
@@ -460,7 +473,7 @@ static void sync_log_receive(uint64_t game, const SyncRecord *message) {
         const SyncRecord *records=*(const SyncRecord **)(uintptr_t)(game+0x550);
         const uint32_t records_count=*(uint32_t *)(uintptr_t)(game+0x558), session=*(uint32_t *)(uintptr_t)(game+0x564);
         static uint32_t last_session;
-        if (session!=last_session) { tolerance=(SyncTolerance){0,0}; last_session=session; }
+        if (session!=last_session) { tolerance=(SyncTolerance){0}; last_session=session; }
         int outcome=-1;
         if (!message->session || !session || message->session==session)
             for (uint32_t i=0;i<records_count && records;++i)
@@ -1021,11 +1034,47 @@ static void stub_pool_reserve(void) {
     if (!load) return;
     for (uintptr_t at=load>STUB_POOL ? load-STUB_POOL : 0x10000; !stub_pool && at>=0x10000; at-=0x10000)
         stub_pool=VirtualAlloc((void *)at,STUB_POOL,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    /* Security: no access until a block is handed out (near_image_alloc). */
+    DWORD was;
+    if (stub_pool) VirtualProtect(stub_pool,STUB_POOL,PAGE_NOACCESS,&was);
 }
+/* Security: patch code is written once, while the game is set up, and is then made read-only and executable
+ * (stub_memory_seal), so nothing can write code there later. A block whose stub keeps data it changes while the
+ * game runs (LBPPC_SIM_DIVIDE, research) stays writable (stub_keep_writable). */
+enum { MAX_STUB_BLOCKS=64 };
+static unsigned char *stub_blocks[MAX_STUB_BLOCKS];
+static unsigned char stub_block_writable[MAX_STUB_BLOCKS];
+static int stub_block_count, stub_memory_sealed;
+static unsigned char *near_image_alloc_raw(void);
 static unsigned char *near_image_alloc(void) {
+    unsigned char *p=near_image_alloc_raw();
+    if (!p) return NULL;
+    if (stub_block_count<MAX_STUB_BLOCKS) stub_blocks[stub_block_count++]=p;
+    if (stub_memory_sealed) fputs("Patches: code memory allocated after it was made read-only (left writable)\n",stderr);
+    return p;
+}
+static void stub_keep_writable(const unsigned char *p) {
+    for (int i=0;i<stub_block_count;++i) if (stub_blocks[i]==p) stub_block_writable[i]=1;
+}
+static void stub_memory_seal(void) {
+    int sealed=0, kept=0;
+    for (int i=0;i<stub_block_count;++i) {
+        DWORD was;
+        if (stub_block_writable[i]) { ++kept; continue; }
+        if (VirtualProtect(stub_blocks[i],65536,PAGE_EXECUTE_READ,&was)) ++sealed;
+        else fprintf(stderr,"Patches: could not make code memory at %p read-only (%lu)\n",(void *)stub_blocks[i],
+                     (unsigned long)GetLastError());
+    }
+    FlushInstructionCache(GetCurrentProcess(),NULL,0);
+    stub_memory_sealed=1;
+    printf("Patches: %d blocks of patch code read-only%s\n",sealed,kept ? ", research switches keep theirs writable" : "");
+}
+static unsigned char *near_image_alloc_raw(void) {
     unsigned char *p=NULL;
     if (stub_pool && stub_pool_used+65536<=STUB_POOL && (uintptr_t)stub_pool-(uintptr_t)image+0x70000000u<0xe0000000u) {
         p=stub_pool+stub_pool_used;
+        DWORD was;
+        if (!VirtualProtect(p,65536,PAGE_EXECUTE_READWRITE,&was)) return NULL;
         stub_pool_used+=65536;
         return p;
     }
@@ -1143,6 +1192,7 @@ static void sim_divide_install(void) {
     if (n<1 || image[site]!=0xe8) { fprintf(stderr,"LBPPC_SIM_DIVIDE: not applied\n"); return; }
     unsigned char *s=near_image_alloc();
     if (!s) { fputs("LBPPC_SIM_DIVIDE: no memory near the image\n",stderr); return; }
+    stub_keep_writable(s); /* its counter and switch are in the stub */
     /* stub: cmp byte [rip+active],0; je direct; sub dword [rip+counter],1; jg skip;
      *       mov dword [rip+counter],n; direct: jmp [rip+target]; skip: ret */
     unsigned char *o=s;
@@ -1243,8 +1293,96 @@ static DWORD WINAPI friend_log_thread(void *unused) {
     return 0;
 }
 static void friend_log_install(void) {
-    const char *npid=getenv("BB_SHADNET_NPID");
-    if (npid && *npid) CloseHandle(CreateThread(NULL,0,friend_log_thread,NULL,0,NULL));
+    /* LBPPC_FRIENDS_LOG=1 (launcher Debug page: "Friends menu log", off by default), online only. */
+    const char *npid=getenv("BB_SHADNET_NPID"), *wanted=getenv("LBPPC_FRIENDS_LOG");
+    if (npid && *npid && wanted && wanted[0]=='1') CloseHandle(CreateThread(NULL,0,friend_log_thread,NULL,0,NULL));
+}
+/* lbppc (diagnostics, online, with LBPPC_POS_LOG=1): the game's network messages, by type, every 5 s. The dispatcher
+ * (0x3add00) first checks a message (0x379ab0, called at 0x3add96; it drops the message when that fails), then decodes
+ * its header (0x3ac550 at 0x3addec; the type is the first dword) and calls the handler registered for that type
+ * (0x247a04 on: 0x3d the sync check, 0x39, 0x36, 0x35, 0x2c, 0x2e, 0x4d, 0x55, 0x6d). Logged: messages passing and
+ * failing the check, and each type's count, to tell what a co-op guest stops receiving after a Pod load. */
+enum { NET_CHECK_SITE=0x3add96, NET_CHECK=0x379ab0, NET_HEADER_SITE=0x3addec, NET_HEADER=0x3ac550 };
+static ABI uint64_t (*net_check)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+static ABI uint64_t (*net_header)(uint64_t,uint64_t);
+static volatile LONG net_passed, net_failed, net_types[128];
+static volatile LONG64 net_last_log;
+/* The dispatcher's r13 (who sent the message), stored by the hook's stub before it jumps to net_header_hook. */
+static volatile uint64_t net_sender;
+static void net_log_maybe(void) {
+    const LONG64 now=(LONG64)GetTickCount64();
+    LONG64 last=net_last_log;
+    if (now-last<5000 || InterlockedCompareExchange64(&net_last_log,now,last)!=last) return;
+    char line[1024];
+    int n=snprintf(line,sizeof(line),"Net: last 5 s: %ld messages passed the check, %ld failed; by type:",
+                   InterlockedExchange(&net_passed,0),InterlockedExchange(&net_failed,0));
+    for (int i=0;i<128 && n<(int)sizeof(line)-16;++i) {
+        const LONG c=InterlockedExchange(&net_types[i],0);
+        if (c) n+=snprintf(line+n,sizeof(line)-n," %02x:%ld",i,c);
+    }
+    puts(line);
+    fflush(stdout);
+}
+static ABI uint64_t net_check_hook(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f) {
+    const uint64_t r=net_check(a,b,c,d,e,f);
+    InterlockedIncrement((r&0xff) ? &net_passed : &net_failed);
+    net_log_maybe();
+    return r;
+}
+static ABI uint64_t net_header_hook(uint64_t header,uint64_t b) {
+    const uint64_t r=net_header(header,b);
+    const uint32_t type=*(const uint32_t *)(uintptr_t)header;
+    InterlockedIncrement(&net_types[type&127]);
+    /* The one-off messages (not 0x0f, sent every frame, nor 0x3d, the sync check), each: time, world frame, sender,
+     * size and first bytes of the message (the dispatcher's buffer: pointer at header-0x38, size at header-0x30). */
+    if (type!=0x0f && type!=0x3d) {
+        const unsigned char *data=*(const unsigned char *const *)(uintptr_t)(header-0x38);
+        const uint32_t size=*(const uint32_t *)(uintptr_t)(header-0x30);
+        char from[24]={0}, hex[3*48+1]={0};
+        const char *sender=(const char *)(uintptr_t)net_sender;
+        for (int i=0,k=0;i<20 && sender;++i) {
+            char c;
+            if (!read_guest((uint64_t)(uintptr_t)(sender+i),&c,1)) break;
+            if (c>=0x21 && c<0x7f) from[k++]=c; else if (k) break;
+        }
+        for (uint32_t i=0;i<size && i<48 && data;++i) {
+            unsigned char b;
+            if (!read_guest((uint64_t)(uintptr_t)(data+i),&b,1)) break;
+            snprintf(hex+3*i,4,"%02x ",b);
+        }
+        printf("Net: %llu ms, frame %llu: type %02x from '%s', %u bytes: %s\n",(unsigned long long)GetTickCount64(),
+               (unsigned long long)sync_last_frame,type,from,size,hex);
+    }
+    return r;
+}
+static int net_hook_call(unsigned char *stub,uint64_t site,uint64_t callee,void *hook) {
+    int32_t rel;
+    memcpy(&rel,image+site+1,4);
+    if (image[site]!=0xe8 || site+5+(int64_t)rel!=callee) return 0;
+    const uint64_t target=(uint64_t)(uintptr_t)hook;
+    stub[0]=0xff; stub[1]=0x25; memset(stub+2,0,4); memcpy(stub+6,&target,8);
+    rel=(int32_t)((intptr_t)stub-(intptr_t)(image+site+5));
+    memcpy(image+site+1,&rel,4);
+    return 1;
+}
+static void net_log_install(void) {
+    const char *npid=getenv("BB_SHADNET_NPID"), *wanted=getenv("LBPPC_POS_LOG");
+    if (!npid || !*npid || !wanted || wanted[0]!='1') return;
+    unsigned char *s=near_image_alloc();
+    if (!s) return;
+    net_check=(ABI uint64_t (*)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t))(uintptr_t)(image+NET_CHECK);
+    net_header=(ABI uint64_t (*)(uint64_t,uint64_t))(uintptr_t)(image+NET_HEADER);
+    /* The header hook's stub first stores r13 (the sender) in net_sender: mov r11, &net_sender; mov [r11], r13. */
+    unsigned char *h=s+16;
+    const uint64_t slot=(uint64_t)(uintptr_t)&net_sender;
+    h[0]=0x49; h[1]=0xbb; memcpy(h+2,&slot,8); h[10]=0x4d; h[11]=0x89; h[12]=0x2b;
+    const int ok=net_hook_call(s,NET_CHECK_SITE,NET_CHECK,(void *)net_check_hook) &&
+                 net_hook_call(h+13,NET_HEADER_SITE,NET_HEADER,(void *)net_header_hook);
+    if (ok) { /* the call goes to the r13 store, which falls through to the jump */
+        int32_t rel=(int32_t)((intptr_t)h-(intptr_t)(image+NET_HEADER_SITE+5));
+        memcpy(image+NET_HEADER_SITE+1,&rel,4);
+    }
+    printf("Net: message log %s\n",ok ? "on" : "not added (unexpected game code)");
 }
 /* lbppc: online play runs both players' worlds in lockstep and compares them ("The game diverged"). rcpps and rsqrtps
  * are approximations whose results differ between CPU makers, harmless on a console where every machine is alike:
@@ -2399,7 +2537,8 @@ int main(int argc, char **argv) {
         watch_address=getenv("BB_WATCH_ADDR") ? strtoull(getenv("BB_WATCH_ADDR"),NULL,0) : 0;
         CloseHandle(CreateThread(NULL,0,watch_all_threads,NULL,0,NULL));
     }
-    if (getenv("LBPPC_PROFILE")) CloseHandle(CreateThread(NULL,0,profile_threads,NULL,0,NULL));
+    /* The launcher passes 0 when its Debug switch is off. */
+    if (getenv("LBPPC_PROFILE") && strcmp(getenv("LBPPC_PROFILE"),"0")) CloseHandle(CreateThread(NULL,0,profile_threads,NULL,0,NULL));
     if (getenv("LBPPC_FPTRAP"))
         CloseHandle(CreateThread(NULL,0,fptrap_threads,(LPVOID)(uintptr_t)strtoul(getenv("LBPPC_FPTRAP"),NULL,0),0,NULL));
 #else
@@ -2600,6 +2739,7 @@ int main(int argc, char **argv) {
     custom_server_install();
     quit_menu_install();
     friend_log_install();
+    net_log_install();
     sim_divide_install();
     hooks_install(getenv("BB_HOOK"));
     sync_log_install();
@@ -2607,6 +2747,7 @@ int main(int argc, char **argv) {
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
     exact_math_install();
+    stub_memory_seal();
     protect(traps, round_page((import_count + 1) * 32), 5);
     /* Each page goes straight to its final protection (a later segment wins, as before), never
        through no access: another thread that already found the image (a mod DLL's memory

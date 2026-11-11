@@ -9,6 +9,7 @@ Its look follows LittleBigPlanet 3's menus (lbppc_theme.py draws it); the banner
 usage: python launcher/lbppc_launcher.py
 """
 import base64
+import gc
 import json
 import math
 import os
@@ -55,22 +56,34 @@ RESOLUTIONS = [('1280 x 720 (lighter on the GPU)', '1280x720'), ('1920 x 1080 (o
 DISPLAY_MODES = [('Windowed', 'windowed'), ('Borderless fullscreen', 'borderless'), ('Exclusive fullscreen', 'fullscreen')]
 # bbport.ini frame_gen: the game steps 30 times a second; frame generation shows 60.
 FRAME_GENS = [('Off (30 FPS)', 'off'), ('FSR 3.1 (any GPU)', 'fsr3'), ('DLSS (GeForce RTX 40/50)', 'dlss')]
+# BB_FSR1: the finished picture scaled to the window with AMD FSR 1 instead of a plain stretch. It only does something
+# when the resolution is below the window's (full screen at a lower resolution): that is upscaling.
+UPSCALERS = [('Off (plain scaling)', 'off'), ('FSR 1 (any GPU)', 'fsr1')]
+# BB_RCAS / BB_RCAS_ATTENUATION: FSR 1's sharpening (RCAS), in thousandths of a stop: 0 is the sharpest.
+SHARPENING = [('Off', 'off'), ('Low', 'low'), ('Medium', 'medium'), ('High', 'high'), ('Maximum', 'max')]
+SHARPENING_ATTENUATION = {'low': 800, 'medium': 250, 'high': 100, 'max': 0}
 # BB_LOW_LATENCY: NVIDIA Reflex (AMD Anti-Lag 2 on AMD), with the 30 FPS limit kept before each game frame.
 LATENCY = [('On (NVIDIA Reflex / AMD Anti-Lag 2)', 'on'), ('On + Boost (NVIDIA)', 'boost'), ('Off', 'off')]
 OPTIONS = [('resolution', 'Resolution', RESOLUTIONS, 'Wider than 16:9 shows more of the level.'),
            ('display', 'Display', DISPLAY_MODES, 'Borderless suits most screens; a full-size window is shrunk.'),
            ('frame_gen', 'Frame generation', FRAME_GENS, 'The game runs 30 steps a second; this shows 60.'),
-           ('latency', 'Low latency', LATENCY, 'Less delay between your input and the screen.')]
+           ('latency', 'Low latency', LATENCY, 'Less delay between your input and the screen.'),
+           ('upscaling', 'Upscaling', UPSCALERS, 'Sharper when the resolution is below your screen\'s.'),
+           ('sharpening', 'Sharpening', SHARPENING, 'How much FSR 1 sharpens the scaled picture.')]
 # The Debug page's Diagnostics: (key, environment variable, title, hint, default). Each is passed to the game on
 # Play as 1 or 0.
 DIAGNOSTICS = [('frame_stats', 'BB_FRAME_STATS', 'Frame log', 'Frame rate, pacing and every slow frame in the log.',
                 True),
                ('profile', 'LBPPC_PROFILE', 'Slow-frame profiler',
-                'What the game waited for in each slow frame, and the CPU each thread used.', True),
+                'What the game waited for in each slow frame, and the CPU each thread used.', False),
                ('positions', 'LBPPC_POS_LOG', 'Player positions',
                 'Each player\'s position and buttons at every step. Large logs: for chasing a bug.', False),
                ('no_readback', 'LBPPC_WRITE_FAULT_NO_READBACK', 'Skip GPU readbacks',
-                'Faster in busy levels. Turn it off if something flickers or looks wrong.', True)]
+                'Faster in busy levels. Turn it off if something flickers or looks wrong.', True),
+               ('toggles', 'LBPPC_TOGGLES', 'Optimization switches',
+                'Turns optimizations off while the game runs, from user/toggles.txt. For chasing a bug.', False),
+               ('friends_log', 'LBPPC_FRIENDS_LOG', 'Friends menu log',
+                'What the game\'s Friends menu holds, every 5 seconds while online.', False)]
 # The Debug page's Performance overlay: bbport.ini switches, which the in-game menu (Insert) also changes.
 OVERLAY = [('show_fps', 'Frame rate', False), ('show_frame_times', 'Frame times', False),
            ('show_latency', 'Render latency', False), ('show_vram', 'Video memory', False),
@@ -78,6 +91,7 @@ OVERLAY = [('show_fps', 'Frame rate', False), ('show_frame_times', 'Frame times'
            ('show_fps_graph', 'Frame time graph', False), ('graph_game_frames', 'Graph the game\'s own frames', True),
            ('counter_colors', 'Colour-coded values', True)]
 DEFAULTS = {'game': '', 'resolution': '1920x1080', 'display': 'borderless', 'frame_gen': 'dlss', 'latency': 'on',
+            'upscaling': 'off', 'sharpening': 'medium', 'beta_notice_seen': False,
             'online': False, 'online_name': '', 'password': '',
             'diagnostics': {key: on for key, _env, _title, _hint, on in DIAGNOSTICS},
             # Not shown: the LBPPC server unless launcher.json names another (a test server on this PC).
@@ -363,6 +377,174 @@ class Tab:
         self.pending = []
 
 
+class BetaNotice:
+    """Shown at every start until "Don't show this again" is ticked: the build is a beta, and how to report a
+    problem. A card like the launcher's
+    panels over the launcher, which dims behind it; it fades in rising a little, and fades out."""
+
+    W = 600
+    KEY = '#010203'  # the card's window is see-through where it has this colour: its rounded corners
+    DIM = 0.6
+    INTRO = ('LBPPC 0.1.0 is a beta. Most of LittleBigPlanet 3 plays well, but you may run into effects that draw '
+             'wrongly in some levels, the odd crash, or rough edges online.')
+    STEPS = ('Close the game.',
+             'Click Make a report at the bottom of the launcher. It saves a zip of the game\'s logs and opens its '
+             'folder. Your password and Windows user name are left out.',
+             'Post the zip in the bug reports forum on our Discord, with the level and what you were doing.')
+    THANKS = 'Every report helps us fix what\'s broken. Thanks for testing!'
+
+    def __init__(self, launcher):
+        self.launcher, self.closing, self.dont_show = launcher, False, False
+        launcher.update_idletasks()
+        lx, ly = launcher.winfo_rootx(), launcher.winfo_rooty()
+        lw, lh = launcher.winfo_width(), launcher.winfo_height()
+        card, buttons_y = self.draw()
+        self.buttons_y = buttons_y
+        self.H = card.height
+
+        # The launcher dimmed: a black window over it, faded in.
+        self.shade = shade = tk.Toplevel(launcher)
+        shade.withdraw()
+        shade.overrideredirect(True)
+        shade.configure(bg='#000000')
+        shade.attributes('-alpha', 0.0)
+        shade.geometry(f'{lw}x{lh}+{lx}+{ly}')
+        shade.transient(launcher)
+
+        self.window = window = tk.Toplevel(launcher)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.configure(bg=self.KEY)
+        window.attributes('-transparentcolor', self.KEY)
+        window.attributes('-alpha', 0.0)
+        window.transient(launcher)
+        scene = Scene(window, self.W, self.H)
+        scene.configure(bg=self.KEY)
+        scene.pack(fill='both', expand=True)
+        scene.image('card', card, 0, 0)
+        self.ok = Tab(scene, 'Got it', self.close, self.W - 30, buttons_y, 'e', size=15)
+        self.discord = Tab(scene, 'Join the Discord', lambda: webbrowser.open(DISCORD),
+                           self.ok.cx - self.ok.width / 2 - 16, buttons_y, 'e', size=15, fill=BLURPLE)
+        self.scene = scene
+        box = scene.image('dont:box', theme.checkbox(False), 30, buttons_y - 11)
+        label = scene.image('dont:label', theme.text_image("Don't show this again", 13, TEXT, 'Medium'), 60,
+                            buttons_y - 10)
+        for item in (box, label):
+            scene.tag_bind(item, '<Button-1>', lambda _e: self.toggle_dont_show())
+            scene.tag_bind(item, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
+            scene.tag_bind(item, '<Leave>', lambda _e: scene.configure(cursor=''))
+        self.x = lx + (lw - self.W) // 2
+        self.y = ly + max(0, (lh - self.H) // 2 - 20)
+        window.geometry(f'{self.W}x{self.H}+{self.x}+{self.y + 18}')
+        window.protocol('WM_DELETE_WINDOW', self.close)
+        window.bind('<Escape>', lambda _e: self.close())
+        window.bind('<Return>', lambda _e: self.close())
+        shade.bind('<Button-1>', lambda _e: self.nudge())
+
+        shade.deiconify()
+        self.round(shade)
+        # Over the launcher explicitly: its title bar shows it again at start (TitleBar.show_in_taskbar), which
+        # can leave a window it owns underneath it.
+        shade.tk.call('raise', shade._w, launcher._w)
+        window.deiconify()
+        window.tk.call('raise', window._w, shade._w)
+        window.focus_force()
+        window.grab_set()
+        self.animate(0, opening=True)
+
+    def draw(self):
+        """The card, and where its buttons go."""
+        w, pad = self.W, 30
+        width = w - 2 * pad
+        title = theme.text_image('Welcome to the beta!', 26, theme.hex_colour(theme.ORANGE), 'Bold',
+                                 outline=theme.CREAM)
+        title = theme.shadowed(title.rotate(1.5, resample=Image.BICUBIC, expand=True), 4, (0, 2))[0]
+        intro = theme.paragraph(self.INTRO, 14, width, TEXT, 'Regular')
+        heading = theme.text_image('Found a problem?', 15, theme.hex_colour(theme.LIME), 'SemiBold')
+        steps = [theme.paragraph(text, 14, width - 42, TEXT, 'Regular') for text in self.STEPS]
+        thanks = theme.paragraph(self.THANKS, 13, width, MUTED, 'Regular')
+        y = 44
+        parts = [(title, pad - 10, y - 14)]
+        y += title.height - 14
+        parts.append((intro, pad, y))
+        y += intro.height + 14
+        parts.append((heading, pad, y))
+        y += heading.height + 10
+        for number, step in enumerate(steps, 1):
+            parts.append((theme.badge(number), pad, y - 2))
+            parts.append((step, pad + 42, y))
+            y += max(step.height, 26) + 8
+        y += 4
+        parts.append((thanks, pad, y))
+        y += thanks.height + 18
+        buttons_y = y + 18
+        height = buttons_y + 40
+        card = theme.notice_card(w, height, 'Beta')
+        for image, x, top in parts:
+            card.alpha_composite(image, (int(x), int(top)))
+        return card, buttons_y
+
+    def round(self, window):
+        """Rounded corners like the launcher's (Windows 11 draws them; elsewhere the window is cut)."""
+        if not CUSTOM_FRAME:
+            return
+        import ctypes
+        try:
+            hwnd = int(window.wm_frame(), 16)
+            preference = ctypes.c_int(2)  # DWMWCP_ROUND
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(preference),
+                                                          ctypes.sizeof(preference)) != 0:
+                w, h = window.winfo_width(), window.winfo_height()
+                ctypes.windll.user32.SetWindowRgn(hwnd, ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1,
+                                                                                              16, 16), True)
+        except (OSError, ValueError, tk.TclError):
+            pass
+
+    FRAMES = 12
+    FRAME_MS = 16
+
+    def animate(self, frame, opening):
+        """Opening: the shade darkens and the card fades in rising 18 px, eased out. Closing: both fade out."""
+        t = frame / self.FRAMES
+        ease = 1 - (1 - t) ** 3
+        amount = ease if opening else 1 - ease
+        try:
+            self.shade.attributes('-alpha', self.DIM * amount)
+            self.window.attributes('-alpha', amount)
+            if opening:
+                self.window.geometry(f'+{self.x}+{self.y + round(18 * (1 - ease))}')
+        except tk.TclError:
+            return
+        if frame < self.FRAMES:
+            self.window.after(self.FRAME_MS, self.animate, frame + 1, opening)
+        elif not opening:
+            self.shade.destroy()
+            self.window.destroy()
+
+    def nudge(self, step=0):
+        """A click on the dimmed launcher: the card shakes a little (it wants an answer first)."""
+        offsets = (-8, 8, -6, 6, -3, 3, 0)
+        if step < len(offsets) and not self.closing:
+            self.window.geometry(f'+{self.x + offsets[step]}+{self.y}')
+            self.window.after(30, self.nudge, step + 1)
+
+    def toggle_dont_show(self):
+        self.dont_show = not self.dont_show
+        self.scene.image('dont:box', theme.checkbox(self.dont_show), 30, self.buttons_y - 11)
+
+    def close(self):
+        if self.closing:
+            return
+        self.closing = True
+        if self.dont_show:
+            self.launcher.settings['beta_notice_seen'] = True
+            self.launcher.store()
+        for tab in (self.ok, self.discord):
+            tab.forget()
+        self.window.grab_release()
+        self.animate(0, opening=False)
+
+
 class TitleBar:
     """Windows: the window's own title bar (drag to move, minimise, close), the system's taken away. The window keeps
     its taskbar button (WS_EX_APPWINDOW)."""
@@ -503,7 +685,7 @@ class Launcher(tk.Tk):
     SIDE_W = WIDTH - 28 - SIDE_X
     GAME_Y = TITLE_HEIGHT + BANNER_HEIGHT + 12
     GRAPHICS_Y = GAME_Y + 118
-    ONLINE_Y = GRAPHICS_Y + 228
+    ONLINE_Y = GRAPHICS_Y + 304
     BAR_Y = ONLINE_Y + 216
     HEIGHT = BAR_Y + 92
 
@@ -541,6 +723,17 @@ class Launcher(tk.Tk):
         self.refresh_game()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(100, self.pump)
+        # Python's garbage collection runs on whichever thread happens to allocate. On a background thread (the
+        # game's log reader, the friends list) it could free Tk images there, and Tcl's memory then gets
+        # corrupted ("alloc: invalid block", the launcher closing). Collected here, on Tk's thread, instead.
+        gc.disable()
+        self.after(5000, self.collect_garbage)
+        if not self.settings.get('beta_notice_seen'):
+            self.after(600, lambda: BetaNotice(self))
+
+    def collect_garbage(self):
+        gc.collect()
+        self.after(5000, self.collect_garbage)
 
     def text(self, x, y, text='', font=HINT_FONT, fill=MUTED, anchor='nw', width=0):
         options = {'width': width} if width else {}
@@ -566,9 +759,9 @@ class Launcher(tk.Tk):
         Tab(scene, 'Browse...', self.browse, x + w - 20, y + 61, 'e', size=14, tilt=3)
         self.status_tag_y = y + 84
 
-        # Graphics: the four choices in two columns
+        # Graphics: the choices in two columns
         y = self.GRAPHICS_Y
-        scene.image('panel:graphics', theme.panel(w, 214, 'Graphics'), x, y)
+        scene.image('panel:graphics', theme.panel(w, 290, 'Graphics'), x, y)
         self.choices = {}
         for index, (key, title, values, hint) in enumerate(OPTIONS):
             cx, cy = (x + 20, right)[index % 2], y + 44 + (index // 2) * 76
@@ -785,6 +978,9 @@ class Launcher(tk.Tk):
             env['BB_WINDOW_MODE'] = self.settings['display']
         else:
             env.pop('BB_WINDOW_MODE', None)
+        env['BB_FSR1'] = '1' if self.settings['upscaling'] == 'fsr1' else '0'
+        env['BB_RCAS'] = '0' if self.settings['sharpening'] == 'off' else '1'
+        env['BB_RCAS_ATTENUATION'] = str(SHARPENING_ATTENUATION.get(self.settings['sharpening'], 250))
         if self.settings['latency'] == 'off':
             env.update(BB_LOW_LATENCY='off', BB_VBLANK_HZ='60', BB_FPS_LIMIT='-1')
         else:
@@ -1008,10 +1204,10 @@ class DebugPage:
         dy = y + overlay_h + 12
         scene.image('panel:diagnostics', theme.panel(w, h - overlay_h - 12, 'Diagnostics'), x, dy)
         for index, (key, _variable, title, hint, _on) in enumerate(DIAGNOSTICS):
-            cy = dy + 44 + index * 52
+            cy = dy + 44 + index * 46
             self.switch(f'diag:{key}', x + 20, cy, title, launcher.settings['diagnostics'].get(key),
                         lambda k=key: self.toggle_diagnostic(k))
-            launcher.text(x + 52, cy + 24, hint, HINT_FONT, MUTED, 'nw', width=w - 74)
+            launcher.text(x + 52, cy + 22, hint, HINT_FONT, MUTED, 'nw', width=w - 74)
         self.diag_status = launcher.text(x + 22, dy + h - overlay_h - 12 - 24, 'Used the next time you press Play. '
                                          'Logs go in the report from Make a report.', HINT_FONT, MUTED, 'nw',
                                          width=w - 44)

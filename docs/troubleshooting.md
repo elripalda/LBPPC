@@ -70,6 +70,20 @@ A single long frame when a level starts is normal: the level's textures are uplo
 | `Clear: target ... dropped (blended: check this one)` | Only appears with the image sync switched off for testing. If effects build up or leave trails, send a report. |
 | `Clear warning: shader ...` | The same: only worth a look if something draws wrongly. |
 
+## Debug page switches
+
+The launcher's Debug page has diagnostics that add to the log. Only switch one on when asked to: they make logs
+larger.
+
+| Switch | Adds |
+|---|---|
+| Frame log (on) | The 5-second lines above. |
+| Slow-frame profiler | `Profile:` and `Threads:` lines: where the game waited in each slow frame, CPU per thread. |
+| Player positions | Every player's position and buttons at every step, and online the game's network messages (`Net:` lines). Large. |
+| Skip GPU readbacks (on) | Not a log: faster busy levels. Turn it off if something flickers or draws wrongly. |
+| Optimization switches | Reads `user/toggles.txt` while the game runs; each bit turns an optimization off. |
+| Friends menu log | `Friends (menu):` lines while online: what the game's Friends page holds. |
+
 ## Tips
 
 - **Quitting:** the pause menu has **Quit Game**; press it twice. It waits for a save in progress to finish.
