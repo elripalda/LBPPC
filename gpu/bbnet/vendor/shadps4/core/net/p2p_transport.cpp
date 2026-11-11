@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <tuple>
 
@@ -383,7 +386,20 @@ void Transport::HandleDatagram(Codec::Decoded& decoded, const Endpoint& from) {
         return; // not from the connected peer
     }
     if (binding.bytes + decoded.payload.size() > config_.datagram_queue_bytes) {
-        return; // queue full, drop like UDP
+        // Queue full, drop like UDP. lbppc: logged (at most once a second), since a dropped game message can split a
+        // co-op session.
+        static std::atomic<unsigned long long> dropped{0};
+        static std::atomic<long long> last_log{0};
+        const unsigned long long total = ++dropped;
+        const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        if (last_log.exchange(now) != now) {
+            std::printf("Online: dropped a game packet on port %u, the receive queue is full (%llu dropped so far)\n",
+                        unsigned(decoded.dst_vport), total);
+            std::fflush(stdout);
+        }
+        return;
     }
     binding.bytes += decoded.payload.size();
     binding.queue.push_back({std::move(decoded.payload), from, decoded.src_vport});

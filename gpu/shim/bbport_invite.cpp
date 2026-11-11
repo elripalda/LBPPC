@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 
@@ -23,7 +24,7 @@ void Show(const std::string& invitation_id, const std::string& from, std::functi
     std::scoped_lock lock{mutex};
     std::erase_if(pending, [&](const Pending& p) { return p.id == invitation_id; });
     pending.push_back({invitation_id, from, std::move(answer)});
-    std::printf("Online: %s invited you to play (Cross or Enter joins, Circle or Esc does not)\n", from.c_str());
+    std::printf("Online: %s invited you to play\n", from.c_str());
 }
 
 void Dismiss(const std::string& invitation_id) {
@@ -34,6 +35,29 @@ void Dismiss(const std::string& invitation_id) {
 bool Shown() {
     std::scoped_lock lock{mutex};
     return !pending.empty();
+}
+
+bool BoxShown() {
+    static const bool box = [] {
+        const char* env = std::getenv("LBPPC_INVITE_BOX");
+        return env && env[0] == '1';
+    }();
+    return box && Shown();
+}
+
+bool JoinNewest() {
+    Pending answered;
+    {
+        std::scoped_lock lock{mutex};
+        if (pending.empty()) {
+            return false;
+        }
+        answered = std::move(pending.back());
+        pending.pop_back();
+    }
+    std::printf("Online: invitation from %s accepted in the game, joining\n", answered.from.c_str());
+    answered.answer(true);
+    return true;
 }
 
 void Answer(bool join) {
@@ -52,6 +76,9 @@ void Answer(bool join) {
 }
 
 std::string ShownFrom() {
+    if (!BoxShown()) {
+        return {};
+    }
     std::scoped_lock lock{mutex};
     return pending.empty() ? std::string{} : pending.front().from;
 }

@@ -84,6 +84,9 @@ enum : std::uint64_t {
     // (LBPPC_NO_BUFFER_IMAGE_INVALIDATE) and only the TargetClears guess applies. In user/toggles.txt:
     // 4611686018427387904.
     BufferWriteImageSync = 1ull << 62,
+    // lbppc: set: the LBP server's empty /npdata reply is left as it is (http.cpp AnswerNpData), so friends are not
+    // LBP friends (the Pod's friends list is empty). For co-op A/B tests. In user/toggles.txt: 9223372036854775808.
+    NpDataFriends = 1ull << 63,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

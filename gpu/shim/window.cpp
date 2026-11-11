@@ -288,7 +288,7 @@ bool WindowSDL::PollEvents() {
             continue;
         }
         // An invitation on screen (bbport_invite.h): Cross (A) or Enter joins, Circle (B) or Esc does not.
-        if (BbInvite::Shown() && !text_active &&
+        if (BbInvite::BoxShown() && !text_active &&
             ((event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
               (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER || event.key.key == SDLK_ESCAPE)) ||
              (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&

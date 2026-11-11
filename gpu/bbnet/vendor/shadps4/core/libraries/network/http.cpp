@@ -1877,20 +1877,81 @@ int PS4_SYSV_ABI sceHttpRequestGetAllHeaders() {
 // them); the PS4 game treats a failed farc_hashes as a failed connection and plays offline. Signed in locally, those
 // replies become empty lists (200), signed as the server signs its replies (X-Digest-A: HMAC-SHA1 with the custom
 // server key over body, MM_AUTH cookie and path), which the game checks.
+static void AnswerSigned(const SendRequestPlan& plan, const std::string& path, const std::string& body,
+                         HttpResponse& res, std::string_view content_type = "text/xml");
+static bool PathEndsWith(const std::string& path, std::string_view tail) {
+    return path.size() >= tail.size() && path.compare(path.size() - tail.size(), tail.size(), tail) == 0;
+}
+
 static void AnswerGoneEndpoint(const SendRequestPlan& plan, HttpResponse& res) {
     if (res.status_code != 410 || EmulatorSettings.GetOnlineName().empty()) {
         return;
     }
     const std::string path = plan.path.substr(0, plan.path.find('?'));
-    const auto ends_with = [&](std::string_view tail) {
-        return path.size() >= tail.size() && path.compare(path.size() - tail.size(), tail.size(), tail) == 0;
-    };
     std::string body;
-    if (ends_with("/farc_hashes")) {
+    if (PathEndsWith(path, "/farc_hashes")) {
         body = "<farc_hashes></farc_hashes>";
-    } else if (!ends_with("/t_conf")) {
+    } else if (!PathEndsWith(path, "/t_conf")) {
         return;
     }
+    AnswerSigned(plan, path, body, res);
+    LOG_INFO(Lib_Http, "{}: the server's 410 answered as an empty 200 (signed)", path);
+}
+
+// lbppc: at sign-in the game posts its PSN friends to /npdata (<npdata><friends><npHandle>...</friends>...) and takes
+// the friends in the reply as the ones with LBP accounts: only those show in the Pod's friends list (the "LBP friend"
+// flag of the game's friend array, set at 0x39871d). Refresh answers with an empty 200, so no one ever showed. A
+// player's friends are shadNet friends, and every LBPPC account is on both servers, so the reply lists all of them.
+extern "C" std::uint64_t runtime_disabled_optimizations;
+static void AnswerNpData(const SendRequestPlan& plan, HttpResponse& res) {
+    // Bit 63 in user/toggles.txt (9223372036854775808): left as the server answered, for co-op A/B tests.
+    if (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & (1ull << 63)) {
+        return;
+    }
+    if (res.status_code != 200 || !res.body.empty() || EmulatorSettings.GetOnlineName().empty()) {
+        return;
+    }
+    const std::string path = plan.path.substr(0, plan.path.find('?'));
+    if (!PathEndsWith(path, "/npdata")) {
+        return;
+    }
+    const std::string posted(plan.body.begin(), plan.body.end());
+    const auto begin = posted.find("<friends>");
+    const auto end = posted.find("</friends>");
+    if (begin == std::string::npos || end == std::string::npos || end < begin) {
+        return;
+    }
+    const std::string friends = posted.substr(begin, end + 10 - begin);
+    AnswerSigned(plan, path, "<npdata>" + friends + "</npdata>", res);
+    std::size_t count = 0;
+    for (auto at = friends.find("<npHandle"); at != std::string::npos; at = friends.find("<npHandle", at + 1)) {
+        ++count;
+    }
+    LOG_INFO(Lib_Http, "{}: the server's empty reply answered with the {} friends posted (signed)", path, count);
+}
+
+// lbppc: in co-op the guest's game sends /match UpdateMyPlayerData for the room it is in, and Refresh lets only a room's
+// host change it: 401. A PS4 guest always got a success there (Sony's server), so the game is answered as it would be,
+// signed. The room keeps the host's data, which is what Refresh's rule protects.
+static void AnswerGuestMatch(const SendRequestPlan& plan, HttpResponse& res) {
+    if (res.status_code != 401 || EmulatorSettings.GetOnlineName().empty()) {
+        return;
+    }
+    const std::string path = plan.path.substr(0, plan.path.find('?'));
+    if (!PathEndsWith(path, "/match")) {
+        return;
+    }
+    AnswerSigned(plan, path, "[{\"StatusCode\":200}]", res, "application/json");
+    static std::atomic<unsigned> answered{0};
+    if (++answered <= 5) {
+        LOG_INFO(Lib_Http, "{}: the server's 401 for a co-op guest answered as a success (signed)", path);
+    }
+}
+
+// The reply signed as the server signs its replies (X-Digest-A: HMAC-SHA1 with the custom server key over body,
+// MM_AUTH cookie and path), which the game checks.
+static void AnswerSigned(const SendRequestPlan& plan, const std::string& path, const std::string& body,
+                         HttpResponse& res, std::string_view content_type) {
     std::string cookie;
     for (const auto& [k, v] : plan.headers) {
         if (HeaderNameMatches(k, "Cookie")) {
@@ -1915,10 +1976,9 @@ static void AnswerGoneEndpoint(const SendRequestPlan& plan, HttpResponse& res) {
     res.content_length = body.size();
     res.content_length_result = 0;
     res.read_cursor = 0;
-    res.all_headers_blob = fmt::format("HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n"
+    res.all_headers_blob = fmt::format("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n"
                                        "X-Digest-A: {}\r\n\r\n",
-                                       body.size(), hex);
-    LOG_INFO(Lib_Http, "{}: the server's 410 answered as an empty 200 (signed)", path);
+                                       content_type, body.size(), hex);
 }
 
 int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
@@ -2034,6 +2094,8 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             // lbppc diagnostics: LBPPC_HTTP_TRACE=1 prints each request's headers and its reply's headers
             // and body (hex for binary bodies) to stderr.
             AnswerGoneEndpoint(plan, local_res);
+            AnswerNpData(plan, local_res);
+            AnswerGuestMatch(plan, local_res);
             // lbppc diagnostics: LBPPC_HTTP_410=<status> answers the game's 410 replies with that status instead.
             static const int status_410 = std::getenv("LBPPC_HTTP_410") ? std::atoi(std::getenv("LBPPC_HTTP_410")) : 0;
             if (status_410 && local_res.status_code == 410) {

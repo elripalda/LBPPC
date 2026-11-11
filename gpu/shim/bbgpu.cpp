@@ -425,9 +425,7 @@ extern "C" int bbgpu_overlay_captures_input(void) {
 }
 
 extern "C" int bbgpu_invite_accept_shown(void) {
-    if (!BbInvite::Shown()) return 0;
-    BbInvite::Answer(true);
-    return 1;
+    return BbInvite::JoinNewest() ? 1 : 0;
 }
 
 extern "C" int bbgpu_audio_muted(void) {

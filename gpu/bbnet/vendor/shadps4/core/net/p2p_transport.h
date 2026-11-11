@@ -64,7 +64,10 @@ public:
 
 struct TransportConfig {
     TcpConfig tcp;
-    size_t datagram_queue_bytes = 40 * 1024; // per vport, PS4's SO_RCVBUF
+    // Per vport. lbppc: was 40 KB (a PS4 socket's default); the game's own SO_RCVBUF is not applied to P2P sockets, and
+    // in co-op a guest still loading the Pod while the host streamed the game overflowed it: the dropped messages left
+    // its world taking no input (2026-11-11). Large enough to hold several seconds of a session's traffic.
+    size_t datagram_queue_bytes = 1 << 20;
     size_t signaling_queue_packets = 256;    // per channel
     size_t signaling_channels = 1;
     std::function<size_t(std::span<const u8>)> classify_signaling;
