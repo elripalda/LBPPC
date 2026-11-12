@@ -36,6 +36,7 @@ BIN = ROOT / 'bin' if (ROOT / 'bin' / 'bb-probe.exe').is_file() else ROOT / 'out
 if not FROZEN:
     sys.path.insert(0, str(ROOT / 'scripts'))  # frozen, PyInstaller bundles the module
 import online_accounts  # noqa: E402
+import ui_scale  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lbppc_theme as theme  # noqa: E402
 import input_settings  # noqa: E402
@@ -288,7 +289,7 @@ class Scene(tk.Canvas):
 
     def image(self, key, pil, x, y, anchor='nw', tags=()):
         """Places (or replaces) the image named `key`."""
-        photo = ImageTk.PhotoImage(pil)
+        photo = ImageTk.PhotoImage(ui_scale.image(pil))
         old = self.images.get(key)
         if old:
             self.itemconfigure(old[0], image=photo)
@@ -433,9 +434,9 @@ class BetaNotice:
             scene.tag_bind(item, '<Button-1>', lambda _e: self.toggle_dont_show())
             scene.tag_bind(item, '<Enter>', lambda _e: scene.configure(cursor='hand2'))
             scene.tag_bind(item, '<Leave>', lambda _e: scene.configure(cursor=''))
-        self.x = lx + (lw - self.W) // 2
-        self.y = ly + max(0, (lh - self.H) // 2 - 20)
-        window.geometry(f'{self.W}x{self.H}+{self.x}+{self.y + 18}')
+        self.x = lx + (lw - ui_scale.s(self.W)) // 2
+        self.y = ly + max(0, (lh - ui_scale.s(self.H)) // 2 - 20)
+        window.geometry(f'{ui_scale.s(self.W)}x{ui_scale.s(self.H)}+{self.x}+{self.y + 18}')
         window.protocol('WM_DELETE_WINDOW', self.close)
         window.bind('<Escape>', lambda _e: self.close())
         window.bind('<Return>', lambda _e: self.close())
@@ -656,10 +657,10 @@ def style_widgets(root):
     """The fields and dropdowns: dark, light text, a lime edge on the focused one."""
     style = ttk.Style(root)
     style.theme_use('clam')
-    style.configure('Night.TCombobox', padding=4, arrowcolor=theme.hex_colour(theme.LIME), foreground=TEXT,
+    style.configure('Night.TCombobox', padding=(ui_scale.s(4), max(1, ui_scale.s(4) - 2)), arrowcolor=theme.hex_colour(theme.LIME), foreground=TEXT,
                     background=theme.FIELD, fieldbackground=theme.FIELD, bordercolor=theme.FIELD_EDGE,
                     lightcolor=theme.FIELD, darkcolor=theme.FIELD, selectbackground=theme.FIELD,
-                    selectforeground=TEXT, arrowsize=14)
+                    selectforeground=TEXT, arrowsize=ui_scale.s(14))
     style.map('Night.TCombobox', fieldbackground=[('readonly', theme.FIELD)], foreground=[('readonly', TEXT)],
               background=[('active', theme.FIELD_EDGE)], bordercolor=[('focus', theme.hex_colour(theme.LIME))])
     style.configure('Night.Vertical.TScrollbar', background=theme.FIELD, troughcolor=BG,
@@ -691,6 +692,7 @@ class Launcher(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        ui_scale.fonts(self)
         self.title('LBPPC')
         self.set_icon()
         self.configure(bg=BG)
@@ -961,7 +963,7 @@ class Launcher(tk.Tk):
             self.scene.delete(self.log_window)
             self.log_window = None
         self.scene.itemconfigure(self.log_link, text='Hide log' if self.log_shown else 'Show log')
-        self.geometry(f'{WIDTH}x{height}')
+        self.geometry(f'{ui_scale.s(WIDTH)}x{ui_scale.s(height)}')
 
     def play(self):
         if self.process or not self.refresh_game():
@@ -1798,4 +1800,8 @@ if __name__ == '__main__':
     if len(sys.argv) > 2 and sys.argv[1] == '--script':
         run_script(sys.argv[2:])
     else:
+        # The launcher at the screen's size (ui_scale.py), and on a short screen (the Steam Deck's) a shorter log.
+        ui_scale.install(ui_scale.choose(WIDTH, Launcher.HEIGHT))
+        room = ui_scale.work_area()[1] * 0.96 / ui_scale.U - Launcher.HEIGHT
+        LOG_HEIGHT = max(100, min(LOG_HEIGHT, int(room)))
         Launcher().mainloop()
