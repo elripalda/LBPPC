@@ -19,15 +19,21 @@ jobs:
           NAME: ${{ github.event.release.name }}
           URL: ${{ github.event.release.html_url }}
           BODY: ${{ github.event.release.body }}
+          # The Version Pings role's ID: the repository variable DISCORD_PING_ROLE (Settings > Secrets and
+          # variables > Actions > Variables). Without it the message pings nobody.
+          ROLE: ${{ vars.DISCORD_PING_ROLE }}
         run: |
           # Discord allows 4096 characters in an embed's description; longer notes end with a link to the rest.
           notes=$(printf '%s' "$BODY" | head -c 3800)
           if [ "${#BODY}" -gt 3800 ]; then notes="$notes"$'\n\n'"[Read the full release notes]($URL)"; fi
-          jq -n --arg tag "$TAG" --arg name "${NAME:-LBPPC $TAG}" --arg url "$URL" --arg notes "$notes" '{
+          # allowed_mentions: only the Version Pings role can be pinged, never @everyone or anyone named in the notes.
+          jq -n --arg tag "$TAG" --arg name "${NAME:-LBPPC $TAG}" --arg url "$URL" --arg notes "$notes" \
+                --arg role "$ROLE" '{
             username: "LBPPC",
             avatar_url: "https://lbppc.com/assets/icon.png?v=6",
-            content: ("**LBPPC " + $tag + " is out!** Download it from the website or GitHub: <https://lbppc.com/download>"),
-            allowed_mentions: { parse: [] },
+            content: ((if $role != "" then "<@&" + $role + "> " else "" end)
+                      + "**LBPPC " + $tag + " is out!** Download it from the website or GitHub: <https://lbppc.com/download>"),
+            allowed_mentions: { parse: [], roles: (if $role != "" then [$role] else [] end) },
             embeds: [{
               title: $name,
               url: $url,
