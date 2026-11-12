@@ -132,7 +132,8 @@ def main(argv):
     if not (game / 'eboot.bin').is_file():
         sys.exit(f'No eboot.bin in {game}')
     # Packaged releases keep the runtime in bin/; development builds in out/.
-    probe = HERE / 'bin' / 'bb-probe.exe' if (HERE / 'bin' / 'bb-probe.exe').is_file() else OUT / 'bb-probe.exe'
+    # A release ships the game as bin/LBPPC-Game.exe; a checkout builds out/bb-probe.exe.
+    probe = HERE / 'bin' / 'LBPPC-Game.exe' if (HERE / 'bin' / 'LBPPC-Game.exe').is_file() else OUT / 'bb-probe.exe'
     if not probe.is_file():
         sys.exit('out/bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64)')
     # LBPPC_USER_DIR (tests): saves and settings somewhere other than user/.

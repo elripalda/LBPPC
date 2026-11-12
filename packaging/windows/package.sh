@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds dist/LBPPC-<version>-windows.zip: LBPPC.exe (the launcher, frozen with PyInstaller so players need no Python;
-# it also runs run.py and the preparation scripts with --script), bin/bb-probe.exe with the MSYS2 CLANG64 DLLs it
+# it also runs run.py and the preparation scripts with --script), bin/LBPPC-Game.exe (the game, built as out/bb-probe.exe) with the MSYS2 CLANG64 DLLs it
 # loads, DLSS when imported (import_dlss.py), the scripts, tools and documents. No game files: players point the
 # launcher at their own dump. Run from an MSYS2 CLANG64 shell after `bash build.sh`.
 # Freezing uses a Windows Python 3.10+ (python.org; WINPYTHON overrides) and a private venv in out/pyenv.
@@ -42,10 +42,11 @@ rm -rf -- out/stage
 mkdir -p "$dest/bin" "$dest/docs" "$dest/licenses" "$dest/tools"
 cp -r out/pyi-dist/LBPPC/. "$dest/"
 # The runtime without debug information (out/ keeps the symbols for crash reports).
-llvm-strip --strip-debug -o "$dest/bin/bb-probe.exe" out/bb-probe.exe
+# The game, under the name players see (bb-probe is the build's own name).
+llvm-strip --strip-debug -o "$dest/bin/LBPPC-Game.exe" out/bb-probe.exe
 # Every DLL it loads from the CLANG64 tree (SDL3, FFmpeg, OpenSSL, protobuf, ...). Not the Vulkan loader: the one
 # the graphics driver installs in System32 is used.
-ldd "$dest/bin/bb-probe.exe" | awk '/\/clang64\/bin\// && !/vulkan-1\.dll/ {print $3}' | sort -u | while read -r dll; do
+ldd "$dest/bin/LBPPC-Game.exe" | awk '/\/clang64\/bin\// && !/vulkan-1\.dll/ {print $3}' | sort -u | while read -r dll; do
     cp -u "$dll" "$dest/bin/"
 done
 # DLSS (NVIDIA RTX): the bridge and NVIDIA's runtime (packaging/windows/import_dlss.py or build_dlss.sh).

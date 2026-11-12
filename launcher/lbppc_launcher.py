@@ -32,7 +32,7 @@ BLURPLE = (88, 101, 242)  # Discord's own colour, for its button
 # Packaged (frozen with PyInstaller): LBPPC.exe sits in the package folder and runs run.py itself (--script).
 FROZEN = getattr(sys, 'frozen', False)
 ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
-BIN = ROOT / 'bin' if (ROOT / 'bin' / 'bb-probe.exe').is_file() else ROOT / 'out'
+BIN = ROOT / 'bin' if (ROOT / 'bin' / 'LBPPC-Game.exe').is_file() else ROOT / 'out'
 if not FROZEN:
     sys.path.insert(0, str(ROOT / 'scripts'))  # frozen, PyInstaller bundles the module
 import online_accounts  # noqa: E402
@@ -1025,7 +1025,7 @@ class Launcher(tk.Tk):
         self.clear_log()
         if self.settings['frame_gen'] == 'dlss' and not all((BIN / name).is_file() for name in DLSS_FILES):
             # The game would quietly use FSR 3.1 instead (packaging/windows/import_dlss.py installs them).
-            self.append(['Launcher: the DLSS files are missing next to bb-probe.exe; frame generation uses FSR 3.1.'])
+            self.append(['Launcher: the DLSS files are missing next to the game; frame generation uses FSR 3.1.'])
         command = [sys.executable, '--script'] if FROZEN else [sys.executable]
         self.process = subprocess.Popen(command + [str(ROOT / 'run.py'), self.settings['game']], cwd=ROOT,
                                         env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
